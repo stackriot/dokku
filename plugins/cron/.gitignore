@@ -2,6 +2,10 @@
 /subcommands/*
 /triggers/*
 /triggers
+/app-json-is-valid
 /cron-*
+/install
 /post-*
 /report
+/scheduler-cron-write
+/scheduler-stop

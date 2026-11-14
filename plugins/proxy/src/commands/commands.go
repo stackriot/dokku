@@ -18,17 +18,16 @@ Manage the proxy integration for an app
 Additional commands:`
 
 	helpContent = `
-	proxy:build-config <app>, (Re)builds config for a given app
+    proxy:build-config [--parallel count] [--all|<app>], (Re)builds config for a given app
+    proxy:clear-config [--all|<app>], Clears config for a given app
     proxy:disable <app>, Disable proxy for app
     proxy:enable <app>, Enable proxy for app
-    proxy:ports <app>, List proxy port mappings for app
-    proxy:ports-add <app> [<scheme>:<host-port>:<container-port>...], Add proxy port mappings to an app
-    proxy:ports-clear <app>, Clear all proxy port mappings for an app
-    proxy:ports-remove <app> [<host-port>|<scheme>:<host-port>:<container-port>...], Remove specific proxy port mappings from an app
-    proxy:ports-set <app> [<scheme>:<host-port>:<container-port>...], Set proxy port mappings for an app
     proxy:report [<app>] [<flag>], Displays a proxy report for one or more apps
-    proxy:set <app> <proxy-type>, Set proxy type for app
-`
+    proxy:route:clear <app>, Removes every path-based route for an app
+    proxy:route:remove <app> <path>, Removes a path-based route from an app
+    proxy:route:report [<app>] [--format json], Displays the path-based routes for an app
+    proxy:route:set <app> <process> <path> [--port port] [--strip-prefix], Adds or updates a path-based route to a non-web process
+    proxy:set <app> <proxy-type>, Set proxy type for app`
 )
 
 func main() {
@@ -40,11 +39,11 @@ func main() {
 	case "proxy", "proxy:help":
 		usage()
 	case "help":
-		command := common.NewShellCmd(fmt.Sprintf("ps -o command= %d", os.Getppid()))
-		command.ShowOutput = false
-		output, err := command.Output()
-
-		if err == nil && strings.Contains(string(output), "--all") {
+		result, err := common.CallExecCommand(common.ExecCommandInput{
+			Command: "ps",
+			Args:    []string{"-o", "command=", strconv.Itoa(os.Getppid())},
+		})
+		if err == nil && strings.Contains(result.StdoutContents(), "--all") {
 			fmt.Println(helpContent)
 		} else {
 			fmt.Print("\n    proxy, Manage the proxy integration for an app\n")

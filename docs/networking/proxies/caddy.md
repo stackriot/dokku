@@ -1,0 +1,338 @@
+# Caddy Proxy
+
+> [!IMPORTANT]
+> New as of 0.28.0
+
+Dokku provides integration with the [Caddy](https://caddyserver.com/) proxy service by utilizing the Docker label-based integration implemented by [Caddy Docker Proxy](https://github.com/lucaslorentz/caddy-docker-proxy).
+
+```
+caddy:report [<app>] [<flag>]                            # Displays a caddy report for one or more apps
+caddy:logs [--num num] [--tail]                          # Display caddy log output
+caddy:set [<app>|--global] <property> (<value>)          # Set or clear an caddy property for an app or globally
+caddy:show-config <app>                                  # Display caddy compose config
+caddy:start                                              # Starts the caddy server
+caddy:stop                                               # Stops the caddy server
+```
+
+## Requirements
+
+Using the `caddy` plugin integration requires the `docker-compose-plugin` for Docker. See [this document](https://docs.docker.com/compose/install/) from the Docker documentation for more information on the installation process for the `docker-compose-plugin`.
+
+## Usage
+
+> [!WARNING]
+> As using multiple proxy plugins on a single Dokku installation can lead to issues routing requests to apps, doing so should be avoided. As the default proxy implementation is nginx, users are encouraged to stop the nginx service before switching to Caddy.
+
+The Caddy plugin has specific rules for routing requests:
+
+- Caddy integration is exposed via docker labels attached to containers. Changes in labels require either app deploys or rebuilds.
+- While Caddy will respect labels associated with other containers, only `web` containers have Caddy labels injected by the plugin.
+- Only `http:80` and `https:443` port mappings are supported.
+- Caddy will automatically enable SSL if the letsencrypt email property is set. SSL will be disabled otherwise.
+- If no `http:80` mapping is found, the first `http` port mapping is used for http requests.
+- If no `https:443` mapping is found, the first `https` port mapping is used for https requests.
+- If no `https` mapping is found, the container port from `http:80` will be used for https requests.
+- Requests are routed as soon as the container is running, before Dokku's healthchecks have passed. See the [healthchecks](#healthchecks) section for how Caddy avoids routing to containers that are not yet ready.
+
+### Healthchecks
+
+When an app has a readiness healthcheck defined in its `app.json` file with a `path` property, Dokku automatically generates Caddy healthcheck and retry labels. These configure Caddy to periodically check each container, stop routing traffic to containers that fail the check, and retry requests that fail to connect against another container.
+
+The following `app.json` healthcheck properties are mapped to Caddy labels:
+
+| app.json Property | Caddy Label | Description |
+|-------------------|-------------|-------------|
+| `path`            | `caddy.reverse_proxy.health_uri`      | The HTTP path to check (required) |
+| `port`            | `caddy.reverse_proxy.health_port`     | The port to check |
+| `timeout`         | `caddy.reverse_proxy.health_timeout`  | Timeout in seconds (formatted as `Xs`, defaults to `5s`) |
+| `wait`            | `caddy.reverse_proxy.health_interval` | Interval between checks in seconds (formatted as `Xs`, defaults to `5s`) |
+| `attempts`        | `caddy.reverse_proxy.health_fails`    | Number of successive failed checks before a container is taken out of rotation (defaults to `3`) |
+| `httpHeaders`     | `caddy.reverse_proxy.health_headers.<name>` | Headers to send with the check |
+
+Additionally, the following labels are generated:
+
+| Caddy Label | Value | Description |
+|-------------|-------|-------------|
+| `caddy.reverse_proxy.health_headers.Host` | the first app domain | The `Host` header sent with the healthcheck, matching the header Dokku sends during deploy checks. A `Host` header in `httpHeaders` takes precedence |
+| `caddy.reverse_proxy.lb_try_duration` | `5s` | How long a request that fails to connect is retried against other containers |
+| `caddy.reverse_proxy.lb_try_interval` | `250ms` | How long to wait between retries |
+
+Example `app.json` configuration:
+
+```json
+{
+  "healthchecks": {
+    "web": [
+      {
+        "name": "web readiness check",
+        "path": "/health",
+        "timeout": 5,
+        "type": "readiness",
+        "wait": 10
+      }
+    ]
+  }
+}
+```
+
+Caddy considers a new container healthy until its first check fails. The first check runs as soon as Caddy picks up the new container, and requests that reach the container before then and fail to connect are retried against the still-running old container.
+
+Headers with values containing quotes, backslashes, or control characters are skipped, as are headers whose names contain a `.` or end in an `_<number>` suffix, as these cannot be represented as Caddy labels. The `scheme` property is not mapped, as Caddy uses the same transport for healthchecks as for proxied requests. Any of the generated labels may be overridden via the `caddy:labels:add` command.
+
+> [!NOTE]
+> Only the first readiness healthcheck with a `path` property is used. Apps without one are routed as soon as the container is running. See the [zero downtime deploys documentation](/docs/deployment/zero-downtime-deploys.md#healthchecks-and-label-based-proxies) for more information.
+
+### Switching to Caddy
+
+To use the Caddy plugin, use the `proxy:set` command for the app in question:
+
+```shell
+dokku proxy:set node-js-app type caddy
+```
+
+This will enable the docker label-based Caddy integration. All future deploys will inject the correct labels for Caddy to read and route requests to containers. Due to the docker label-based integration used by Caddy, a single deploy or rebuild will be required before requests will route successfully.
+
+```shell
+dokku ps:rebuild node-js-app
+```
+
+Any changes to domains or port mappings will also require either a deploy or rebuild.
+
+### Starting Caddy container
+
+Caddy can be started via the `caddy:start` command. This will start a Caddy container via the `docker compose up` command.
+
+```shell
+dokku caddy:start
+```
+
+### Stopping the Caddy container
+
+Caddy may be stopped via the `caddy:stop` command.
+
+```shell
+dokku caddy:stop
+```
+
+The Caddy container will be stopped and removed from the system. If the container is not running, this command will do nothing.
+
+### Showing the Caddy compose config
+
+For debugging purposes, it may be useful to show the Caddy compose config. This can be achieved via the `caddy:show-config` command.
+
+```shell
+dokku caddy:show-config
+```
+
+### Customizing the Caddy container image
+
+While the default Caddy image is hardcoded, users may specify an alternative by setting the `image` property with the `--global` flag:
+
+```shell
+dokku caddy:set --global image lucaslorentz/caddy-docker-proxy:2.7
+```
+
+#### Checking the Caddy container's logs
+
+It may be necessary to check the Caddy container's logs to ensure that Caddy is operating as expected. This can be performed with the `caddy:logs` command.
+
+```shell
+dokku caddy:logs
+```
+
+This command also supports the following modifiers:
+
+```shell
+--num NUM        # the number of lines to display
+--tail           # continually stream logs
+```
+
+You can use these modifiers as follows:
+
+```shell
+dokku caddy:logs --tail --num 10
+```
+
+The above command will show logs continually from the caddy container, with an initial history of 10 log lines
+
+### Changing the Caddy log level
+
+Caddy log output is set to `ERROR` by default. It may be changed by setting the `log-level` property with the `--global` flag:
+
+```shell
+dokku caddy:set --global log-level DEBUG
+```
+
+After modifying,  the Caddy container will need to be restarted.
+
+### Label Management
+
+The Caddy plugin allows you to add custom container labels to apps. These labels are injected into containers during deployment and can be used to configure Caddy behavior beyond what the plugin provides by default.
+
+Refer to the upstream [caddy-docker-proxy](https://github.com/lucaslorentz/caddy-docker-proxy) documentation for more information on what labels are available.
+
+#### Adding a label
+
+To add a custom container label to an app, use the `caddy:labels:add` command:
+
+```shell
+dokku caddy:labels:add node-js-app caddy.directive value
+```
+
+This will add the label `caddy.directive=value` to the app's containers. After adding a label, you will need to rebuild or redeploy the app for the label to be applied to running containers.
+
+```shell
+dokku ps:rebuild node-js-app
+```
+
+#### Removing a label
+
+To remove a custom container label from an app, use the `caddy:labels:remove` command:
+
+```shell
+dokku caddy:labels:remove node-js-app caddy.directive
+```
+
+This will remove the specified label from the app. After removing a label, you will need to rebuild or redeploy the app for the change to be applied to running containers.
+
+```shell
+dokku ps:rebuild node-js-app
+```
+
+#### Showing labels
+
+To view all custom container labels for an app, use the `caddy:labels:show` command:
+
+```shell
+dokku caddy:labels:show node-js-app
+```
+
+To view a specific label value, provide the label name:
+
+```shell
+dokku caddy:labels:show node-js-app caddy.directive
+```
+
+### SSL Configuration
+
+The caddy plugin only supports automatic ssl certificates from its letsencrypt integration. Managed certificates provided by the `certs` plugin are ignored.
+
+#### Enabling letsencrypt integration
+
+By default, letsencrypt is disabled and https port mappings are ignored. To enable, set the `letsencrypt-email` property with the `--global` flag:
+
+```shell
+dokku caddy:set --global letsencrypt-email automated@dokku.sh
+```
+
+After enabling, the Caddy container will need to be restarted and apps will need to be rebuilt. All http requests will then be redirected to https.
+
+#### Customizing the letsencrypt server
+
+The letsencrypt integration is set to the production letsencrypt server by default. To change this, set the `letsencrypt-server` property with the `--global` flag:
+
+```shell
+dokku caddy:set --global letsencrypt-server https://acme-staging-v02.api.letsencrypt.org/directory
+```
+
+After enabling, the Caddy container will need to be restarted and apps will need to be rebuilt to retrieve certificates from the new server.
+
+### Using Caddy's Internal TLS server
+
+To switch to Caddy's internal TLS server for certificate provisioning, set the `tls-internal` property.
+
+```shell
+dokku caddy:set node-js-app tls-internal true
+```
+
+As Caddy only serves https when the `letsencrypt-email` property is set, the internal TLS server is only used for apps when that property is also set. Apps will need to be rebuilt after changing this property.
+
+The default value may also be configured globally with the `--global` flag. Per-app values take precedence over the global value when set.
+
+```shell
+dokku caddy:set --global tls-internal true
+```
+
+Both the per-app and the global value may be unset by setting a blank value.
+
+```shell
+dokku caddy:set node-js-app tls-internal
+dokku caddy:set --global tls-internal
+```
+
+## Displaying Caddy reports for an app
+
+You can get a report about the app's Caddy config using the `caddy:report` command:
+
+```shell
+dokku caddy:report
+```
+
+```
+=====> node-js-app caddy information
+       Caddy computed image:             lucaslorentz/caddy-docker-proxy:2.7
+       Caddy computed letsencrypt email:
+       Caddy computed letsencrypt server: https://acme-v02.api.letsencrypt.org/directory
+       Caddy computed log level:         ERROR
+       Caddy computed polling interval:  5s
+       Caddy computed tls internal:      false
+       Caddy global image:
+       Caddy global letsencrypt email:
+       Caddy global letsencrypt server:
+       Caddy global log level:
+       Caddy global polling interval:
+       Caddy global tls internal:
+       Caddy tls internal:
+```
+
+The `global-<prop>` keys hold the raw global value and are empty when nothing has been set globally. The `computed-<prop>` keys hold the effective value used at deploy time, falling back to the global value (where one has been set) and then to the built-in default. The bare `tls-internal` key holds the raw per-app value.
+
+You can run the command for a specific app also.
+
+```shell
+dokku caddy:report node-js-app
+```
+
+```
+=====> node-js-app caddy information
+       Caddy computed image:             lucaslorentz/caddy-docker-proxy:2.7
+       Caddy computed letsencrypt email:
+       Caddy computed letsencrypt server: https://acme-v02.api.letsencrypt.org/directory
+       Caddy computed log level:         ERROR
+       Caddy computed polling interval:  5s
+       Caddy computed tls internal:      false
+       Caddy global image:
+       Caddy global letsencrypt email:
+       Caddy global letsencrypt server:
+       Caddy global log level:
+       Caddy global polling interval:
+       Caddy global tls internal:
+       Caddy tls internal:
+```
+
+You can pass flags which will output only the value of the specific information you want. For example:
+
+```shell
+dokku caddy:report node-js-app --caddy-computed-image
+```
+
+## Properties
+
+### Settable properties
+
+| Property | Scope | Default | Report flags | Description |
+| --- | --- | --- | --- | --- |
+| `image` | global only | _parsed from `plugins/caddy-vhosts/Dockerfile`_ | `--caddy-global-image`, `--caddy-computed-image` | Docker image used to run the Caddy container |
+| `letsencrypt-email` | global only | none | `--caddy-global-letsencrypt-email`, `--caddy-computed-letsencrypt-email` | Contact email enabling letsencrypt; empty disables https issuance |
+| `letsencrypt-server` | global only | `https://acme-v02.api.letsencrypt.org/directory` | `--caddy-global-letsencrypt-server`, `--caddy-computed-letsencrypt-server` | ACME directory used when requesting certificates |
+| `log-level` | global only | `ERROR` | `--caddy-global-log-level`, `--caddy-computed-log-level` | Caddy log level |
+| `polling-interval` | global only | `5s` | `--caddy-global-polling-interval`, `--caddy-computed-polling-interval` | Frequency at which Caddy polls the Docker API for label changes |
+| `tls-internal` | app + global | `false` | `--caddy-tls-internal`, `--caddy-global-tls-internal`, `--caddy-computed-tls-internal` | When `true`, uses Caddy's built-in self-signed TLS instead of letsencrypt |
+
+### Internal properties
+
+The following properties are not managed by `caddy:set` but are recorded internally by the plugin:
+
+| Property | Description | Source |
+|---|---|---|
+| `proxy-status` | `started`/`stopped` state of the caddy compose project | `cmd-caddy-start`/`cmd-caddy-stop` in `plugins/caddy-vhosts/command-functions` |

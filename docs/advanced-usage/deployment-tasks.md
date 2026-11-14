@@ -1,5 +1,6 @@
 # Deployment Tasks
 
+> [!IMPORTANT]
 > New as of 0.5.0
 
 ## Usage
@@ -17,30 +18,30 @@ To support this, Dokku provides support for a special `release` command within y
 Each "phase" has different expectations and limitations:
 
 - `app.json`: `scripts.dokku.predeploy`
-  - When to use: This should be used if your app does not support arbitrary build commands and you need to make changes to the built image.
-  - Are changes committed to the image at this phase: Yes
-  - Example use-cases
-    - Bundling assets in a slightly different way
-    - Installing a custom package from source or copying a binary into place
+    - When to use: This should be used if your app does not support arbitrary build commands and you need to make changes to the built image.
+    - Are changes committed to the image at this phase: Yes
+    - Example use-cases
+        - Bundling assets in a slightly different way
+        - Installing a custom package from source or copying a binary into place
 - `app.json`: `scripts.dokku.postdeploy`
-  - When to use: This should be used in conjunction with external systems to signal the completion of your deploy.
-  - Are changes committed to the image at this phase: No
-  - Example use-cases
-    - Notifying slack that your app is deployed
-    - Coordinating traffic routing with a central load balancer
+    - When to use: This should be used in conjunction with external systems to signal the completion of your deploy.
+    - Are changes committed to the image at this phase: No
+    - Example use-cases
+        - Notifying slack that your app is deployed
+        - Coordinating traffic routing with a central load balancer
 - `app.json`: `scripts.postdeploy`
-  - When to use: This should be used when you wish to run a command _once_, after the app is created and not on subsequent deploys to the app.
-  - Are changes committed to the image at this phase: No
-  - Example use-cases
-    - Setting up OAuth clients and DNS
-    - Loading seed/test data into the app’s test database
+    - When to use: This should be used when you wish to run a command _once_, after the app is created and not on subsequent deploys to the app.
+    - Are changes committed to the image at this phase: No
+    - Example use-cases
+        - Setting up OAuth clients and DNS
+        - Loading seed/test data into the app’s test database
 - `Procfile`: `release`
-  - When to use: This should be used in conjunction with external systems to signal the completion of your app image build.
-  - Are changes committed to the image at this phase: No
-  - Example use-cases
-    - Sending CSS, JS, and other assets from your app’s slug to a CDN or S3 bucket
-    - Priming or invalidating cache stores
-    - Running database migrations
+    - When to use: This should be used in conjunction with external systems to signal the completion of your app image build.
+    - Are changes committed to the image at this phase: No
+    - Example use-cases
+        - Sending CSS, JS, and other assets from your app’s slug to a CDN or S3 bucket
+        - Priming or invalidating cache stores
+        - Running database migrations
 
 Additionally, if using a Dockerfile with an `ENTRYPOINT`, the deployment task is passed to that entrypoint as is. The exceptions are if the entrypoint is one of the following:
 
@@ -55,11 +56,18 @@ Please keep the above in mind when utilizing deployment tasks.
 
 ### Changing the `app.json` location
 
-When deploying a monorepo, it may be desirable to specify the specific path of the `app.json` file to use for a given app. This can be done via the `app-json:set` command. If a value is specified and that file does not exist within the repository, Dokku will continue the build process as if the repository has no `app.json` file.
+The `app.json` is expected to be found in a specific directory, depending on the deploy approach:
+
+- The `WORKDIR` of the Docker image for deploys resulting from `git:from-image` and `git:load-image` commands.
+- The root of the source code tree for all other deploys (git push, `git:from-archive`, `git:sync`).
+
+Sometimes it may be desirable to set a different path for a given app, e.g. when deploying from a monorepo. This can be done via the `appjson-path` property:
 
 ```shell
-dokku app-json:set node-js-app appjson-path second-app.json
+dokku app-json:set node-js-app appjson-path .dokku/app.json
 ```
+
+The value is the path to the desired file _relative_ to the base search directory, and will never be treated as absolute paths in any context. If that file does not exist within the repository, Dokku will continue the build process as if the repository has no `app.json`.
 
 The default value may be set by passing an empty value for the option:
 
@@ -81,6 +89,7 @@ dokku app-json:set --global appjson-path
 
 ### Displaying app-json reports for an app
 
+> [!IMPORTANT]
 > New as of 0.25.0
 
 You can get a report about the app's storage status using the `app-json:report` command:
@@ -92,17 +101,19 @@ dokku app-json:report
 ```
 =====> node-js-app app-json information
        App-json computed appjson path: app2.json
-       App-json global appjson path:   app.json
+       App-json global appjson path:
        App-json appjson path:          app2.json
 =====> python-sample app-json information
        App-json computed appjson path: app.json
-       App-json global appjson path:   app.json
+       App-json global appjson path:
        App-json appjson path:
 =====> ruby-sample app-json information
        App-json computed appjson path: app.json
-       App-json global appjson path:   app.json
+       App-json global appjson path:
        App-json appjson path:
 ```
+
+The `appjson-path` and `global-appjson-path` keys hold the raw per-app and global value respectively, and are empty when nothing has been set. The `computed-appjson-path` key holds the effective value used at deploy time, falling back to the global value (where one has been set) and then to the built-in default of `app.json`.
 
 You can run the command for a specific app also.
 
@@ -113,7 +124,7 @@ dokku app-json:report node-js-app
 ```
 =====> node-js-app app-json information
        App-json computed appjson path: app2.json
-       App-json global appjson path:   app.json
+       App-json global appjson path:
        App-json appjson path:          app2.json
 ```
 
@@ -131,15 +142,14 @@ app2.json
 
 #### `app.json` deployment tasks
 
-Dokku provides limited support for the `app.json` manifest from Heroku (documentation available [here](https://devcenter.heroku.com/articles/app-json-schema)). The keys available for use with Deployment Tasks are:
+Dokku provides limited support for the `app.json` manifest from Heroku (see the [app.json schema documentation](https://devcenter.heroku.com/articles/app-json-schema)). The keys available for use with Deployment Tasks are:
 
 - `scripts.dokku.predeploy`: This is run _after_ an app's docker image is built, but _before_ any containers are scheduled. Changes made to your image are committed at this phase.
 - `scripts.dokku.postdeploy`: This is run _after_ an app's containers are scheduled. Changes made to your image are _not_ committed at this phase.
 - `scripts.postdeploy`: This is run _after_ an app's containers are scheduled. Changes made to your image are _not_ committed at this phase.
 
-For buildpack-based deployments, the location of the `app.json` file should be at the root of your repository. Dockerfile-based app deploys should have the `app.json` in the configured `WORKDIR` directory; otherwise Dokku defaults to the buildpack app behavior of looking in `/app`.
-
-> Warning: Any failed `app.json` deployment task will fail the deploy. In the case of either phase, a failure will not affect any running containers.
+> [!WARNING]
+> Any failed `app.json` deployment task will fail the deploy. In the case of either phase, a failure will not affect any running containers.
 
 The following is an example `app.json` file. Please note that only the `scripts.dokku.predeploy` and `scripts.dokku.postdeploy` tasks are supported by Dokku at this time. All other fields will be ignored and can be omitted.
 
@@ -157,6 +167,7 @@ The following is an example `app.json` file. Please note that only the `scripts.
 
 #### Procfile Release command
 
+> [!IMPORTANT]
 > New as of 0.14.0
 
 The `Procfile` also supports a special `release` command which acts in a similar way to the [Heroku Release Phase](https://devcenter.heroku.com/articles/release-phase). This command is executed _after_ an app's docker image is built, but _before_ any containers are scheduled. This is also run _after_ any command executed by `scripts.dokku.predeploy`.
@@ -169,4 +180,5 @@ release: curl https://some.external.api.service.com/deployment?state=built
 
 Unlike the `scripts.dokku.predeploy` command, changes made during by the `release` command are _not_ persisted to disk.
 
-> Warning: scaling the release command up will likely result in unspecified issues within your deployment, and is highly discouraged.
+> [!WARNING]
+> scaling the release command up will likely result in unspecified issues within your deployment, and is highly discouraged.

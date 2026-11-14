@@ -1,0 +1,85 @@
+package main
+
+import (
+	"fmt"
+	"os"
+	"strconv"
+	"strings"
+
+	"github.com/dokku/dokku/plugins/common"
+)
+
+const (
+	helpHeader = `Usage: dokku scheduler-k3s[:COMMAND]
+
+Manage scheduler-k3s settings for an app
+
+Additional commands:`
+
+	helpContent = `
+    scheduler-k3s:annotations:clear <app|--global> [--process-type PROCESS_TYPE] [--resource-type RESOURCE_TYPE], Clear all annotations for an app or a single process-type/resource-type scope
+    scheduler-k3s:annotations:set <app|--global> <property> (<value>) [--process-type PROCESS_TYPE] <--resource-type RESOURCE_TYPE>, Set or clear an annotation for a given app/process-type/resource-type combination
+    scheduler-k3s:annotations:set --replace <app|--global> <key=value> [<key=value> ...] [--process-type PROCESS_TYPE] <--resource-type RESOURCE_TYPE>, Replace the entire annotation map for a given app/process-type/resource-type combination
+    scheduler-k3s:annotations:report [<app>|--global] [--format stdout|json] [--process-type PROCESS_TYPE] [--resource-type RESOURCE_TYPE], Displays a scheduler-k3s annotations report for one or more apps
+    scheduler-k3s:autoscaling-auth:set <app|--global> <trigger> [<--metadata key=value>...], Set or clear a scheduler-k3s autoscaling keda trigger authentication resource for an app
+    scheduler-k3s:autoscaling-auth:set --replace <app|--global> <trigger> <--metadata key=value> [<--metadata key=value>...], Replace the entire metadata map for a scheduler-k3s autoscaling keda trigger authentication resource
+    scheduler-k3s:autoscaling-auth:report [<app>|--global] [--format stdout|json] [--include-metadata], Displays a scheduler-k3s autoscaling auth report for one or more apps
+    scheduler-k3s:charts:clear <chart>, Clear all chart-specific helm values for a chart
+    scheduler-k3s:charts:report [<chart>] [--format stdout|json], Displays a scheduler-k3s chart override report
+    scheduler-k3s:charts:set <chart-name.property> (<value>), Set or clear a chart-specific helm value
+    scheduler-k3s:charts:set --replace <chart> <property=value> [<property=value> ...], Replace the entire helm value override map for a chart
+    scheduler-k3s:cluster:add [--profile PROFILE] [--role ROLE] [--insecure-allow-unknown-hosts] [--server-ip SERVER_IP] [--taint-scheduling] [--kubelet-args KUBELET_ARGS] <ssh://user@host:port>, Adds a server node to a Dokku-managed cluster
+    scheduler-k3s:cluster:list [--format json|stdout], Lists all nodes in a Dokku-managed cluster
+    scheduler-k3s:cluster:remove [node-id], Removes client node to a Dokku-managed cluster
+    scheduler-k3s:ensure-charts [--force] [--charts CHART_NAMES], Ensures the k3s charts are installed
+    scheduler-k3s:initialize [--server-ip SERVER_IP] [--ingress-class INGRESS_CLASS] [--taint-scheduling] [--kubelet-args KUBELET_ARGS], Initializes a cluster
+    scheduler-k3s:labels:clear <app|--global> [--process-type PROCESS_TYPE] [--resource-type RESOURCE_TYPE], Clear all labels for an app or a single process-type/resource-type scope
+    scheduler-k3s:labels:set <app|--global> <property> (<value>) [--process-type PROCESS_TYPE] <--resource-type RESOURCE_TYPE>, Set or clear a label for a given app/process-type/resource-type combination
+    scheduler-k3s:labels:set --replace <app|--global> <key=value> [<key=value> ...] [--process-type PROCESS_TYPE] <--resource-type RESOURCE_TYPE>, Replace the entire label map for a given app/process-type/resource-type combination
+    scheduler-k3s:labels:report [<app>|--global] [--format stdout|json] [--process-type PROCESS_TYPE] [--resource-type RESOURCE_TYPE], Displays a scheduler-k3s labels report for one or more apps
+    scheduler-k3s:node-sysctls:clear [--global|--profile PROFILE], Clear all node-level kernel sysctls for unprofiled nodes or a single node profile
+    scheduler-k3s:node-sysctls:set <sysctl> (<value>) [--global|--profile PROFILE], Set or clear a node-level kernel sysctl for unprofiled nodes or a single node profile
+    scheduler-k3s:node-sysctls:set --replace <sysctl=value> [<sysctl=value> ...] [--global|--profile PROFILE], Replace the entire node-level kernel sysctl map for unprofiled nodes or a single node profile
+    scheduler-k3s:node-sysctls:report [--format stdout|json] [--stored] [--global|--profile PROFILE], Displays the node-level kernel sysctls for each scope
+    scheduler-k3s:preview <app> [--context N] [--show-secrets] [--show-secrets-decoded], Displays a diff between the current and next deployment for an app
+    scheduler-k3s:profiles:add <profile> [--role ROLE] [--insecure-allow-unknown-hosts] [--taint-scheduling] [--kubelet-args KUBELET_ARGS], Adds a node profile to the k3s cluster
+    scheduler-k3s:profiles:list [--format json|stdout], Lists all node profiles in the k3s cluster
+    scheduler-k3s:profiles:remove <profile>, Removes a node profile from the k3s cluster
+    scheduler-k3s:report [<app>|--global] [--format stdout|json] [<flag>], Displays a scheduler-k3s report for one or more apps
+    scheduler-k3s:set <app|--global> <property> (<value>), Set or clear a scheduler-k3s property for an app or globally
+    scheduler-k3s:show-kubeconfig, Displays the kubeconfig for remote usage
+    scheduler-k3s:uninstall, Uninstalls k3s from the Dokku server`
+)
+
+func main() {
+	cmd := ""
+	if len(os.Args) > 1 {
+		cmd = os.Args[1]
+	}
+
+	switch cmd {
+	case "scheduler-k3s", "scheduler-k3s:help":
+		usage()
+	case "help":
+		result, err := common.CallExecCommand(common.ExecCommandInput{
+			Command: "ps",
+			Args:    []string{"-o", "command=", strconv.Itoa(os.Getppid())},
+		})
+		if err == nil && strings.Contains(result.StdoutContents(), "--all") {
+			fmt.Println(helpContent)
+		} else {
+			fmt.Print("\n    scheduler-k3s, Manage scheduler-k3s settings for an app\n")
+		}
+	default:
+		dokkuNotImplementExitCode, err := strconv.Atoi(os.Getenv("DOKKU_NOT_IMPLEMENTED_EXIT"))
+		if err != nil {
+			fmt.Println("failed to retrieve DOKKU_NOT_IMPLEMENTED_EXIT environment variable")
+			dokkuNotImplementExitCode = 10
+		}
+		os.Exit(dokkuNotImplementExitCode)
+	}
+}
+
+func usage() {
+	common.CommandUsage(helpHeader, helpContent)
+}

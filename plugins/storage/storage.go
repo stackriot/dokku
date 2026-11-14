@@ -1,0 +1,272 @@
+package storage
+
+import (
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strings"
+
+	"github.com/dokku/dokku/plugins/common"
+	dockeroptions "github.com/dokku/dokku/plugins/docker-options"
+)
+
+// MountPhases are the phases where storage mounts are applied
+var MountPhases = []string{"deploy", "run"}
+
+// VerifyPaths validates the storage mount path format
+func VerifyPaths(mountPath string) error {
+	if strings.HasPrefix(mountPath, "/") {
+		matched, err := regexp.MatchString(`^/.*:/`, mountPath)
+		if err != nil {
+			return err
+		}
+		if !matched {
+			return errors.New("Storage path must be two valid paths divided by colon.")
+		}
+	} else {
+		matched, err := regexp.MatchString(`^[a-zA-Z0-9][a-zA-Z0-9_.-]+:/`, mountPath)
+		if err != nil {
+			return err
+		}
+		if !matched {
+			return errors.New("Volume name must be two characters or more. Volume name must not contain invalid characters. Storage path must be two valid paths divided by colon.")
+		}
+	}
+	return nil
+}
+
+// CheckIfPathExists checks if a mount path exists in the specified phases
+func CheckIfPathExists(appName string, mountPath string, phases []string) bool {
+	for _, phase := range phases {
+		options, err := dockeroptions.GetDockerOptionsForPhase(appName, phase)
+		if err != nil {
+			continue
+		}
+		for _, option := range options {
+			if option == fmt.Sprintf("-v %s", mountPath) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// GetBindMounts returns the bind mounts for an app and phase, synthesized
+// from the attachment store. The returned strings use the legacy colon
+// form (host:container[:options]) so existing display paths keep
+// working unchanged.
+func GetBindMounts(appName string, phase string) ([]string, error) {
+	entries, err := ListAppMountEntries(appName, phase)
+	if err != nil {
+		return nil, err
+	}
+	mounts := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		mounts = append(mounts, formatStorageListEntry(entry))
+	}
+	return mounts, nil
+}
+
+// GetBindMountsForDisplay returns the bind mounts formatted for display
+func GetBindMountsForDisplay(appName string, phase string) string {
+	mounts, err := GetBindMounts(appName, phase)
+	if err != nil {
+		return ""
+	}
+
+	result := []string{}
+	for _, mount := range mounts {
+		result = append(result, fmt.Sprintf("-v %s", mount))
+	}
+	return strings.Join(result, " ")
+}
+
+// StorageListEntry represents a storage mount entry for JSON output.
+// Readonly and VolumeOptions mirror the underlying Attachment fields one
+// for one so external drift-detection tooling can compare against them
+// directly; the combined "ro,<opts>" colon-form string used by the text
+// view is derived at format time by formatStorageListEntry rather than
+// cached on the struct.
+type StorageListEntry struct {
+	EntryName     string `json:"entry_name,omitempty"`
+	HostPath      string `json:"host_path"`
+	ContainerPath string `json:"container_path"`
+	Readonly      bool   `json:"readonly,omitempty"`
+	VolumeOptions string `json:"volume_options,omitempty"`
+}
+
+// ListAppMountEntries returns one StorageListEntry per attachment on
+// an app for the requested phase, joining each attachment with its
+// referenced storage entry. Used by storage:list and the deprecated
+// storage-list trigger.
+func ListAppMountEntries(appName string, phase string) ([]StorageListEntry, error) {
+	if phase == "" {
+		phase = PhaseDeploy
+	}
+	attachments, err := AttachmentsForPhase(appName, phase)
+	if err != nil {
+		return nil, err
+	}
+
+	rows := make([]StorageListEntry, 0, len(attachments))
+	for _, attachment := range attachments {
+		entry, err := LoadEntry(attachment.EntryName)
+		if err != nil {
+			return nil, fmt.Errorf("attachment on %q references missing entry %q: %w", appName, attachment.EntryName, err)
+		}
+
+		host := entry.HostPath
+		if host == "" {
+			// k3s-only entries with no host path: surface the entry
+			// name as the host token so the colon-form output is
+			// well-formed and parseable.
+			host = entry.Name
+		}
+
+		rows = append(rows, StorageListEntry{
+			EntryName:     entry.Name,
+			HostPath:      host,
+			ContainerPath: attachment.ContainerPath,
+			Readonly:      attachment.Readonly,
+			VolumeOptions: attachment.VolumeOptions,
+		})
+	}
+	return rows, nil
+}
+
+// formatStorageListEntry renders a StorageListEntry into the legacy
+// host:container[:options] colon form for textual output. Combines
+// Readonly and VolumeOptions into a single "ro,<opts>" token to match
+// the historical shape consumers expect.
+func formatStorageListEntry(entry StorageListEntry) string {
+	options := ""
+	switch {
+	case entry.Readonly && entry.VolumeOptions != "":
+		options = "ro," + entry.VolumeOptions
+	case entry.Readonly:
+		options = "ro"
+	case entry.VolumeOptions != "":
+		options = entry.VolumeOptions
+	}
+	if options == "" {
+		return fmt.Sprintf("%s:%s", entry.HostPath, entry.ContainerPath)
+	}
+	return fmt.Sprintf("%s:%s:%s", entry.HostPath, entry.ContainerPath, options)
+}
+
+// ParseMountPath parses a mount path into its components. The optional
+// third colon-separated section is a comma-separated mount-options list;
+// any "ro" token is hoisted into the Readonly field and the remaining
+// tokens (preserving order) are rejoined into VolumeOptions.
+func ParseMountPath(mountPath string) StorageListEntry {
+	parts := strings.SplitN(mountPath, ":", 3)
+	entry := StorageListEntry{}
+
+	if len(parts) >= 1 {
+		entry.HostPath = parts[0]
+	}
+	if len(parts) >= 2 {
+		entry.ContainerPath = parts[1]
+	}
+	if len(parts) >= 3 && parts[2] != "" {
+		remaining := []string{}
+		for _, token := range strings.Split(parts[2], ",") {
+			if token == "ro" {
+				entry.Readonly = true
+				continue
+			}
+			remaining = append(remaining, token)
+		}
+		entry.VolumeOptions = strings.Join(remaining, ",")
+	}
+
+	return entry
+}
+
+// GetStorageDirectory returns the storage directory path
+func GetStorageDirectory() string {
+	dokkuLibRoot := common.GetenvWithDefault("DOKKU_LIB_ROOT", "/var/lib/dokku")
+	return fmt.Sprintf("%s/data/storage", dokkuLibRoot)
+}
+
+// HostPathForDocker rewrites a path under DOKKU_LIB_ROOT to the
+// DOKKU_LIB_HOST_ROOT view used by the host Docker daemon. Named
+// volumes and paths outside DOKKU_LIB_ROOT are returned unchanged.
+//
+// When Dokku runs in a container with a shared Docker socket, filesystem
+// operations must use DOKKU_LIB_ROOT (visible inside the Dokku container)
+// while Docker -v host paths must use DOKKU_LIB_HOST_ROOT (visible to the
+// daemon on the real host).
+func HostPathForDocker(path string) string {
+	libRoot := common.GetenvWithDefault("DOKKU_LIB_ROOT", "/var/lib/dokku")
+	libHost := os.Getenv("DOKKU_LIB_HOST_ROOT")
+	if libHost == "" || libHost == libRoot {
+		return path
+	}
+	if path == libRoot || strings.HasPrefix(path, libRoot+"/") {
+		return libHost + strings.TrimPrefix(path, libRoot)
+	}
+	return path
+}
+
+// storageDirScriptNames lists the sudo helpers shipped in the plugin's bin
+// directory. Each one takes a storage entry basename and builds the path
+// under $DOKKU_LIB_ROOT/data/storage itself, so no caller can point them
+// outside the storage root.
+var storageDirScriptNames = []string{
+	"chown-storage-dir",
+	"chmod-storage-dir",
+	"destroy-storage-dir",
+}
+
+// StorageDirScriptPath returns the absolute path to a storage directory
+// sudo helper.
+func StorageDirScriptPath(name string) string {
+	pluginPath := common.MustGetEnv("PLUGIN_AVAILABLE_PATH")
+	return filepath.Join(pluginPath, "storage", "bin", name)
+}
+
+// StorageDirScripts returns the absolute path of every storage directory
+// sudo helper. TriggerInstall whitelists each one in the plugin's sudoers
+// file.
+func StorageDirScripts() []string {
+	paths := []string{}
+	for _, name := range storageDirScriptNames {
+		paths = append(paths, StorageDirScriptPath(name))
+	}
+	return paths
+}
+
+// callStorageDirScript runs a storage directory sudo helper, surfacing the
+// helper's own stderr message when it refuses the arguments.
+func callStorageDirScript(name string, args ...string) error {
+	result, err := common.CallExecCommand(common.ExecCommandInput{
+		Command: "sudo",
+		Args:    append([]string{StorageDirScriptPath(name)}, args...),
+	})
+	if err != nil {
+		return err
+	}
+	if result.ExitCode != 0 {
+		return errors.New(strings.TrimSpace(result.StderrContents()))
+	}
+	return nil
+}
+
+// ValidateDirectoryName validates a storage directory name
+func ValidateDirectoryName(directory string) error {
+	if directory == "" {
+		return errors.New("Please specify a directory to create")
+	}
+
+	matched, err := regexp.MatchString(`^[A-Za-z0-9_-]+$`, directory)
+	if err != nil {
+		return err
+	}
+	if !matched {
+		return errors.New("Directory can only contain the following set of characters: [A-Za-z0-9_-]")
+	}
+	return nil
+}

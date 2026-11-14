@@ -1,20 +1,21 @@
 package appjson
 
 import (
-	"bytes"
-	"context"
+	"bufio"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 
 	"github.com/dokku/dokku/plugins/common"
 	shellquote "github.com/kballard/go-shellquote"
-	"golang.org/x/sync/errgroup"
+	"github.com/mattn/go-isatty"
 )
 
 func constructScript(command string, shell string, isHerokuishImage bool, isCnbImage bool, dockerfileEntrypoint string) []string {
@@ -49,11 +50,6 @@ func constructScript(command string, shell string, isHerokuishImage bool, isCnbI
 			"if [[ -d '/app/.profile.d' ]]; then",
 			"  for file in /app/.profile.d/*; do source $file; done;",
 			"fi;",
-
-			"if [[ -d '/cache' ]]; then",
-			"  rm -rf /tmp/cache ;",
-			"  ln -sf /cache /tmp/cache;",
-			"fi;",
 		}...)
 	}
 
@@ -69,42 +65,27 @@ func constructScript(command string, shell string, isHerokuishImage bool, isCnbI
 
 	script = append(script, fmt.Sprintf("%s || exit 1;", command))
 
-	if isHerokuishImage && !isCnbImage {
-		script = append(script, []string{
-			"if [[ -d '/cache' ]]; then",
-			"  rm -f /tmp/cache;",
-			"fi;",
-		}...)
-	}
-
 	return []string{shell, "-c", strings.Join(script, " ")}
 }
 
-func getAppJSON(appName string) (AppJSON, error) {
-	if !common.FileExists(GetAppjsonPath(appName)) {
-		return AppJSON{}, nil
+func getAppJSONPath(appName string) string {
+	directory := filepath.Join(common.MustGetEnv("DOKKU_LIB_ROOT"), "data", "app-json", appName)
+	return filepath.Join(directory, "app.json")
+}
+
+func getProcessSpecificAppJSONPath(appName string) string {
+	existingAppJSON := getAppJSONPath(appName)
+	processSpecificAppJSON := fmt.Sprintf("%s.%s", existingAppJSON, os.Getenv("DOKKU_PID"))
+	if common.FileExists(processSpecificAppJSON) {
+		return processSpecificAppJSON
 	}
 
-	b, err := ioutil.ReadFile(GetAppjsonPath(appName))
-	if err != nil {
-		return AppJSON{}, fmt.Errorf("Cannot read app.json file: %v", err)
-	}
-
-	if strings.TrimSpace(string(b)) == "" {
-		return AppJSON{}, nil
-	}
-
-	var appJSON AppJSON
-	if err = json.Unmarshal(b, &appJSON); err != nil {
-		return AppJSON{}, fmt.Errorf("Cannot parse app.json: %v", err)
-	}
-
-	return appJSON, nil
+	return existingAppJSON
 }
 
 // getPhaseScript extracts app.json from app image and returns the appropriate json key/value
 func getPhaseScript(appName string, phase string) (string, error) {
-	appJSON, err := getAppJSON(appName)
+	appJSON, err := GetAppJSON(appName)
 	if err != nil {
 		return "", err
 	}
@@ -121,66 +102,47 @@ func getPhaseScript(appName string, phase string) (string, error) {
 }
 
 // getReleaseCommand extracts the release command from a given app's procfile
-func getReleaseCommand(appName string, image string) string {
-	err := common.SuppressOutput(func() error {
-		return common.PlugnTrigger("procfile-extract", []string{appName, image}...)
-	})
-
-	if err != nil {
-		return ""
-	}
-
+func getReleaseCommand(appName string) string {
 	processType := "release"
 	port := "5000"
-	b, _ := common.PlugnTriggerOutput("procfile-get-command", []string{appName, processType, port}...)
-	return strings.TrimSpace(string(b[:]))
+	results, _ := common.CallPlugnTrigger(common.PlugnTriggerInput{
+		Trigger: "procfile-get-command",
+		Args:    []string{appName, processType, port},
+	})
+	return results.StdoutContents()
 }
 
-func getDokkuAppShell(appName string) string {
-	shell := "/bin/bash"
-	globalShell := ""
-	appShell := ""
-
-	ctx := context.Background()
-	errs, ctx := errgroup.WithContext(ctx)
-	errs.Go(func() error {
-		b, _ := common.PlugnTriggerOutput("config-get-global", []string{"DOKKU_APP_SHELL"}...)
-		globalShell = strings.TrimSpace(string(b[:]))
-		return nil
-	})
-	errs.Go(func() error {
-		b, _ := common.PlugnTriggerOutput("config-get", []string{appName, "DOKKU_APP_SHELL"}...)
-		appShell = strings.TrimSpace(string(b[:]))
-		return nil
-	})
-
-	errs.Wait()
-	if appShell != "" {
-		shell = appShell
-	} else if globalShell != "" {
-		shell = globalShell
+func hasAppJSON(appName string) bool {
+	appJSONPath := getAppJSONPath(appName)
+	if common.FileExists(fmt.Sprintf("%s.%s.missing", appJSONPath, os.Getenv("DOKKU_PID"))) {
+		return false
 	}
 
-	return shell
+	if common.FileExists(fmt.Sprintf("%s.%s", appJSONPath, os.Getenv("DOKKU_PID"))) {
+		return true
+	}
+
+	return common.FileExists(appJSONPath)
 }
 
-func cleanupDeploymentContainer(appName string, containerID string, phase string) error {
+func cleanupDeploymentContainer(containerID string, phase string) error {
 	if phase != "predeploy" {
 		os.Setenv("DOKKU_SKIP_IMAGE_RETIRE", "true")
 	}
-	return common.PlugnTrigger("scheduler-register-retired", []string{appName, containerID}...)
+
+	if !common.ContainerRemove(containerID) {
+		return fmt.Errorf("Failed to remove %s execution container", phase)
+	}
+
+	return nil
 }
 
 func executeScript(appName string, image string, imageTag string, phase string) error {
-	phaseName := phase
-	if phase == "heroku.postdeploy" {
-		phaseName = "first deploy postdeploy"
-	}
-	common.LogInfo1(fmt.Sprintf("Checking for %s task", phaseName))
+	common.LogInfo1(fmt.Sprintf("Checking for %s task", phase))
 	command := ""
 	phaseSource := ""
 	if phase == "release" {
-		command = getReleaseCommand(appName, image)
+		command = getReleaseCommand(appName)
 		phaseSource = "Procfile"
 	} else {
 		var err error
@@ -191,11 +153,16 @@ func executeScript(appName string, image string, imageTag string, phase string) 
 	}
 
 	if command == "" {
-		common.LogVerbose(fmt.Sprintf("No %s task found, skipping", phaseName))
+		common.LogVerbose(fmt.Sprintf("No %s task found, skipping", phase))
 		return nil
 	}
 
-	common.LogInfo1(fmt.Sprintf("Executing %s task from %s: %s", phaseName, phaseSource, command))
+	if phase == "predeploy" {
+		common.LogVerbose(fmt.Sprintf("Executing %s task from %s: %s", phase, phaseSource, command))
+	} else {
+		common.LogVerbose(fmt.Sprintf("Executing %s task from %s in ephemeral container: %s", phase, phaseSource, command))
+	}
+
 	isHerokuishImage := common.IsImageHerokuishBased(image, appName)
 	isCnbImage := common.IsImageCnbBased(image)
 	dockerfileEntrypoint := ""
@@ -205,7 +172,7 @@ func executeScript(appName string, image string, imageTag string, phase string) 
 		dockerfileCommand, _ = getCommandFromImage(image)
 	}
 
-	dokkuAppShell := getDokkuAppShell(appName)
+	dokkuAppShell := common.GetDokkuAppShell(appName)
 	script := constructScript(command, dokkuAppShell, isHerokuishImage, isCnbImage, dockerfileEntrypoint)
 
 	imageSourceType := "dockerfile"
@@ -215,30 +182,39 @@ func executeScript(appName string, image string, imageTag string, phase string) 
 		imageSourceType = "pack"
 	}
 
-	cacheDir := fmt.Sprintf("%s/cache", common.AppRoot(appName))
-	cacheHostDir := fmt.Sprintf("%s/cache", common.AppHostRoot(appName))
-	if !common.DirectoryExists(cacheDir) {
-		os.MkdirAll(cacheDir, 0755)
-	}
-
+	// Both triggers are fatal here, the same way they are on the scheduler's
+	// own deploy path. Swallowing the error meant a plugin refusing to describe
+	// the container - a storage entry belonging to another scheduler, say -
+	// silently produced a deploy task running without the arguments it asked
+	// for, while the identical failure aborted the deploy a moment later.
 	var dockerArgs []string
-	if b, err := common.PlugnTriggerSetup("docker-args-deploy", []string{appName, imageTag}...).SetInput("").Output(); err == nil {
-		words, err := shellquote.Split(strings.TrimSpace(string(b[:])))
-		if err != nil {
-			return err
-		}
-
-		dockerArgs = append(dockerArgs, words...)
+	results, err := common.CallPlugnTrigger(common.PlugnTriggerInput{
+		Trigger: "docker-args-deploy",
+		Args:    []string{appName, imageTag},
+		Stdin:   strings.NewReader(""),
+	})
+	if err != nil {
+		return fmt.Errorf("Error getting deploy docker args for %s task: %w", phase, err)
 	}
-
-	if b, err := common.PlugnTriggerSetup("docker-args-process-deploy", []string{appName, imageSourceType, imageTag}...).SetInput("").Output(); err == nil {
-		words, err := shellquote.Split(strings.TrimSpace(string(b[:])))
-		if err != nil {
-			return err
-		}
-
-		dockerArgs = append(dockerArgs, words...)
+	words, err := shellquote.Split(results.StdoutContents())
+	if err != nil {
+		return err
 	}
+	dockerArgs = append(dockerArgs, words...)
+
+	results, err = common.CallPlugnTrigger(common.PlugnTriggerInput{
+		Trigger: "docker-args-process-deploy",
+		Args:    []string{appName, imageSourceType, imageTag},
+		Stdin:   strings.NewReader(""),
+	})
+	if err != nil {
+		return fmt.Errorf("Error getting process deploy docker args for %s task: %w", phase, err)
+	}
+	words, err = shellquote.Split(results.StdoutContents())
+	if err != nil {
+		return err
+	}
+	dockerArgs = append(dockerArgs, words...)
 
 	filteredArgs := []string{
 		"--cpus",
@@ -279,7 +255,9 @@ func executeScript(appName string, image string, imageTag string, phase string) 
 	}
 
 	dockerArgs = append(dockerArgs, "--label=dokku_phase_script="+phase)
-	dockerArgs = append(dockerArgs, "-v", cacheHostDir+":/cache")
+	if isHerokuishImage && !isCnbImage {
+		dockerArgs = append(dockerArgs, "-v", fmt.Sprintf("cache-%s:/tmp/cache", appName))
+	}
 	if os.Getenv("DOKKU_TRACE") != "" {
 		dockerArgs = append(dockerArgs, "--env", "DOKKU_TRACE="+os.Getenv("DOKKU_TRACE"))
 	}
@@ -296,18 +274,18 @@ func executeScript(appName string, image string, imageTag string, phase string) 
 		return fmt.Errorf("Failed to create %s execution container: %s", phase, err.Error())
 	}
 
-	defer cleanupDeploymentContainer(appName, containerID, phase)
+	defer cleanupDeploymentContainer(containerID, phase)
 
 	if !waitForExecution(containerID) {
-		common.LogInfo2Quiet(fmt.Sprintf("Start of %s %s task (%s) output", appName, phaseName, containerID[0:9]))
+		common.LogInfo2Quiet(fmt.Sprintf("Start of %s %s task (%s) output", appName, phase, containerID[0:9]))
 		common.LogVerboseQuietContainerLogs(containerID)
-		common.LogInfo2Quiet(fmt.Sprintf("End of %s %s task (%s) output", appName, phaseName, containerID[0:9]))
-		return fmt.Errorf("Execution of %s task failed: %s", phaseName, command)
+		common.LogInfo2Quiet(fmt.Sprintf("End of %s %s task (%s) output", appName, phase, containerID[0:9]))
+		return fmt.Errorf("Execution of %s task failed: %s", phase, command)
 	}
 
-	common.LogInfo2Quiet(fmt.Sprintf("Start of %s %s task (%s) output", appName, phaseName, containerID[0:9]))
+	common.LogInfo2Quiet(fmt.Sprintf("Start of %s %s task (%s) output", appName, phase, containerID[0:9]))
 	common.LogVerboseQuietContainerLogs(containerID)
-	common.LogInfo2Quiet(fmt.Sprintf("End of %s %s task (%s) output", appName, phaseName, containerID[0:9]))
+	common.LogInfo2Quiet(fmt.Sprintf("End of %s %s task (%s) output", appName, phase, containerID[0:9]))
 
 	if phase != "predeploy" {
 		return nil
@@ -335,14 +313,17 @@ func executeScript(appName string, image string, imageTag string, phase string) 
 		fmt.Sprintf("LABEL com.dokku.%s-phase=true", phase),
 	}...)
 	commitArgs = append(commitArgs, containerID, image)
-	containerCommitCmd := common.NewShellCmdWithArgs(
-		common.DockerBin(),
-		commitArgs...,
-	)
-	containerCommitCmd.ShowOutput = false
-	containerCommitCmd.Command.Stderr = os.Stderr
-	if !containerCommitCmd.Execute() {
-		return fmt.Errorf("Commiting of '%s' to image failed: %s", phase, command)
+	result, err := common.CallExecCommand(common.ExecCommandInput{
+		Command:      common.DockerBin(),
+		Args:         commitArgs,
+		StreamStderr: true,
+	})
+	if err != nil {
+		return fmt.Errorf("Committing of '%s' to image failed: %w", phase, err)
+	}
+
+	if result.ExitCode != 0 {
+		return fmt.Errorf("Committing of '%s' to image failed: %s", phase, command)
 	}
 
 	return nil
@@ -393,34 +374,11 @@ func getCommandFromImage(image string) (string, error) {
 }
 
 func waitForExecution(containerID string) bool {
-	containerStartCmd := common.NewShellCmdWithArgs(
-		common.DockerBin(),
-		"container",
-		"start",
-		containerID,
-	)
-	containerStartCmd.ShowOutput = false
-	containerStartCmd.Command.Stderr = os.Stderr
-	if !containerStartCmd.Execute() {
+	if !common.ContainerStart(containerID) {
 		return false
 	}
 
-	containerWaitCmd := common.NewShellCmdWithArgs(
-		common.DockerBin(),
-		"container",
-		"wait",
-		containerID,
-	)
-
-	containerWaitCmd.ShowOutput = false
-	containerWaitCmd.Command.Stderr = os.Stderr
-	b, err := containerWaitCmd.Output()
-	if err != nil {
-		return false
-	}
-
-	containerExitCode := strings.TrimSpace(string(b[:]))
-	return containerExitCode == "0"
+	return common.ContainerWait(containerID)
 }
 
 func createdContainerID(appName string, dockerArgs []string, image string, command []string, phase string) (string, error) {
@@ -434,149 +392,276 @@ func createdContainerID(appName string, dockerArgs []string, image string, comma
 	arguments = append(arguments, image)
 	arguments = append(arguments, command...)
 
-	b, err := common.PlugnTriggerOutput("config-export", []string{appName, "false", "true", "json"}...)
+	results, err := common.CallPlugnTrigger(common.PlugnTriggerInput{
+		Trigger: "config-export",
+		Args:    []string{appName, "false", "true", "json"},
+	})
 	if err != nil {
 		return "", err
 	}
 	var env map[string]string
-	if err := json.Unmarshal(b, &env); err != nil {
+	if err := json.Unmarshal(results.StdoutBytes(), &env); err != nil {
 		return "", err
 	}
 
-	containerCreateCmd := common.NewShellCmdWithArgs(
-		common.DockerBin(),
-		arguments...,
-	)
-	var stderr bytes.Buffer
-	containerCreateCmd.Env = env
-	containerCreateCmd.ShowOutput = false
-	containerCreateCmd.Command.Stderr = &stderr
-
-	b, err = containerCreateCmd.Output()
+	result, err := common.CallExecCommand(common.ExecCommandInput{
+		Command: common.DockerBin(),
+		Args:    arguments,
+		Env:     env,
+	})
 	if err != nil {
-		return "", errors.New(stderr.String())
+		return "", err
+	}
+	if result.ExitCode != 0 {
+		return "", errors.New(result.StderrContents())
 	}
 
-	containerID := strings.TrimSpace(string(b))
-	err = common.PlugnTrigger("post-container-create", []string{"app", containerID, appName, phase}...)
+	containerID := result.StdoutContents()
+	_, err = common.CallPlugnTrigger(common.PlugnTriggerInput{
+		Trigger:     "post-container-create",
+		Args:        []string{"app", containerID, appName, phase},
+		StreamStdio: true,
+	})
 	return containerID, err
 }
 
-func refreshAppJSON(appName string, image string) error {
-	baseDirectory := filepath.Join(common.MustGetEnv("DOKKU_LIB_ROOT"), "data", "app-json")
-	if !common.DirectoryExists(baseDirectory) {
-		return errors.New("Run 'dokku plugin:install' to ensure the correct directories exist")
-	}
-
-	directory := GetAppjsonDirectory(appName)
-	if !common.DirectoryExists(directory) {
-		if err := os.MkdirAll(directory, 0755); err != nil {
-			return err
-		}
-	}
-
-	appjsonPath := GetAppjsonPath(appName)
-	if common.FileExists(appjsonPath) {
-		if err := os.Remove(appjsonPath); err != nil {
-			return errors.New("Unable to remove previous app.json file")
-		}
-	}
-
-	common.CopyFromImage(appName, image, reportComputedAppjsonpath(appName), appjsonPath)
-	return nil
-}
-
-func setScale(appName string, image string) error {
-	if err := injectDokkuScale(appName, image); err != nil {
-		return err
-	}
-
-	appJSON, err := getAppJSON(appName)
+func setScale(appName string) error {
+	appJSON, err := GetAppJSON(appName)
 	if err != nil {
 		return err
 	}
 
 	skipDeploy := true
-	clearExisting := false
+	clearExisting := true
 	args := []string{appName, strconv.FormatBool(skipDeploy), strconv.FormatBool(clearExisting)}
 	for processType, formation := range appJSON.Formation {
 		if formation.Quantity != nil {
+			if *formation.Quantity < 0 {
+				return fmt.Errorf("Invalid quantity for process type %s in app.json: value must be zero or greater", processType)
+			}
+
 			args = append(args, fmt.Sprintf("%s=%d", processType, *formation.Quantity))
 		}
 	}
 
 	if len(args) == 3 {
-		return common.PlugnTrigger("ps-can-scale", []string{appName, "true"}...)
-	}
-
-	if err := common.PlugnTrigger("ps-can-scale", []string{appName, "false"}...); err != nil {
+		_, err := common.CallPlugnTrigger(common.PlugnTriggerInput{
+			Trigger:     "ps-can-scale",
+			Args:        []string{appName, "true"},
+			StreamStdio: true,
+		})
 		return err
 	}
 
-	return common.PlugnTrigger("ps-set-scale", args...)
+	_, err = common.CallPlugnTrigger(common.PlugnTriggerInput{
+		Trigger:     "ps-can-scale",
+		Args:        []string{appName, "false"},
+		StreamStdio: true,
+	})
+	if err != nil {
+		return err
+	}
+
+	_, err = common.CallPlugnTrigger(common.PlugnTriggerInput{
+		Trigger:     "ps-set-scale",
+		Args:        args,
+		StreamStdio: true,
+	})
+	return err
 }
 
-func injectDokkuScale(appName string, image string) error {
-	appJSON, err := getAppJSON(appName)
+// generateSecret generates a cryptographically secure random hex string of specified length
+func generateSecret(length int) (string, error) {
+	bytes := make([]byte, length/2)
+	if _, err := rand.Read(bytes); err != nil {
+		return "", fmt.Errorf("failed to generate secret: %w", err)
+	}
+	return hex.EncodeToString(bytes), nil
+}
+
+// isInteractive returns true if stdin is a terminal (TTY available)
+func isInteractive() bool {
+	return isatty.IsTerminal(os.Stdin.Fd()) || isatty.IsCygwinTerminal(os.Stdin.Fd())
+}
+
+// promptForValue prompts the user for an environment variable value
+func promptForValue(varName string, envVar EnvVarValue) (string, error) {
+	prompt := fmt.Sprintf("Enter value for %s", varName)
+	if envVar.Description != "" {
+		prompt = fmt.Sprintf("Enter value for %s (%s)", varName, envVar.Description)
+	}
+
+	common.LogInfo1(prompt)
+	fmt.Print("> ")
+
+	reader := bufio.NewReader(os.Stdin)
+	response, err := reader.ReadString('\n')
 	if err != nil {
-		return err
+		return "", err
 	}
 
-	baseDirectory := filepath.Join(common.MustGetEnv("DOKKU_LIB_ROOT"), "data", "app-json")
-	if !common.DirectoryExists(baseDirectory) {
-		return errors.New("Run 'dokku plugin:install' to ensure the correct directories exist")
+	return strings.TrimSpace(response), nil
+}
+
+// getCurrentConfig retrieves the current config values for an app
+func getCurrentConfig(appName string) (map[string]string, error) {
+	results, err := common.CallPlugnTrigger(common.PlugnTriggerInput{
+		Trigger: "config-export",
+		Args:    []string{appName, "false", "true", "json"},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to get current config: %w", err)
 	}
 
-	dokkuScaleFile := filepath.Join(baseDirectory, "DOKKU_SCALE")
-	previouslyExtracted := common.FileExists(dokkuScaleFile)
-	if previouslyExtracted {
-		os.Remove(dokkuScaleFile)
+	var currentConfig map[string]string
+	if err := json.Unmarshal(results.StdoutBytes(), &currentConfig); err != nil {
+		return nil, fmt.Errorf("failed to parse current config: %w", err)
 	}
 
-	common.CopyFromImage(appName, image, "DOKKU_SCALE", dokkuScaleFile)
+	return currentConfig, nil
+}
 
-	if !common.FileExists(dokkuScaleFile) {
+// setConfigVars sets multiple config vars for an app without triggering restart
+func setConfigVars(appName string, vars map[string]string) error {
+	if len(vars) == 0 {
 		return nil
 	}
 
-	lines, err := common.FileToSlice(dokkuScaleFile)
+	// Build arguments for config-set trigger: --no-restart flag, appName, key=value pairs
+	args := []string{"--no-restart", appName}
+	for key, value := range vars {
+		args = append(args, fmt.Sprintf("%s=%s", key, value))
+	}
+
+	_, err := common.CallPlugnTrigger(common.PlugnTriggerInput{
+		Trigger:     "config-set",
+		Args:        args,
+		StreamStdio: true,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to set config vars: %w", err)
+	}
+
+	return nil
+}
+
+// processAppJSONEnv processes env vars from app.json and sets them as config
+func processAppJSONEnv(appName string) error {
+	appJSON, err := GetAppJSON(appName)
 	if err != nil {
 		return err
 	}
 
-	if appJSON.Formation == nil {
-		common.LogWarn("Deprecated: Injecting scale settings from DOKKU_SCALE file. Use the 'formation' key the app.json file to specify scaling instead of 'DOKKU_SCALE'.")
-		appJSON.Formation = make(map[string]Formation)
-	} else {
-		common.LogWarn("Deprecated: DOKKU_SCALE ignored in favor of 'formation' key in the app.json")
+	if len(appJSON.Env) == 0 {
 		return nil
 	}
 
-	for _, line := range lines {
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
+	common.LogInfo1("Processing app.json env vars")
 
-		procParts := strings.SplitN(line, "=", 2)
-		if len(procParts) != 2 {
-			continue
-		}
+	isFirstDeploy := common.PropertyGet("common", appName, "deployed") != "true"
 
-		processType := procParts[0]
-		quantity, err := strconv.Atoi(procParts[1])
-		if err != nil {
-			continue
-		}
+	// Check if env vars have been processed for this deploy
+	envProcessedProperty := "appjson-env-processed"
+	alreadyProcessed := common.PropertyGet("app-json", appName, envProcessedProperty) == "executed"
 
-		appJSON.Formation[processType] = Formation{
-			Quantity: &quantity,
-		}
-	}
-
-	b, err := json.Marshal(appJSON)
+	// Get current config values
+	currentConfig, err := getCurrentConfig(appName)
 	if err != nil {
 		return err
 	}
 
-	return ioutil.WriteFile(GetAppjsonPath(appName), b, 0644)
+	varsToSet := make(map[string]string)
+	interactive := isInteractive()
+
+	// Sort keys for deterministic ordering
+	var keys []string
+	for k := range appJSON.Env {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	for _, varName := range keys {
+		envVar := appJSON.Env[varName]
+
+		// Determine if we should process this var
+		shouldProcess := false
+		if isFirstDeploy && !alreadyProcessed {
+			// First deploy: process all vars
+			shouldProcess = true
+		} else if envVar.Sync {
+			// Subsequent deploy with sync: always process sync vars
+			shouldProcess = true
+		}
+
+		if !shouldProcess {
+			continue
+		}
+
+		// Check if already set (for first deploy, skip if already has value and not sync)
+		currentValue, hasValue := currentConfig[varName]
+		if hasValue && currentValue != "" && !envVar.Sync {
+			common.LogDebug(fmt.Sprintf("Skipping %s: already set", varName))
+			continue
+		}
+
+		// Determine the value
+		var value string
+
+		// Handle generator
+		if envVar.Generator == "secret" {
+			if !hasValue || currentValue == "" || envVar.Sync {
+				generated, err := generateSecret(64)
+				if err != nil {
+					return fmt.Errorf("failed to generate secret for %s: %w", varName, err)
+				}
+				value = generated
+				common.LogDebug(fmt.Sprintf("Generated secret for %s", varName))
+			} else {
+				continue // Already has value, not sync
+			}
+		} else if envVar.Value != "" {
+			// Use default value
+			value = envVar.Value
+		} else if interactive {
+			// Prompt user
+			prompted, err := promptForValue(varName, envVar)
+			if err != nil {
+				if envVar.IsRequired() {
+					return fmt.Errorf("required env var %s has no value and prompt failed: %w", varName, err)
+				}
+				continue
+			}
+			if prompted == "" && envVar.IsRequired() {
+				return fmt.Errorf("required env var %s cannot be empty", varName)
+			}
+			value = prompted
+		} else {
+			// No TTY, no default, no generator
+			if envVar.IsRequired() {
+				return fmt.Errorf("required env var %s has no value, no default, and no TTY for prompt", varName)
+			}
+			continue
+		}
+
+		if value != "" {
+			varsToSet[varName] = value
+		}
+	}
+
+	if len(varsToSet) == 0 {
+		common.LogVerbose("No env vars to set from app.json")
+		if !isFirstDeploy {
+			return common.PropertyWrite("app-json", appName, envProcessedProperty, "executed")
+		}
+		return nil
+	}
+
+	// Set the config vars without restart (we're in middle of deploy)
+	common.LogInfo1(fmt.Sprintf("Setting %d env var(s) from app.json", len(varsToSet)))
+	if err := setConfigVars(appName, varsToSet); err != nil {
+		return fmt.Errorf("failed to set env vars: %w", err)
+	}
+
+	// Mark as processed
+	return common.PropertyWrite("app-json", appName, envProcessedProperty, "executed")
 }

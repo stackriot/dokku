@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+source "$PLUGIN_CORE_AVAILABLE_PATH/common/functions"
+source "$PLUGIN_CORE_AVAILABLE_PATH/common/property-functions"
+set -eo pipefail
+[[ $DOKKU_TRACE ]] && set -x
+
+fn-builder-nixpacks-computed-nixpackstoml-path() {
+  declare APP="$1"
+
+  file="$(fn-builder-nixpacks-nixpackstoml-path "$APP")"
+  if [[ "$file" == "" ]]; then
+    file="$(fn-builder-nixpacks-global-nixpackstoml-path "$APP")"
+  fi
+  if [[ "$file" == "" ]]; then
+    file="nixpacks.toml"
+  fi
+
+  echo "$file"
+}
+
+fn-builder-nixpacks-global-nixpackstoml-path() {
+  declare APP="$1"
+
+  fn-plugin-property-get "builder-nixpacks" "--global" "nixpackstoml-path" ""
+}
+
+fn-builder-nixpacks-nixpackstoml-path() {
+  declare APP="$1"
+
+  fn-plugin-property-get "builder-nixpacks" "$APP" "nixpackstoml-path" ""
+}

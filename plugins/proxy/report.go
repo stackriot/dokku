@@ -1,21 +1,42 @@
 package proxy
 
 import (
-	"strings"
-
 	"github.com/dokku/dokku/plugins/common"
 )
 
 // ReportSingleApp is an internal function that displays the proxy report for one or more apps
 func ReportSingleApp(appName string, format string, infoFlag string) error {
-	if err := common.VerifyAppName(appName); err != nil {
-		return err
+	if appName != "--global" {
+		if err := common.VerifyAppName(appName); err != nil {
+			return err
+		}
 	}
 
-	flags := map[string]common.ReportFunc{
-		"--proxy-enabled":  reportEnabled,
-		"--proxy-type":     reportType,
-		"--proxy-port-map": reportPortMap,
+	var flags map[string]common.ReportFunc
+	if appName == "--global" {
+		flags = map[string]common.ReportFunc{
+			"--proxy-computed-proxy-port":     reportComputedProxyPort,
+			"--proxy-computed-proxy-ssl-port": reportComputedProxySSLPort,
+			"--proxy-computed-type":           reportComputedType,
+			"--proxy-global-proxy-port":       reportGlobalProxyPort,
+			"--proxy-global-proxy-ssl-port":   reportGlobalProxySSLPort,
+			"--proxy-global-type":             reportGlobalType,
+		}
+	} else {
+		flags = map[string]common.ReportFunc{
+			"--proxy-computed-disabled":       reportComputedDisabled,
+			"--proxy-computed-proxy-port":     reportComputedProxyPort,
+			"--proxy-computed-proxy-ssl-port": reportComputedProxySSLPort,
+			"--proxy-computed-type":           reportComputedType,
+			"--proxy-disabled":                reportDisabled,
+			"--proxy-enabled":                 reportEnabled,
+			"--proxy-global-proxy-port":       reportGlobalProxyPort,
+			"--proxy-global-proxy-ssl-port":   reportGlobalProxySSLPort,
+			"--proxy-global-type":             reportGlobalType,
+			"--proxy-proxy-port":              reportProxyPort,
+			"--proxy-proxy-ssl-port":          reportProxySSLPort,
+			"--proxy-type":                    reportType,
+		}
 	}
 
 	flagKeys := []string{}
@@ -23,10 +44,18 @@ func ReportSingleApp(appName string, format string, infoFlag string) error {
 		flagKeys = append(flagKeys, flagKey)
 	}
 
-	trimPrefix := false
-	uppercaseFirstCharacter := true
 	infoFlags := common.CollectReport(appName, infoFlag, flags)
-	return common.ReportSingleApp("proxy", appName, infoFlag, infoFlags, flagKeys, format, trimPrefix, uppercaseFirstCharacter)
+	return common.ReportSingleApp(common.ReportSingleAppInput{
+		ReportType:              "proxy",
+		AppName:                 appName,
+		InfoFlag:                infoFlag,
+		InfoFlags:               infoFlags,
+		InfoFlagKeys:            flagKeys,
+		Format:                  format,
+		TrimPrefix:              true,
+		UppercaseFirstCharacter: true,
+		EmitLegacyPrefix:        true,
+	})
 }
 
 func reportEnabled(appName string) string {
@@ -38,15 +67,46 @@ func reportEnabled(appName string) string {
 	return proxyEnabled
 }
 
+func reportComputedType(appName string) string {
+	return getComputedProxyType(appName)
+}
+
+func reportGlobalType(appName string) string {
+	return getGlobalProxyType()
+}
+
 func reportType(appName string) string {
 	return getAppProxyType(appName)
 }
 
-func reportPortMap(appName string) string {
-	var proxyPortMap []string
-	for _, portMap := range getProxyPortMap(appName) {
-		proxyPortMap = append(proxyPortMap, portMap.String())
-	}
+func reportDisabled(appName string) string {
+	return getAppDisabled(appName)
+}
 
-	return strings.Join(proxyPortMap, " ")
+func reportComputedDisabled(appName string) string {
+	return getComputedDisabled(appName)
+}
+
+func reportProxyPort(appName string) string {
+	return getAppProxyPort(appName)
+}
+
+func reportGlobalProxyPort(appName string) string {
+	return getGlobalProxyPort()
+}
+
+func reportComputedProxyPort(appName string) string {
+	return getComputedProxyPort(appName)
+}
+
+func reportProxySSLPort(appName string) string {
+	return getAppProxySSLPort(appName)
+}
+
+func reportGlobalProxySSLPort(appName string) string {
+	return getGlobalProxySSLPort()
+}
+
+func reportComputedProxySSLPort(appName string) string {
+	return getComputedProxySSLPort(appName)
 }

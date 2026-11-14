@@ -1,0 +1,644 @@
+#!/usr/bin/env bats
+
+load test_helper
+
+setup() {
+  global_setup
+  dokku nginx:stop
+  dokku caddy:set --global letsencrypt-server https://acme-staging-v02.api.letsencrypt.org/directory
+  dokku caddy:set --global letsencrypt-email
+  dokku caddy:start
+  create_app
+}
+
+teardown() {
+  global_teardown
+  destroy_app
+  dokku caddy:stop
+  dokku nginx:start
+}
+
+@test "(caddy:report) --global global vs computed log-level" {
+  run /bin/bash -c "dokku caddy:report --global --caddy-global-log-level"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output ""
+
+  run /bin/bash -c "dokku caddy:report --global --caddy-computed-log-level"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "ERROR"
+
+  run /bin/bash -c "dokku caddy:set --global log-level DEBUG"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku caddy:report --global --caddy-global-log-level"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "DEBUG"
+
+  run /bin/bash -c "dokku caddy:report --global --caddy-computed-log-level"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "DEBUG"
+
+  run /bin/bash -c "dokku caddy:set --global log-level"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku caddy:report --global --caddy-global-log-level"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output ""
+
+  run /bin/bash -c "dokku caddy:report --global --caddy-computed-log-level"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "ERROR"
+}
+
+@test "(caddy:report) --global raw and computed keys in --format json" {
+  run /bin/bash -c "dokku caddy:report --global --format json | jq -r '.\"global-image\"'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output ""
+
+  run /bin/bash -c "dokku caddy:report --global --format json | jq -r '.\"computed-image\"'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output_exists
+
+  run /bin/bash -c "dokku caddy:report --global --format json | jq -r '.\"global-polling-interval\"'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output ""
+
+  run /bin/bash -c "dokku caddy:report --global --format json | jq -r '.\"computed-polling-interval\"'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "5s"
+}
+
+@test "(caddy) global-only keys" {
+  for key in image letsencrypt-email letsencrypt-server log-level polling-interval; do
+    run /bin/bash -c "dokku caddy:set $TEST_APP $key somevalue"
+    echo "key: $key"
+    echo "output: $output"
+    echo "status: $status"
+    assert_failure
+    assert_output_contains "can only be set globally"
+  done
+
+  run /bin/bash -c "dokku caddy:set $TEST_APP tls-internal true"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku caddy:report $TEST_APP --caddy-tls-internal"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "true"
+
+  run /bin/bash -c "dokku caddy:set $TEST_APP tls-internal"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+}
+
+@test "(caddy:report) tls-internal raw vs computed vs global" {
+  run /bin/bash -c "dokku caddy:report $TEST_APP --caddy-tls-internal"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output ""
+
+  run /bin/bash -c "dokku caddy:report $TEST_APP --caddy-computed-tls-internal"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "false"
+
+  run /bin/bash -c "dokku caddy:report $TEST_APP --caddy-global-tls-internal"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output ""
+
+  run /bin/bash -c "dokku caddy:set $TEST_APP tls-internal true"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku caddy:report $TEST_APP --caddy-tls-internal"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "true"
+
+  run /bin/bash -c "dokku caddy:report $TEST_APP --caddy-computed-tls-internal"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "true"
+
+  run /bin/bash -c "dokku caddy:set $TEST_APP tls-internal"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku caddy:report $TEST_APP --caddy-tls-internal"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output ""
+
+  run /bin/bash -c "dokku caddy:report $TEST_APP --caddy-computed-tls-internal"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "false"
+}
+
+@test "(caddy:set) --global tls-internal" {
+  run /bin/bash -c "dokku caddy:set --global tls-internal true"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku caddy:report --global --caddy-global-tls-internal"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "true"
+
+  run /bin/bash -c "dokku caddy:report $TEST_APP --caddy-tls-internal"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output ""
+
+  run /bin/bash -c "dokku caddy:report $TEST_APP --caddy-computed-tls-internal"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "true"
+
+  run /bin/bash -c "dokku caddy:report $TEST_APP --caddy-global-tls-internal"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "true"
+
+  run /bin/bash -c "dokku caddy:set $TEST_APP tls-internal false"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku caddy:report $TEST_APP --caddy-tls-internal"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "false"
+
+  run /bin/bash -c "dokku caddy:report $TEST_APP --caddy-computed-tls-internal"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "false"
+
+  run /bin/bash -c "dokku caddy:set $TEST_APP tls-internal"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku caddy:set --global tls-internal"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+}
+
+@test "(caddy) caddy:help" {
+  run /bin/bash -c "dokku caddy"
+  echo "output: $output"
+  echo "status: $status"
+  assert_output_contains "Manage the caddy proxy integration"
+  help_output="$output"
+
+  run /bin/bash -c "dokku caddy:help"
+  echo "output: $output"
+  echo "status: $status"
+  assert_output_contains "Manage the caddy proxy integration"
+  assert_output "$help_output"
+}
+
+@test "(caddy) single domain" {
+  run /bin/bash -c "dokku proxy:set $TEST_APP caddy"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run deploy_app python dokku@$DOKKU_DOMAIN:$TEST_APP convert_to_dockerfile
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "curl --silent $(dokku url $TEST_APP)"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output_contains "python/http.server"
+}
+
+@test "(caddy) multiple domains" {
+  run /bin/bash -c "dokku proxy:set $TEST_APP caddy"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku domains:add $TEST_APP $TEST_APP.${DOKKU_DOMAIN}"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku domains:add $TEST_APP $TEST_APP-2.${DOKKU_DOMAIN}"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run deploy_app python dokku@$DOKKU_DOMAIN:$TEST_APP convert_to_dockerfile
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "curl --silent $TEST_APP.${DOKKU_DOMAIN}"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "python/http.server"
+
+  run /bin/bash -c "curl --silent $TEST_APP-2.${DOKKU_DOMAIN}"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "python/http.server"
+}
+
+@test "(caddy) ssl" {
+  run /bin/bash -c "dokku builder-herokuish:set $TEST_APP allowed true"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku proxy:set $TEST_APP caddy"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run deploy_app
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "docker inspect $TEST_APP.web.1 --format '{{ index .Config.Labels \"caddy\" }}'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "$TEST_APP.${DOKKU_DOMAIN}:80"
+
+  run /bin/bash -c "dokku caddy:set --global letsencrypt-email test@example.com"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku caddy:stop"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku caddy:start"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku ps:rebuild $TEST_APP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku ps:inspect $TEST_APP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "docker inspect $TEST_APP.web.1 --format '{{ index .Config.Labels \"caddy\" }}'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "$TEST_APP.${DOKKU_DOMAIN}"
+
+  run /bin/bash -c "dokku ports:report $TEST_APP --ports-map"
+  echo "output: $output"
+  echo "status: $status"
+  assert_output_not_exists
+
+  run /bin/bash -c "dokku ports:report $TEST_APP --ports-map-detected"
+  echo "output: $output"
+  echo "status: $status"
+  assert_output "http:80:5000 https:443:5000"
+}
+
+@test "(caddy) label management" {
+  run /bin/bash -c "dokku proxy:set $TEST_APP caddy"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku caddy:labels:add $TEST_APP caddy.directive value"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku caddy:labels:show $TEST_APP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output_contains "caddy.directive=value"
+
+  run /bin/bash -c "dokku caddy:labels:show $TEST_APP caddy.directive"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "value"
+
+  run /bin/bash -c "dokku caddy:labels:show $TEST_APP caddy.directive2"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output_not_exists
+
+  run deploy_app
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "docker inspect $TEST_APP.web.1 --format '{{ index .Config.Labels \"caddy.directive\" }}'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "value"
+
+  run /bin/bash -c "dokku caddy:labels:remove $TEST_APP caddy.directive"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku caddy:labels:show $TEST_APP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output_not_contains "caddy.directive=value"
+
+  run /bin/bash -c "dokku caddy:labels:show $TEST_APP caddy.directive"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output_not_exists
+
+  run /bin/bash -c "dokku ps:rebuild $TEST_APP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "docker inspect $TEST_APP.web.1 --format '{{ index .Config.Labels \"caddy.directive\" }}'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output_not_exists
+}
+
+@test "(caddy:labels:add) concurrent calls for the same app keep every label" {
+  run run_concurrently 20 /bin/bash -c 'dokku caddy:labels:add "$1" "caddy.race$2" value' _ "$TEST_APP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku caddy:labels:show $TEST_APP | grep -c 'caddy\.race[0-9]*=value'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "20"
+
+  run run_concurrently 20 /bin/bash -c 'dokku caddy:labels:remove "$1" "caddy.race$2"' _ "$TEST_APP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku caddy:labels:show $TEST_APP 2>/dev/null | grep -c 'caddy\.race[0-9]*=value'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_output "0"
+}
+
+@test "(caddy) healthcheck labels from app.json" {
+  run /bin/bash -c "dokku proxy:set $TEST_APP caddy"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run deploy_app python dokku@$DOKKU_DOMAIN:$TEST_APP setup_caddy_readiness_healthcheck
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "docker inspect $TEST_APP.web.1 --format '{{ index .Config.Labels \"caddy.reverse_proxy.health_uri\" }}'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "/"
+
+  run /bin/bash -c "docker inspect $TEST_APP.web.1 --format '{{ index .Config.Labels \"caddy.reverse_proxy.health_interval\" }}'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "2s"
+
+  run /bin/bash -c "docker inspect $TEST_APP.web.1 --format '{{ index .Config.Labels \"caddy.reverse_proxy.health_timeout\" }}'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "5s"
+
+  run /bin/bash -c "docker inspect $TEST_APP.web.1 --format '{{ index .Config.Labels \"caddy.reverse_proxy.health_headers.Host\" }}'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "$TEST_APP.$DOKKU_DOMAIN"
+
+  run /bin/bash -c "docker inspect $TEST_APP.web.1 --format '{{ index .Config.Labels \"caddy.reverse_proxy.lb_try_duration\" }}'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "5s"
+
+  run /bin/bash -c "docker inspect $TEST_APP.web.1 --format '{{ index .Config.Labels \"caddy.reverse_proxy.lb_try_interval\" }}'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "250ms"
+
+  assert_http_localhost_response "http" "$TEST_APP.dokku.me" "80" "" "python/http.server"
+
+  run /bin/bash -c "dokku ps:rebuild $TEST_APP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  assert_http_localhost_response "http" "$TEST_APP.dokku.me" "80" "" "python/http.server"
+}
+
+@test "(caddy) healthcheck labels can be overridden" {
+  run /bin/bash -c "dokku proxy:set $TEST_APP caddy"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku caddy:labels:add $TEST_APP caddy.reverse_proxy.lb_try_duration 10s"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run deploy_app python dokku@$DOKKU_DOMAIN:$TEST_APP setup_caddy_readiness_healthcheck
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "docker inspect $TEST_APP.web.1 --format '{{ index .Config.Labels \"caddy.reverse_proxy.lb_try_duration\" }}'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "10s"
+
+  assert_http_localhost_response "http" "$TEST_APP.dokku.me" "80" "" "python/http.server"
+}
+
+@test "(caddy) no healthcheck labels without readiness check" {
+  run /bin/bash -c "dokku proxy:set $TEST_APP caddy"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run deploy_app python dokku@$DOKKU_DOMAIN:$TEST_APP convert_to_dockerfile
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "docker inspect $TEST_APP.web.1 --format '{{ index .Config.Labels \"caddy.reverse_proxy.health_uri\" }}'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output_not_exists
+
+  run /bin/bash -c "docker inspect $TEST_APP.web.1 --format '{{ index .Config.Labels \"caddy.reverse_proxy.lb_try_duration\" }}'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output_not_exists
+}
+
+@test "(caddy) invalid stored healthcheck path fails restart" {
+  run /bin/bash -c "dokku proxy:set $TEST_APP caddy"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run deploy_app python dokku@$DOKKU_DOMAIN:$TEST_APP setup_caddy_readiness_healthcheck
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "jq '.healthchecks.web[0].path = \"/health check\"' /var/lib/dokku/data/app-json/$TEST_APP/app.json > /var/lib/dokku/data/app-json/$TEST_APP/app.json.tmp && mv /var/lib/dokku/data/app-json/$TEST_APP/app.json.tmp /var/lib/dokku/data/app-json/$TEST_APP/app.json"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku ps:restart $TEST_APP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_failure
+  assert_output_contains "Invalid app.json healthcheck path for caddy" -1
+}
+
+@test "(caddy) healthcheck headers from app.json" {
+  run /bin/bash -c "dokku proxy:set $TEST_APP caddy"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run deploy_app python dokku@$DOKKU_DOMAIN:$TEST_APP setup_caddy_readiness_healthcheck_headers
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "docker inspect $TEST_APP.web.1 --format '{{ index .Config.Labels \"caddy.reverse_proxy.health_headers.X-Check\" }}'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output '"dokku check"'
+
+  run /bin/bash -c "docker inspect $TEST_APP.web.1 --format '{{ index .Config.Labels \"caddy.reverse_proxy.health_fails\" }}'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "2"
+
+  sleep 5
+
+  run /bin/bash -c "docker cp caddy-caddy-1:/config/caddy/Caddyfile.autosave - | tar -xO"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output_contains 'X-Check "dokku check"'
+  assert_output_contains "health_fails 2"
+
+  run /bin/bash -c "docker logs caddy-caddy-1"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output_contains "Failed to convert caddyfile" 0
+
+  assert_http_localhost_response "http" "$TEST_APP.dokku.me" "80" "" "python/http.server"
+}
+
+setup_caddy_readiness_healthcheck() {
+  local APP="$1"
+  local APP_REPO_DIR="$2"
+  [[ -z "$APP" ]] && local APP="$TEST_APP"
+  APP_REPO_DIR="$(realpath "$APP_REPO_DIR")"
+
+  convert_to_dockerfile "$APP" "$APP_REPO_DIR"
+  mv "$APP_REPO_DIR/app-readiness.json" "$APP_REPO_DIR/app.json"
+}
+
+setup_caddy_readiness_healthcheck_headers() {
+  local APP="$1"
+  local APP_REPO_DIR="$2"
+  [[ -z "$APP" ]] && local APP="$TEST_APP"
+  APP_REPO_DIR="$(realpath "$APP_REPO_DIR")"
+
+  convert_to_dockerfile "$APP" "$APP_REPO_DIR"
+  jq '.healthchecks.web[0].attempts = 2 | .healthchecks.web[0].httpHeaders = [{"name": "X-Check", "value": "dokku check"}]' "$APP_REPO_DIR/app-readiness.json" >"$APP_REPO_DIR/app.json"
+}

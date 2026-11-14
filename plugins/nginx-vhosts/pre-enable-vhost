@@ -2,16 +2,39 @@
 set -eo pipefail
 [[ $DOKKU_TRACE ]] && set -x
 source "$PLUGIN_CORE_AVAILABLE_PATH/common/functions"
-source "$PLUGIN_AVAILABLE_PATH/config/functions"
+source "$PLUGIN_CORE_AVAILABLE_PATH/common/property-functions"
 
 trigger-nginx-vhosts-pre-enable-vhost() {
   declare desc="unset port prior to vhosts being enabled"
   declare trigger="pre-enable-vhost"
   declare APP="$1"
 
-  if [[ "$(plugn trigger proxy-type "$APP")" == "nginx" ]]; then
-    DOKKU_QUIET_OUTPUT=1 config_unset --no-restart "$APP" DOKKU_PROXY_PORT DOKKU_PROXY_SSL_PORT DOKKU_PROXY_PORT_MAP
+  if [[ "$(plugn trigger proxy-type "$APP")" != "nginx" ]]; then
+    return
   fi
+
+  # clear stored proxy ports so they can be recomputed for the enabled state
+  local PROXY_PORT=$(plugn trigger ports-get-property "$APP" "proxy-port")
+  local PROXY_SSL_PORT=$(plugn trigger ports-get-property "$APP" "proxy-ssl-port")
+
+  if [[ -n "$PROXY_PORT" ]]; then
+    fn-plugin-property-delete "proxy" "$APP" "proxy-port"
+  fi
+  if [[ -n "$PROXY_SSL_PORT" ]]; then
+    fn-plugin-property-delete "proxy" "$APP" "proxy-ssl-port"
+  fi
+
+  # clear auto-detected port maps so they get recomputed for vhost mode
+  fn-plugin-property-delete "ports" "$APP" "map-detected"
+
+  # clear ports if there is a mapping starting with http:80 or https:443
+  local PORT_MAPS=$(plugn trigger ports-get "$APP")
+  for PORT_MAP in $PORT_MAPS; do
+    if [[ "$PORT_MAP" == "http:80:"* ]] || [[ "$PORT_MAP" == "https:443:"* ]]; then
+      plugn trigger ports-clear "$APP"
+      break
+    fi
+  done
 }
 
 trigger-nginx-vhosts-pre-enable-vhost "$@"

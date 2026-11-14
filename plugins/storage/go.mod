@@ -1,0 +1,38 @@
+module github.com/dokku/dokku/plugins/storage
+
+go 1.27.1
+
+require (
+	github.com/dokku/dokku/plugins/common v0.0.0-00010101000000-000000000000
+	github.com/dokku/dokku/plugins/docker-options v0.0.0-00010101000000-000000000000
+	github.com/mattn/go-isatty v0.0.24
+	github.com/onsi/gomega v1.44.0
+	github.com/spf13/pflag v1.1.0
+)
+
+require (
+	github.com/alexellis/go-execute/v2 v2.2.1 // indirect
+	github.com/fatih/color v1.19.0 // indirect
+	github.com/google/go-cmp v0.7.0 // indirect
+	github.com/hashicorp/errwrap v1.1.0 // indirect
+	github.com/hashicorp/go-multierror v1.1.1 // indirect
+	github.com/kr/fs v0.1.0 // indirect
+	github.com/mattn/go-colorable v0.1.14 // indirect
+	github.com/melbahja/goph v1.5.2 // indirect
+	github.com/otiai10/copy v1.14.1 // indirect
+	github.com/otiai10/mint v1.6.3 // indirect
+	github.com/pkg/errors v0.9.1 // indirect
+	github.com/pkg/sftp v1.13.11 // indirect
+	github.com/ryanuber/columnize v2.1.2+incompatible // indirect
+	go.yaml.in/yaml/v3 v3.0.5 // indirect
+	golang.org/x/crypto v0.58.0 // indirect
+	golang.org/x/net v0.60.0 // indirect
+	golang.org/x/sync v0.25.0 // indirect
+	golang.org/x/sys v0.49.0 // indirect
+	golang.org/x/text v0.43.0 // indirect
+	mvdan.cc/sh/v3 v3.14.1 // indirect
+)
+
+replace github.com/dokku/dokku/plugins/common => ../common
+
+replace github.com/dokku/dokku/plugins/docker-options => ../docker-options

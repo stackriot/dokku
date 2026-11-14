@@ -2,7 +2,7 @@
 
 Dokku commands can be run over SSH. Anywhere you would run `dokku <command>`, just run `ssh -t dokku@dokku.me <command>`
 The `-t` is used to request a pty. It is highly recommended to do so.
-To avoid the need to type the `-t` option each time, simply create/modify a section in the `.ssh/config` on the client side, as follows:
+To avoid the need to type the `-t` option each time, create/modify a section in the `.ssh/config` on the client side, as follows:
 
 ```ini
 Host dokku.me
@@ -12,7 +12,7 @@ Host dokku.me
 ## Behavioral modifiers
 
 Dokku also supports certain command line arguments that augment its behavior. If using these over SSH, you must use the form `ssh -t dokku@dokku.me -- <command>`
-in order to avoid SSH interpretting Dokku arguments for itself.
+to avoid SSH interpreting Dokku arguments for itself.
 
 ```
 --quiet                suppress output headers
@@ -71,7 +71,7 @@ All commands have the application name automatically set via the `--app` flag on
 
 The client supports several environment variables:
 
-- `DOKKU_HOST` (default: `dokku` git remote): Used to interact with a specific remote server. Can be overriden via `--remote` flag.
+- `DOKKU_HOST` (default: `dokku` git remote): Used to interact with a specific remote server. Can be overridden via the `--remote` flag. Must specify the `--app` flag when specified.
 - `DOKKU_PORT` (default: `22`): Used to specify a port to connect to the Dokku server on.
 
 It also supports several flags (all flags unspecified here are passed as is to the server):
@@ -84,10 +84,32 @@ It also supports several flags (all flags unspecified here are passed as is to t
 In addition, the following commands have special local side-effects:
 
 - `apps:create`:
-  - If no local `--app` flag is specified or detected from a `dokku` git remote, a random name is generated and used for the app.
-  - The `dokku` git remote is set if not already set.
+    - If no local `--app` flag is specified or detected from a `dokku` git remote, a random name is generated and used for the app.
+    - The `dokku` git remote is set if not already set.
 - `apps:destroy`:
-  - Removes the local `dokku` git remote if set.
+    - Removes the local `dokku` git remote if set.
+
+#### Specifying a remote
+
+While many users will only ever push to a single dokku remote from a given repository, it may be useful to point the same repository at multiple remotes, especially in the case of pre-production environments. This can be done via the `remote` commands. These commands are *only* available within the official remote client, and are not server-side commands.
+
+To see your currently configured remote, run `dokku remote`. This will respect the `--remote` flag.
+
+To list all available remotes, run `dokku remote:list`. This is equivalent to running `git remote`.
+
+To add a remote, run `dokku remote:add $REMOTE_NAME dokku@dokku.me:$APP_NAME`, replacing `$REMOTE_NAME` with your desired remote name, the `$APP_NAME` with your desired app name and the host `dokku.me` with your Dokku host. This is equivalent to running `git remote add $REMOTE_NAME dokku@dokku.me:$APP_NAME`.
+
+The following remote formats are supported:
+
+- `dokku@HOSTNAME.TLD:APP_NAME`
+- `ssh://dokku@HOSTNAME.TLD/APP_NAME`
+- `ssh://dokku@HOSTNAME.TLD:HOST_PORT/APP_NAME`
+
+To remove a remote, run `dokku remote:remove $REMOTE_NAME`. This is equivalent to running `git remote remove $REMOTE_NAME`.
+
+By default, the remote in use is `dokku`. To change the remote the client uses by default, run `dokku remote:set $REMOTE_NAME`, where `$REMOTE_NAME` is the name of your desired remote. This will not check the value specified, so that remote *must* be available or errors will occur when running normal client commands. Note that specifying `--remote` when running dokku commands will override this configuration value.
+
+To clear the configured remote, run `dokku remote:unset`. The client will unset the configured remote, and will default back to `dokku`, or the value of `--remote` if specified.
 
 ## Unofficial Clients
 

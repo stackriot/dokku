@@ -1,0 +1,1611 @@
+package scheduler_k3s
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/url"
+	"os"
+	"os/signal"
+	"sort"
+	"strings"
+	"syscall"
+
+	"github.com/dokku/dokku/plugins/common"
+	resty "github.com/go-resty/resty/v2"
+	"github.com/ryanuber/columnize"
+	"helm.sh/helm/v3/pkg/chartutil"
+)
+
+// CommandAnnotationsSet sets, clears or replaces scheduler-k3s annotations for an app
+func CommandAnnotationsSet(input MetadataSetInput) error {
+	return commandMetadataSet(annotationsField, input)
+}
+
+// CommandAnnotationsClear clears scheduler-k3s annotations for an app
+func CommandAnnotationsClear(input MetadataClearInput) error {
+	return commandMetadataClear(annotationsField, input)
+}
+
+// NodeSysctlsSetInput captures the inputs accepted by node-sysctls:set.
+// Key/Value and Pairs are mutually exclusive: Pairs is populated only under
+// --replace, where the positional arguments are key=value pairs rather than a
+// single sysctl name and value.
+type NodeSysctlsSetInput struct {
+	ProfileName string
+	Key         string
+	Value       string
+	Pairs       []string
+	Replace     bool
+}
+
+// CommandNodeSysctlsSet sets, clears or replaces node-level kernel sysctls for a scope
+func CommandNodeSysctlsSet(input NodeSysctlsSetInput) error {
+	if err := verifyNodeSysctlsScope(input.ProfileName); err != nil {
+		return err
+	}
+
+	property := getNodeSysctlsProperty(input.ProfileName)
+	if input.Replace {
+		if len(input.Pairs) == 0 {
+			return fmt.Errorf("Must specify at least one key=value pair, use scheduler-k3s:node-sysctls:clear to remove all sysctls")
+		}
+
+		parsed, err := parseMetadataPairs(input.Pairs)
+		if err != nil {
+			return err
+		}
+
+		removed, err := removedSysctlNames(property, parsed)
+		if err != nil {
+			return err
+		}
+
+		if err := common.PropertyMapWrite("scheduler-k3s", "--global", property, parsed); err != nil {
+			return fmt.Errorf("Unable to write property map: %w", err)
+		}
+
+		warnUnmanagedSysctls(removed)
+		return CreateOrUpdateNodeSysctls(context.Background())
+	}
+
+	if input.Key == "" {
+		return fmt.Errorf("Missing sysctl name")
+	}
+
+	if input.Value == "" {
+		if err := common.PropertyMapDelete("scheduler-k3s", "--global", property, input.Key); err != nil {
+			return fmt.Errorf("Unable to delete property map entry: %w", err)
+		}
+
+		warnUnmanagedSysctls([]string{input.Key})
+	} else {
+		if err := common.PropertyMapSet("scheduler-k3s", "--global", property, input.Key, input.Value); err != nil {
+			return fmt.Errorf("Unable to set property map entry: %w", err)
+		}
+	}
+
+	return CreateOrUpdateNodeSysctls(context.Background())
+}
+
+// CommandNodeSysctlsClear clears every node-level kernel sysctl for a scope
+func CommandNodeSysctlsClear(profileName string) error {
+	if err := verifyNodeSysctlsScope(profileName); err != nil {
+		return err
+	}
+
+	property := getNodeSysctlsProperty(profileName)
+	removed, err := removedSysctlNames(property, map[string]string{})
+	if err != nil {
+		return err
+	}
+
+	if err := common.PropertyDelete("scheduler-k3s", "--global", property); err != nil {
+		return fmt.Errorf("Unable to delete property: %w", err)
+	}
+
+	warnUnmanagedSysctls(removed)
+	return CreateOrUpdateNodeSysctls(context.Background())
+}
+
+// verifyNodeSysctlsScope returns an error when a profile-scoped command names a profile
+// that does not exist or cannot back a helm release.
+func verifyNodeSysctlsScope(profileName string) error {
+	if profileName == "" {
+		return nil
+	}
+
+	if err := verifyNodeProfileExists(profileName); err != nil {
+		return err
+	}
+
+	return verifyNodeProfileSysctlsSupported(profileName)
+}
+
+// removedSysctlNames returns the sysctls a scope currently manages that the next
+// stored map no longer will, so they can be warned about before the write happens.
+func removedSysctlNames(property string, next map[string]string) ([]string, error) {
+	current, err := common.PropertyMapGet("scheduler-k3s", "--global", property)
+	if err != nil {
+		return nil, fmt.Errorf("Unable to get property map: %w", err)
+	}
+
+	removed := []string{}
+	for key := range current {
+		if _, ok := next[key]; !ok {
+			removed = append(removed, key)
+		}
+	}
+
+	sort.Strings(removed)
+	return removed, nil
+}
+
+// warnUnmanagedSysctls notes that dokku has stopped managing a sysctl. The last
+// value written stays on affected nodes until they reboot, which is how sysctl -w
+// behaves everywhere else.
+func warnUnmanagedSysctls(names []string) {
+	for _, name := range names {
+		common.LogWarn(fmt.Sprintf("Removing %s stops dokku managing it, but does not restore the previous value on affected nodes until they reboot", name))
+	}
+}
+
+// NodeSysctlsReportInput captures the inputs accepted by node-sysctls:report.
+// Global and ProfileName are mutually exclusive, and naming neither reports every
+// scope rather than the global one.
+type NodeSysctlsReportInput struct {
+	Format      string
+	Global      bool
+	ProfileName string
+	Stored      bool
+}
+
+// CommandNodeSysctlsReport displays the configured node-level kernel sysctls. A named
+// profile only has to exist to be reported on, unlike one being written to: a profile
+// whose legacy name cannot back a helm release still resolves to a scope, and the map
+// it stores is worth reading back even though nothing applies it.
+func CommandNodeSysctlsReport(input NodeSysctlsReportInput) error {
+	if input.Format != "stdout" && input.Format != "json" {
+		return fmt.Errorf("Invalid format: %s", input.Format)
+	}
+
+	if input.ProfileName != "" {
+		if err := verifyNodeProfileExists(input.ProfileName); err != nil {
+			return err
+		}
+	}
+
+	scopes, err := resolveNodeSysctlScopes()
+	if err != nil {
+		return err
+	}
+
+	scopes = filterNodeSysctlScopes(scopes, input.Global, input.ProfileName)
+
+	if input.Format == "json" {
+		output := map[string]map[string]string{}
+		for _, scope := range scopes {
+			entries := map[string]string{}
+			for _, sysctl := range scope.reportSysctls(input.Stored) {
+				entries[sysctl.Name] = sysctl.Value
+			}
+			output[nodeSysctlsScopeKey(scope.ProfileName)] = entries
+		}
+
+		b, err := json.Marshal(output)
+		if err != nil {
+			return fmt.Errorf("Unable to marshal json: %w", err)
+		}
+
+		fmt.Println(string(b))
+		return nil
+	}
+
+	lines := []string{"scope|sysctl|value"}
+	for _, scope := range scopes {
+		scopeName := nodeSysctlsScopeKey(scope.ProfileName)
+		for _, sysctl := range scope.reportSysctls(input.Stored) {
+			lines = append(lines, fmt.Sprintf("%s|%s|%s", scopeName, sysctl.Name, sysctl.Value))
+		}
+	}
+
+	fmt.Println(columnize.SimpleFormat(lines))
+	return nil
+}
+
+// verifyNodeProfileExists returns an error when a node profile has not been created
+func verifyNodeProfileExists(profileName string) error {
+	properties := common.PropertyGetDefault("scheduler-k3s", "--global", fmt.Sprintf("node-profile-%s.json", profileName), "")
+	if properties == "" {
+		return fmt.Errorf("Node profile %s not found", profileName)
+	}
+
+	return nil
+}
+
+// verifyNodeProfileSysctlsSupported returns an error when a node profile is stored under a
+// name dokku cannot derive a node sysctls release name from. Such a profile predates the
+// validation in profiles:add and must be recreated before it can carry node sysctls.
+func verifyNodeProfileSysctlsSupported(profileName string) error {
+	if err := chartutil.ValidateReleaseName(getNodeSysctlsReleaseName(profileName)); err != nil {
+		return fmt.Errorf("Node profile %s cannot carry node sysctls, recreate it with a name of at most %d lowercase alphanumeric characters and dashes: %w", profileName, maxNodeProfileNameLength, err)
+	}
+
+	return nil
+}
+
+// CommandAutoscalingAuthSet sets, clears or replaces a scheduler-k3s autoscaling keda trigger authentication object for an app
+func CommandAutoscalingAuthSet(appName string, trigger string, metadata map[string]string, global bool, replace bool) error {
+	if global {
+		appName = "--global"
+	}
+
+	if appName != "--global" {
+		if err := common.VerifyAppName(appName); err != nil {
+			return err
+		}
+	}
+
+	if len(trigger) == 0 {
+		return fmt.Errorf("Missing trigger type argument")
+	}
+
+	if replace && len(metadata) == 0 {
+		return fmt.Errorf("Must specify at least one --metadata flag, omit --replace to remove all metadata for the trigger")
+	}
+
+	err := common.PropertyLock("scheduler-k3s", appName, func(p *common.LockedProperties) error {
+		if len(metadata) == 0 || replace {
+			if err := deleteTriggerAuthProperties(p, appName, trigger); err != nil {
+				return err
+			}
+		}
+
+		for key, value := range metadata {
+			if err := p.Write(fmt.Sprintf("%s%s.%s", TriggerAuthPropertyPrefix, trigger, key), value); err != nil {
+				return fmt.Errorf("Unable to set property: %w", err)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+
+	if len(metadata) == 0 {
+		if appName == "--global" {
+			helmAgent, err := NewHelmAgent("keda", DeployLogPrinter)
+			if err != nil {
+				return fmt.Errorf("Unable to create helm agent: %w", err)
+			}
+
+			releaseName := fmt.Sprintf("keda-cluster-trigger-authentications-%s", trigger)
+			if err := helmAgent.UninstallChart(releaseName); err != nil {
+				return fmt.Errorf("Unable to uninstall chart: %w", err)
+			}
+		}
+
+		return nil
+	}
+
+	common.LogInfo1("Trigger authentication settings saved")
+	common.LogVerbose("Resources will be created or updated on next deploy")
+
+	if appName == "--global" {
+		err := applyKedaClusterTriggerAuthentications(context.Background(), trigger, metadata)
+		if err != nil {
+			return fmt.Errorf("Unable to install chart: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// deleteTriggerAuthProperties removes every stored metadata key for one
+// trigger. The caller must hold the app's scheduler-k3s property lock.
+func deleteTriggerAuthProperties(p *common.LockedProperties, appName string, trigger string) error {
+	properties, err := common.PropertyGetAllByPrefix("scheduler-k3s", appName, fmt.Sprintf("%s%s.", TriggerAuthPropertyPrefix, trigger))
+	if err != nil {
+		return fmt.Errorf("Unable to get property list: %w", err)
+	}
+
+	for key := range properties {
+		if err := p.Delete(key); err != nil {
+			return fmt.Errorf("Unable to delete property: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// CommandAutoscalingAuthReport displays a scheduler-k3s autoscaling keda trigger authentication report for one or more apps
+func CommandAutoscalingAuthReport(appName string, format string, includeMetadata bool, infoFlag string) error {
+	if len(appName) == 0 {
+		apps, err := common.DokkuApps()
+		if err != nil {
+			if errors.Is(err, common.NoAppsExist) {
+				common.LogWarn(err.Error())
+				return nil
+			}
+			return err
+		}
+		for _, app := range apps {
+			if err := ReportAutoscalingAuthSingleApp(app, format, includeMetadata, infoFlag); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	return ReportAutoscalingAuthSingleApp(appName, format, includeMetadata, infoFlag)
+}
+
+// CommandAnnotationsReport displays a scheduler-k3s annotations report for one or more apps
+func CommandAnnotationsReport(appName string, format string, processType string, resourceType string, infoFlag string) error {
+	if len(appName) == 0 {
+		apps, err := common.DokkuApps()
+		if err != nil {
+			if errors.Is(err, common.NoAppsExist) {
+				common.LogWarn(err.Error())
+				return nil
+			}
+			return err
+		}
+		for _, app := range apps {
+			if err := ReportAnnotationsSingleApp(app, format, processType, resourceType, infoFlag); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	return ReportAnnotationsSingleApp(appName, format, processType, resourceType, infoFlag)
+}
+
+// CommandLabelsReport displays a scheduler-k3s labels report for one or more apps
+func CommandLabelsReport(appName string, format string, processType string, resourceType string, infoFlag string) error {
+	if len(appName) == 0 {
+		apps, err := common.DokkuApps()
+		if err != nil {
+			if errors.Is(err, common.NoAppsExist) {
+				common.LogWarn(err.Error())
+				return nil
+			}
+			return err
+		}
+		for _, app := range apps {
+			if err := ReportLabelsSingleApp(app, format, processType, resourceType, infoFlag); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	return ReportLabelsSingleApp(appName, format, processType, resourceType, infoFlag)
+}
+
+// CommandInitialize initializes a k3s cluster on the local server
+func CommandInitialize(ingressClass string, serverIP string, taintScheduling bool, kubeletArgs []string) error {
+	if ingressClass != "nginx" && ingressClass != "traefik" {
+		return fmt.Errorf("Invalid ingress-class: %s", ingressClass)
+	}
+
+	if err := isK3sInstalled(); err == nil {
+		return fmt.Errorf("k3s already installed, cannot re-initialize k3s")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, os.Interrupt, syscall.SIGHUP,
+		syscall.SIGINT,
+		syscall.SIGQUIT,
+		syscall.SIGTERM)
+	go func() {
+		<-signals
+		cancel()
+	}()
+
+	if serverIP == "" {
+		var err error
+		serverIP, err = getServerIP()
+		if err != nil {
+			return fmt.Errorf("Unable to get server ip address: %w", err)
+		}
+
+		common.LogVerboseQuiet(fmt.Sprintf("Using server ip address: %s", serverIP))
+	}
+
+	common.LogInfo1Quiet("Initializing k3s")
+
+	common.LogInfo2Quiet("Updating apt")
+	aptUpdateCmd, err := common.CallExecCommand(common.ExecCommandInput{
+		Command: "apt-get",
+		Args: []string{
+			"update",
+		},
+		StreamStdio: true,
+	})
+	if err != nil {
+		return fmt.Errorf("Unable to call apt-get update command: %w", err)
+	}
+	if aptUpdateCmd.ExitCode != 0 {
+		return fmt.Errorf("Invalid exit code from apt-get update command: %d", aptUpdateCmd.ExitCode)
+	}
+
+	common.LogInfo2Quiet("Installing k3s dependencies")
+	aptInstallCmd, err := common.CallExecCommand(common.ExecCommandInput{
+		Command: "apt-get",
+		Args: []string{
+			"-y",
+			"install",
+			"ca-certificates",
+			"curl",
+			"open-iscsi",
+			"nfs-common",
+			"wireguard",
+		},
+		StreamStdio: true,
+	})
+	if err != nil {
+		return fmt.Errorf("Unable to call apt-get install command: %w", err)
+	}
+	if aptInstallCmd.ExitCode != 0 {
+		return fmt.Errorf("Invalid exit code from apt-get install command: %d", aptInstallCmd.ExitCode)
+	}
+
+	common.LogInfo2Quiet("Downloading k3s installer")
+	client := resty.New()
+	resp, err := client.R().
+		SetContext(ctx).
+		Get("https://get.k3s.io")
+	if err != nil {
+		return fmt.Errorf("Unable to download k3s installer: %w", err)
+	}
+	if resp == nil {
+		return fmt.Errorf("Missing response from k3s installer download: %w", err)
+	}
+
+	if resp.StatusCode() != 200 {
+		return fmt.Errorf("Invalid status code for k3s installer script: %d", resp.StatusCode())
+	}
+
+	f, err := os.CreateTemp("", "sample")
+	if err != nil {
+		return fmt.Errorf("Unable to create temporary file for k3s installer: %w", err)
+	}
+	defer os.Remove(f.Name())
+
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("Unable to close k3s installer file: %w", err)
+	}
+
+	err = common.WriteStringToFile(common.WriteStringToFileInput{
+		Content:  resp.String(),
+		Filename: f.Name(),
+		Mode:     os.FileMode(0755),
+	})
+	if err != nil {
+		return fmt.Errorf("Unable to write k3s installer to file: %w", err)
+	}
+
+	fi, err := os.Stat(f.Name())
+	if err != nil {
+		return fmt.Errorf("Unable to get k3s installer file size: %w", err)
+	}
+
+	if fi.Size() == 0 {
+		return fmt.Errorf("Invalid k3s installer filesize")
+	}
+
+	token := getGlobalGlobalToken()
+	if len(token) == 0 {
+		n := 5
+		b := make([]byte, n)
+		if _, err := rand.Read(b); err != nil {
+			return fmt.Errorf("Unable to generate random node name: %w", err)
+		}
+
+		token = strings.ToLower(fmt.Sprintf("%X", b))
+		if err := CommandSet("--global", "token", token); err != nil {
+			return fmt.Errorf("Unable to set k3s token: %w", err)
+		}
+	}
+
+	nodeName := serverIP
+	n := 5
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		return fmt.Errorf("Unable to generate random node name: %w", err)
+	}
+	nodeName = strings.ReplaceAll(strings.ToLower(fmt.Sprintf("ip-%s-%s", nodeName, fmt.Sprintf("%X", b))), ".", "-")
+
+	common.CommandPropertySet("scheduler-k3s", "--global", "ingress-class", ingressClass, DefaultProperties, GlobalProperties)
+
+	args := initializeInstallerArgs(InitializeInstallerArgsInput{
+		IngressClass:    ingressClass,
+		KubeletArgs:     kubeletArgs,
+		NodeName:        nodeName,
+		TaintScheduling: taintScheduling,
+		Token:           token,
+	})
+
+	common.LogInfo2Quiet("Running k3s installer")
+	installerCmd, err := common.CallExecCommand(common.ExecCommandInput{
+		Command:     f.Name(),
+		Args:        args,
+		StreamStdio: true,
+	})
+	if err != nil {
+		return fmt.Errorf("Unable to call k3s installer command: %w", err)
+	}
+	if installerCmd.ExitCode != 0 {
+		return fmt.Errorf("Invalid exit code from k3s installer command: %d", installerCmd.ExitCode)
+	}
+
+	clientset, err := NewKubernetesClient()
+	if err != nil {
+		return fmt.Errorf("Unable to create kubernetes client: %w", err)
+	}
+
+	common.LogInfo2Quiet("Waiting for node to exist")
+	nodes, err := waitForNodeToExist(ctx, WaitForNodeToExistInput{
+		Clientset:  clientset,
+		NodeName:   nodeName,
+		RetryCount: 20,
+	})
+	if err != nil {
+		return fmt.Errorf("Error waiting for pod to exist: %w", err)
+	}
+	if len(nodes) == 0 {
+		return fmt.Errorf("Unable to find node after initializing cluster, node will not be annotated/labeled appropriately access registry secrets")
+	}
+
+	for _, manifest := range KubernetesManifests {
+		common.LogInfo2Quiet(fmt.Sprintf("Installing %s@%s", manifest.Name, manifest.Version))
+		err = clientset.ApplyKubernetesManifest(ctx, ApplyKubernetesManifestInput{
+			Manifest: manifest.Path,
+		})
+		if err != nil {
+			return fmt.Errorf("Unable to apply kubernetes manifest: %w", err)
+		}
+	}
+
+	for key, value := range ServerLabels {
+		common.LogInfo2Quiet(fmt.Sprintf("Labeling node %s=%s", key, value))
+		if err != nil {
+			return fmt.Errorf("Unable to create kubernetes client: %w", err)
+		}
+
+		err = clientset.LabelNode(ctx, LabelNodeInput{
+			Name:  nodeName,
+			Key:   key,
+			Value: value,
+		})
+		if err != nil {
+			return fmt.Errorf("Unable to patch node: %w", err)
+		}
+	}
+
+	common.LogInfo2Quiet("Installing helm charts")
+	err = installHelmCharts(ctx, clientset, func(chart HelmChart) bool {
+		return chartInstallDecision(ChartInstallDecisionInput{
+			Chart:        chart,
+			ForceInstall: true,
+			IngressClass: ingressClass,
+		}).Install
+	})
+	if err != nil {
+		return fmt.Errorf("Unable to install helm charts: %w", err)
+	}
+
+	common.LogInfo2Quiet("Installing helper commands")
+	err = installHelperCommands(ctx)
+	if err != nil {
+		return fmt.Errorf("Unable to install helper commands: %w", err)
+	}
+
+	common.LogInfo2Quiet("Applying node sysctls")
+	if err := CreateOrUpdateNodeSysctls(ctx); err != nil {
+		return fmt.Errorf("Unable to apply node sysctls: %w", err)
+	}
+
+	common.LogVerboseQuiet("Done")
+
+	return nil
+}
+
+// ChartsSetInput captures the inputs accepted by charts:set.
+// Property/Value and ChartName/Pairs are mutually exclusive: ChartName and
+// Pairs are populated only under --replace, where the positional arguments are
+// a chart name followed by property=value pairs rather than a single
+// <chart-name>.<property> argument and value.
+type ChartsSetInput struct {
+	ChartName string
+	Property  string
+	Value     string
+	Pairs     []string
+	Replace   bool
+}
+
+// CommandChartsClear clears every chart-specific helm value for a chart
+func CommandChartsClear(chartName string) error {
+	if chartName == "" {
+		return fmt.Errorf("Missing chart name")
+	}
+
+	chart, err := getHelmChart(chartName)
+	if err != nil {
+		return err
+	}
+
+	common.LogInfo2Quiet(fmt.Sprintf("Clearing chart overrides for %s", chart.ReleaseName))
+	if err := common.PropertyDelete("scheduler-k3s", "--global", "chart-overrides."+chart.ReleaseName); err != nil {
+		return fmt.Errorf("Unable to delete property: %w", err)
+	}
+	return nil
+}
+
+// CommandChartsSet sets, clears or replaces chart-specific helm values for the scheduler
+func CommandChartsSet(input ChartsSetInput) error {
+	if input.Replace {
+		return replaceChartOverrides(input.ChartName, input.Pairs)
+	}
+
+	propertyArg := input.Property
+	if propertyArg == "" {
+		return fmt.Errorf("Invalid property, expected format: <chart-name>.<property>")
+	}
+
+	dotIndex := strings.Index(propertyArg, ".")
+	if dotIndex <= 0 || dotIndex == len(propertyArg)-1 {
+		return fmt.Errorf("Invalid property, expected format: <chart-name>.<property>")
+	}
+
+	chartName := propertyArg[:dotIndex]
+	chartProperty := propertyArg[dotIndex+1:]
+	if _, err := getHelmChart(chartName); err != nil {
+		return err
+	}
+
+	key := fmt.Sprintf("chart.%s.%s", chartName, chartProperty)
+	mapProperty := "chart-overrides." + chartName
+	if input.Value != "" {
+		common.LogInfo2Quiet(fmt.Sprintf("Setting %s to %s", key, input.Value))
+		if err := common.PropertyMapSet("scheduler-k3s", "--global", mapProperty, chartProperty, input.Value); err != nil {
+			return fmt.Errorf("Unable to write property: %w", err)
+		}
+		return nil
+	}
+
+	common.LogInfo2Quiet(fmt.Sprintf("Unsetting %s", key))
+	if err := common.PropertyMapDelete("scheduler-k3s", "--global", mapProperty, chartProperty); err != nil {
+		return fmt.Errorf("Unable to delete property: %w", err)
+	}
+	return nil
+}
+
+// replaceChartOverrides replaces every chart-specific helm value for a chart in a single write
+func replaceChartOverrides(chartName string, pairs []string) error {
+	if chartName == "" {
+		return fmt.Errorf("Missing chart name")
+	}
+
+	chart, err := getHelmChart(chartName)
+	if err != nil {
+		return err
+	}
+
+	if len(pairs) == 0 {
+		return fmt.Errorf("Must specify at least one key=value pair, use scheduler-k3s:charts:clear to remove all chart overrides")
+	}
+
+	parsed, err := parseMetadataPairs(pairs)
+	if err != nil {
+		return err
+	}
+
+	common.LogInfo2Quiet(fmt.Sprintf("Replacing chart overrides for %s", chart.ReleaseName))
+	if err := common.PropertyMapWrite("scheduler-k3s", "--global", "chart-overrides."+chart.ReleaseName, parsed); err != nil {
+		return fmt.Errorf("Unable to write property map: %w", err)
+	}
+	return nil
+}
+
+// CommandChartsReport displays a scheduler-k3s chart override report
+func CommandChartsReport(chartName string, format string, infoFlag string) error {
+	if format != "stdout" && format != "json" {
+		return fmt.Errorf("Invalid format: %s", format)
+	}
+
+	if format == "json" && infoFlag != "" {
+		return fmt.Errorf("--format flag cannot be specified when specifying an info flag")
+	}
+
+	charts := []HelmChart{}
+	if chartName != "" {
+		chart, err := getHelmChart(chartName)
+		if err != nil {
+			return err
+		}
+		charts = append(charts, chart)
+	} else {
+		charts = append(charts, HelmCharts...)
+	}
+
+	overridesByChart := map[string]map[string]string{}
+	flatOverrides := map[string]string{}
+	flagToValue := map[string]string{}
+	for _, chart := range charts {
+		chartOverrides, err := common.PropertyMapGet("scheduler-k3s", "--global", "chart-overrides."+chart.ReleaseName)
+		if err != nil {
+			return fmt.Errorf("Unable to get chart properties: %w", err)
+		}
+
+		for overrideKey, value := range chartOverrides {
+			flatKey := chart.ReleaseName + "." + overrideKey
+			flatOverrides[flatKey] = value
+			flagToValue["--scheduler-k3s-charts-"+flatKey] = value
+		}
+		overridesByChart[chart.ReleaseName] = chartOverrides
+	}
+
+	if infoFlag != "" {
+		value, ok := flagToValue[infoFlag]
+		if !ok {
+			validFlags := []string{}
+			for flag := range flagToValue {
+				validFlags = append(validFlags, flag)
+			}
+			sort.Strings(validFlags)
+			return fmt.Errorf("Invalid flag passed, valid flags: %s", strings.Join(validFlags, ", "))
+		}
+		fmt.Println(value)
+		return nil
+	}
+
+	if format == "json" {
+		b, err := json.Marshal(flatOverrides)
+		if err != nil {
+			return fmt.Errorf("Unable to marshal json: %w", err)
+		}
+		fmt.Println(string(b))
+		return nil
+	}
+
+	length := 31
+	for _, overrides := range overridesByChart {
+		for key := range overrides {
+			label := fmt.Sprintf("Chart property %s:", key)
+			if len(label) > length {
+				length = len(label)
+			}
+		}
+	}
+
+	for _, chart := range charts {
+		common.LogInfo2Quiet(fmt.Sprintf("%s chart information", chart.ReleaseName))
+
+		overrideKeys := []string{}
+		for key := range overridesByChart[chart.ReleaseName] {
+			overrideKeys = append(overrideKeys, key)
+		}
+		sort.Strings(overrideKeys)
+
+		for _, key := range overrideKeys {
+			label := fmt.Sprintf("Chart property %s:", key)
+			common.LogVerbose(fmt.Sprintf("%s%s", common.RightPad(label, length, " "), overridesByChart[chart.ReleaseName][key]))
+		}
+	}
+
+	return nil
+}
+
+// CommandClusterAdd adds a server to the k3s cluster
+func CommandClusterAdd(profileName string, role string, remoteHost string, serverIP string, allowUknownHosts bool, taintScheduling bool, kubeletArgs []string) error {
+	if err := isK3sInstalled(); err != nil {
+		return fmt.Errorf("k3s not installed, cannot add node to cluster: %w", err)
+	}
+
+	clientset, err := NewKubernetesClient()
+	if err != nil {
+		return fmt.Errorf("Unable to create kubernetes client: %w", err)
+	}
+
+	if err := clientset.Ping(); err != nil {
+		return fmt.Errorf("kubernetes api not available, cannot add node to cluster: %w", err)
+	}
+
+	incomingProfile := NodeProfile{}
+
+	if profileName != "" {
+		properties := common.PropertyGetDefault("scheduler-k3s", "--global", fmt.Sprintf("node-profile-%s.json", profileName), "")
+		if properties == "" {
+			return fmt.Errorf("Node profile %s not found", profileName)
+		}
+
+		err = json.Unmarshal([]byte(properties), &incomingProfile)
+		if err != nil {
+			return fmt.Errorf("Unable to unmarshal node profile: %w", err)
+		}
+	}
+
+	if role != "" {
+		incomingProfile.Role = role
+	}
+
+	if allowUknownHosts {
+		incomingProfile.AllowUknownHosts = allowUknownHosts
+	}
+
+	if taintScheduling {
+		incomingProfile.TaintScheduling = taintScheduling
+	}
+
+	if len(kubeletArgs) > 0 {
+		incomingProfile.KubeletArgs = kubeletArgs
+	}
+
+	if incomingProfile.Role != "server" && incomingProfile.Role != "worker" {
+		return fmt.Errorf("Invalid role: %s", incomingProfile.Role)
+	}
+
+	token := getGlobalGlobalToken()
+	if len(token) == 0 {
+		return fmt.Errorf("Missing k3s token")
+	}
+
+	if incomingProfile.TaintScheduling && incomingProfile.Role == "worker" {
+		return fmt.Errorf("Taint scheduling can only be used on the server role")
+	}
+
+	if serverIP == "" {
+		var err error
+		serverIP, err = getServerIP()
+		if err != nil {
+			return fmt.Errorf("Unable to get server ip address: %w", err)
+		}
+
+		common.LogVerboseQuiet(fmt.Sprintf("Using server ip address: %s", serverIP))
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, os.Interrupt, syscall.SIGHUP,
+		syscall.SIGINT,
+		syscall.SIGQUIT,
+		syscall.SIGTERM)
+	go func() {
+		<-signals
+		cancel()
+	}()
+
+	// todo: check if k3s is installed on the remote host
+
+	k3sVersionCmd, err := common.CallExecCommand(common.ExecCommandInput{
+		Command: "k3s",
+		Args:    []string{"--version"},
+	})
+	if err != nil {
+		return fmt.Errorf("Unable to call k3s version command: %w", err)
+	}
+	if k3sVersionCmd.ExitCode != 0 {
+		return fmt.Errorf("Invalid exit code from k3s --version command: %d", k3sVersionCmd.ExitCode)
+	}
+
+	k3sVersion := ""
+	k3sVersionLines := strings.Split(string(k3sVersionCmd.Stdout), "\n")
+	if len(k3sVersionLines) > 0 {
+		k3sVersionParts := strings.Split(k3sVersionLines[0], " ")
+		if len(k3sVersionParts) != 4 {
+			return fmt.Errorf("Unable to get k3s version from k3s --version: %s", k3sVersionCmd.Stdout)
+		}
+		k3sVersion = k3sVersionParts[2]
+	}
+	common.LogDebug(fmt.Sprintf("k3s version: %s", k3sVersion))
+
+	common.LogInfo1(fmt.Sprintf("Joining %s to k3s cluster as %s", remoteHost, incomingProfile.Role))
+	common.LogInfo2Quiet("Updating apt")
+	aptUpdateCmd, err := common.CallSshCommand(common.SshCommandInput{
+		Command: "apt-get",
+		Args: []string{
+			"update",
+		},
+		AllowUknownHosts: incomingProfile.AllowUknownHosts,
+		RemoteHost:       remoteHost,
+		StreamStdio:      true,
+		Sudo:             true,
+	})
+	if err != nil {
+		return fmt.Errorf("Unable to call apt-get update command over ssh: %w", err)
+	}
+	if aptUpdateCmd.ExitCode != 0 {
+		return fmt.Errorf("Invalid exit code from apt-get update command over ssh: %d", aptUpdateCmd.ExitCode)
+	}
+
+	common.LogInfo2Quiet("Installing k3s dependencies")
+	aptInstallCmd, err := common.CallSshCommand(common.SshCommandInput{
+		Command: "apt-get",
+		Args: []string{
+			"-y",
+			"install",
+			"ca-certificates",
+			"curl",
+			"open-iscsi",
+			"nfs-common",
+			"wireguard",
+		},
+		AllowUknownHosts: incomingProfile.AllowUknownHosts,
+		RemoteHost:       remoteHost,
+		StreamStdio:      true,
+		Sudo:             true,
+	})
+	if err != nil {
+		return fmt.Errorf("Unable to call apt-get install command over ssh: %w", err)
+	}
+	if aptInstallCmd.ExitCode != 0 {
+		return fmt.Errorf("Invalid exit code from apt-get install command over ssh: %d", aptInstallCmd.ExitCode)
+	}
+
+	common.LogInfo2Quiet("Downloading k3s installer")
+	curlTask, err := common.CallSshCommand(common.SshCommandInput{
+		Command: "curl",
+		Args: []string{
+			"-o /tmp/k3s-installer.sh",
+			"https://get.k3s.io",
+		},
+		AllowUknownHosts: incomingProfile.AllowUknownHosts,
+		RemoteHost:       remoteHost,
+		StreamStdio:      true,
+	})
+	if err != nil {
+		return fmt.Errorf("Unable to call curl command over ssh: %w", err)
+	}
+	if curlTask.ExitCode != 0 {
+		return fmt.Errorf("Invalid exit code from curl command over ssh: %d", curlTask.ExitCode)
+	}
+
+	common.LogInfo2Quiet("Setting k3s installer permissions")
+	chmodCmd, err := common.CallSshCommand(common.SshCommandInput{
+		Command: "chmod",
+		Args: []string{
+			"0755",
+			"/tmp/k3s-installer.sh",
+		},
+		AllowUknownHosts: incomingProfile.AllowUknownHosts,
+		RemoteHost:       remoteHost,
+		StreamStdio:      true,
+	})
+	if err != nil {
+		return fmt.Errorf("Unable to call chmod command over ssh: %w", err)
+	}
+	if chmodCmd.ExitCode != 0 {
+		return fmt.Errorf("Invalid exit code from chmod command over ssh: %d", chmodCmd.ExitCode)
+	}
+
+	common.LogInfo2Quiet("Ensuring compatible k3s version for node")
+	lowestNodeVersion, err := clientset.GetLowestNodeVersion(ctx, ListNodesInput{
+		LabelSelector: "node-role.kubernetes.io/control-plane=true",
+	})
+	if err != nil {
+		return fmt.Errorf("Unable to get lowest node version: %w", err)
+	}
+
+	tmpFile, err := os.CreateTemp("", "k3s-installer-*.sh")
+	if err != nil {
+		return fmt.Errorf("failed to create temporary file: %w", err)
+	}
+	defer os.Remove(tmpFile.Name())
+
+	scriptContent := fmt.Sprintf(`#!/usr/bin/env bash
+set -x
+export INSTALL_K3S_VERSION=%s
+
+/tmp/k3s-installer.sh "$@"`, lowestNodeVersion)
+
+	if _, err := tmpFile.WriteString(scriptContent); err != nil {
+		return fmt.Errorf("failed to write to temporary file: %w", err)
+	}
+	tmpFile.Close()
+
+	sftpCopyCmd, err := common.CallSftpCopy(common.SftpCopyInput{
+		AllowUknownHosts: incomingProfile.AllowUknownHosts,
+		DestinationPath:  "/tmp/k3s-installer-executor.sh",
+		RemoteHost:       remoteHost,
+		SourcePath:       tmpFile.Name(),
+	})
+	if err != nil {
+		return fmt.Errorf("Unable to copy installer script via sftp: %w", err)
+	}
+	if sftpCopyCmd.ExitErr != nil {
+		return fmt.Errorf("Invalid exit code from sftp copy command: %d", sftpCopyCmd.ExitErr)
+	}
+
+	chmodExecutorCmd, err := common.CallSshCommand(common.SshCommandInput{
+		Command: "chmod",
+		Args: []string{
+			"0755",
+			"/tmp/k3s-installer-executor.sh",
+		},
+		AllowUknownHosts: incomingProfile.AllowUknownHosts,
+		RemoteHost:       remoteHost,
+		StreamStdio:      true,
+	})
+	if err != nil {
+		return fmt.Errorf("Unable to make installer script executable via ssh: %w", err)
+	}
+	if chmodExecutorCmd.ExitCode != 0 {
+		return fmt.Errorf("Invalid exit code from chmod command via ssh: %d", chmodExecutorCmd.ExitCode)
+	}
+
+	u, err := url.Parse(remoteHost)
+	if err != nil {
+		return fmt.Errorf("failed to parse remote host: %w", err)
+	}
+
+	nodeName := u.Hostname()
+	n := 5
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		return fmt.Errorf("Unable to generate random node name: %w", err)
+	}
+	nodeName = strings.ReplaceAll(strings.ToLower(fmt.Sprintf("ip-%s-%s", nodeName, fmt.Sprintf("%X", b))), ".", "-")
+
+	args := []string{
+		// disable local-storage
+		"--disable", "local-storage",
+		// use wireguard for flannel
+		"--flannel-backend=wireguard-native",
+		// specify the node name
+		"--node-name", nodeName,
+		// server to connect to as the main
+		"--server",
+		fmt.Sprintf("https://%s:6443", serverIP),
+		// specify a token
+		"--token",
+		token,
+	}
+
+	if incomingProfile.Role == "server" {
+		args = append([]string{"server"}, args...)
+		// expose etcd metrics
+		args = append(args, "--etcd-expose-metrics")
+		// bind controller-manager to all interfaces
+		args = append(args, "--kube-controller-manager-arg", "bind-address=0.0.0.0")
+		// bind proxy metrics to all interfaces
+		args = append(args, "--kube-proxy-arg", "metrics-bind-address=0.0.0.0")
+		// bind scheduler to all interfaces
+		args = append(args, "--kube-scheduler-arg", "bind-address=0.0.0.0")
+		// gc terminated pods
+		args = append(args, "--kube-controller-manager-arg", "terminated-pod-gc-threshold=10")
+		// allow access for the dokku user
+		args = append(args, "--write-kubeconfig-mode", "0644")
+	} else {
+		// disable etcd on workers
+		args = append(args, "--disable-etcd")
+		// disable apiserver on workers
+		args = append(args, "--disable-apiserver")
+		// disable controller-manager on workers
+		args = append(args, "--disable-controller-manager")
+		// disable scheduler on workers
+		args = append(args, "--disable-scheduler")
+		// bind proxy metrics to all interfaces
+		args = append(args, "--kube-proxy-arg", "metrics-bind-address=0.0.0.0")
+	}
+
+	if incomingProfile.TaintScheduling {
+		args = append(args, "--node-taint", "CriticalAddonsOnly=true:NoSchedule")
+	}
+
+	for _, kubeletArg := range incomingProfile.KubeletArgs {
+		args = append(args, "--kubelet-arg", kubeletArg)
+	}
+
+	common.LogInfo2Quiet(fmt.Sprintf("Adding %s k3s cluster", nodeName))
+	joinCmd, err := common.CallSshCommand(common.SshCommandInput{
+		Command:          "/tmp/k3s-installer-executor.sh",
+		Args:             args,
+		AllowUknownHosts: incomingProfile.AllowUknownHosts,
+		RemoteHost:       remoteHost,
+		StreamStdio:      true,
+		Sudo:             true,
+	})
+	if err != nil {
+		return fmt.Errorf("Unable to call k3s installer command over ssh: %w", err)
+	}
+	if joinCmd.ExitCode != 0 {
+		return fmt.Errorf("Invalid exit code from k3s installer command over ssh: %d", joinCmd.ExitCode)
+	}
+
+	common.LogInfo2Quiet("Waiting for node to exist")
+	nodes, err := waitForNodeToExist(ctx, WaitForNodeToExistInput{
+		Clientset:  clientset,
+		NodeName:   nodeName,
+		RetryCount: 20,
+	})
+	if err != nil {
+		return fmt.Errorf("Error waiting for pod to exist: %w", err)
+	}
+	if len(nodes) == 0 {
+		return fmt.Errorf("Unable to find node after joining cluster, node will not be annotated/labeled appropriately access registry secrets")
+	}
+
+	labels := nodeLabels(incomingProfile.Role, profileName)
+
+	for key, value := range labels {
+		common.LogInfo2Quiet(fmt.Sprintf("Labeling node %s=%s", key, value))
+		if err != nil {
+			return fmt.Errorf("Unable to create kubernetes client: %w", err)
+		}
+
+		err = clientset.LabelNode(ctx, LabelNodeInput{
+			Name:  nodeName,
+			Key:   key,
+			Value: value,
+		})
+		if err != nil {
+			return fmt.Errorf("Unable to patch node: %w", err)
+		}
+	}
+
+	common.LogInfo2Quiet("Annotating node with connection information")
+	err = clientset.AnnotateNode(ctx, AnnotateNodeInput{
+		Name:  nodes[0].Name,
+		Key:   "dokku.com/remote-host",
+		Value: remoteHost,
+	})
+	if err != nil {
+		return fmt.Errorf("Unable to patch node: %w", err)
+	}
+
+	common.LogVerboseQuiet("Done")
+	return nil
+}
+
+// CommandClusterList lists the nodes in the k3s cluster
+func CommandClusterList(format string) error {
+	if format != "stdout" && format != "json" {
+		return fmt.Errorf("Invalid format: %s", format)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, os.Interrupt, syscall.SIGHUP,
+		syscall.SIGINT,
+		syscall.SIGQUIT,
+		syscall.SIGTERM)
+	go func() {
+		<-signals
+		cancel()
+	}()
+
+	clientset, err := NewKubernetesClient()
+	if err != nil {
+		return fmt.Errorf("Unable to create kubernetes client: %w", err)
+	}
+
+	if err := clientset.Ping(); err != nil {
+		return fmt.Errorf("kubernetes api not available, cannot list cluster nodes: %w", err)
+	}
+
+	nodes, err := clientset.ListNodes(ctx, ListNodesInput{})
+	if err != nil {
+		return fmt.Errorf("Unable to list nodes: %w", err)
+	}
+
+	output := []Node{}
+	for _, node := range nodes {
+		output = append(output, kubernetesNodeToNode(node))
+	}
+
+	if format == "stdout" {
+		lines := []string{"name|ready|roles|version"}
+		for _, node := range output {
+			lines = append(lines, node.String())
+		}
+
+		columnized := columnize.SimpleFormat(lines)
+		fmt.Println(columnized)
+		return nil
+	}
+
+	b, err := json.Marshal(output)
+	if err != nil {
+		return fmt.Errorf("Unable to marshal json: %w", err)
+	}
+
+	fmt.Println(string(b))
+	return nil
+}
+
+// CommandClusterRemove removes a node from the k3s cluster
+func CommandClusterRemove(nodeName string) error {
+	if err := isK3sInstalled(); err != nil {
+		return fmt.Errorf("k3s not installed, cannot remove node from cluster: %w", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, os.Interrupt, syscall.SIGHUP,
+		syscall.SIGINT,
+		syscall.SIGQUIT,
+		syscall.SIGTERM)
+	go func() {
+		<-signals
+		cancel()
+	}()
+
+	common.LogInfo1Quiet(fmt.Sprintf("Removing %s from k3s cluster", nodeName))
+	clientset, err := NewKubernetesClient()
+	if err != nil {
+		return fmt.Errorf("Unable to create kubernetes client: %w", err)
+	}
+
+	if err := clientset.Ping(); err != nil {
+		return fmt.Errorf("kubernetes api not available: %w", err)
+	}
+
+	common.LogVerboseQuiet("Getting node remote connection information")
+	node, err := clientset.GetNode(ctx, GetNodeInput{
+		Name: nodeName,
+	})
+	if err != nil {
+		return fmt.Errorf("Unable to get node: %w", err)
+	}
+
+	common.LogVerboseQuiet("Checking if node is a remote node managed by Dokku")
+	if node.RemoteHost == "" {
+		return fmt.Errorf("Node %s is not a remote node managed by Dokku", nodeName)
+	}
+
+	common.LogVerboseQuiet("Uninstalling k3s on remote host")
+	removeCmd, err := common.CallSshCommand(common.SshCommandInput{
+		Command:          "/usr/local/bin/k3s-uninstall.sh",
+		Args:             []string{},
+		AllowUknownHosts: true,
+		RemoteHost:       node.RemoteHost,
+		StreamStdio:      true,
+		Sudo:             true,
+	})
+	if err != nil {
+		return fmt.Errorf("Unable to call k3s uninstall command over ssh: %w", err)
+	}
+
+	if removeCmd.ExitCode != 0 {
+		return fmt.Errorf("Invalid exit code from k3s uninstall command over ssh: %d", removeCmd.ExitCode)
+	}
+
+	common.LogVerboseQuiet("Deleting node from k3s cluster")
+	err = clientset.DeleteNode(ctx, DeleteNodeInput{
+		Name: nodeName,
+	})
+	if err != nil {
+		return fmt.Errorf("Unable to delete node: %w", err)
+	}
+
+	common.LogVerboseQuiet("Done")
+
+	return nil
+}
+
+// CommandEnsureCharts ensures that the required helm charts are installed
+func CommandEnsureCharts(forceInstall bool, forceChartNames []string) error {
+	ctx, cancel := context.WithCancel(context.Background())
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, os.Interrupt, syscall.SIGHUP,
+		syscall.SIGINT,
+		syscall.SIGQUIT,
+		syscall.SIGTERM)
+	go func() {
+		<-signals
+		cancel()
+	}()
+
+	clientset, err := NewKubernetesClient()
+	if err != nil {
+		return fmt.Errorf("Unable to create kubernetes client: %w", err)
+	}
+
+	ingressClass := getComputedIngressClass()
+
+	namespacedHelmAgents := map[string]*HelmAgent{}
+	for _, chart := range HelmCharts {
+		_, ok := namespacedHelmAgents[chart.Namespace]
+		if !ok {
+			helmAgent, err := NewHelmAgent(chart.Namespace, DeployLogPrinter)
+			if err != nil {
+				common.LogWarn(fmt.Sprintf("Unable to create helm agent: %s", err.Error()))
+				return err
+			}
+			namespacedHelmAgents[chart.Namespace] = helmAgent
+		}
+	}
+
+	common.LogInfo2Quiet("Installing helm charts")
+	err = installHelmCharts(ctx, clientset, func(chart HelmChart) bool {
+		common.LogInfo1(fmt.Sprintf("Processing chart %s@%s", chart.ReleaseName, chart.Version))
+
+		helmAgent := namespacedHelmAgents[chart.Namespace]
+		latestRevision, err := helmAgent.InstalledRevision(chart.ReleaseName)
+		if err != nil {
+			common.LogWarn(fmt.Sprintf("Unable to get installed revision: %s", err))
+			return false
+		}
+
+		decision := chartInstallDecision(ChartInstallDecisionInput{
+			Chart:             chart,
+			ForceChartNames:   forceChartNames,
+			ForceInstall:      forceInstall,
+			IngressClass:      ingressClass,
+			InstalledRevision: latestRevision,
+		})
+		common.LogVerbose(decision.Reason)
+
+		return decision.Install
+	})
+	if err != nil {
+		return fmt.Errorf("Unable to install helm charts: %w", err)
+	}
+
+	for _, manifest := range KubernetesManifests {
+		common.LogInfo2Quiet(fmt.Sprintf("Installing %s@%s", manifest.Name, manifest.Version))
+		err = clientset.ApplyKubernetesManifest(ctx, ApplyKubernetesManifestInput{
+			Manifest: manifest.Path,
+		})
+		if err != nil {
+			return fmt.Errorf("Unable to apply kubernetes manifest: %w", err)
+		}
+	}
+
+	common.LogInfo2Quiet("Done")
+
+	return nil
+}
+
+// CommandLabelsSet sets, clears or replaces scheduler-k3s labels for an app
+func CommandLabelsSet(input MetadataSetInput) error {
+	return commandMetadataSet(labelsField, input)
+}
+
+// CommandLabelsClear clears scheduler-k3s labels for an app
+func CommandLabelsClear(input MetadataClearInput) error {
+	return commandMetadataClear(labelsField, input)
+}
+
+// CommandProfilesAdd adds a node profile to the k3s cluster
+func CommandProfilesAdd(profileName string, role string, allowUknownHosts bool, taintScheduling bool, kubeletArgs []string) error {
+	if role != "server" && role != "worker" {
+		return fmt.Errorf("Invalid role: %s", role)
+	}
+
+	if err := validateNodeProfileName(profileName); err != nil {
+		return err
+	}
+
+	profile := NodeProfile{
+		Name:             profileName,
+		Role:             role,
+		AllowUknownHosts: allowUknownHosts,
+		TaintScheduling:  taintScheduling,
+		KubeletArgs:      kubeletArgs,
+	}
+
+	data, err := json.Marshal(profile)
+	if err != nil {
+		return fmt.Errorf("Unable to marshal node profile to json: %w", err)
+	}
+
+	if err := common.PropertyWrite("scheduler-k3s", "--global", fmt.Sprintf("node-profile-%s.json", profileName), string(data)); err != nil {
+		return fmt.Errorf("Unable to write node profile: %w", err)
+	}
+
+	common.LogInfo1(fmt.Sprintf("Node profile %s added", profileName))
+
+	return nil
+}
+
+// CommandProfilesList lists the node profiles in the k3s cluster
+func CommandProfilesList(format string) error {
+	if format != "stdout" && format != "json" {
+		return fmt.Errorf("Invalid format: %s", format)
+	}
+
+	properties, err := common.PropertyGetAllByPrefix("scheduler-k3s", "--global", "node-profile-")
+	if err != nil {
+		return fmt.Errorf("Unable to get node profiles: %w", err)
+	}
+
+	output := []NodeProfile{}
+	for property, data := range properties {
+		if !strings.HasSuffix(property, ".json") {
+			continue
+		}
+
+		var profile NodeProfile
+		err := json.Unmarshal([]byte(data), &profile)
+		if err != nil {
+			return fmt.Errorf("Unable to unmarshal node profile: %w", err)
+		}
+
+		output = append(output, profile)
+	}
+
+	if format == "stdout" {
+		lines := []string{"name|role"}
+		for _, profile := range output {
+			lines = append(lines, fmt.Sprintf("%s|%s", profile.Name, profile.Role))
+		}
+
+		columnized := columnize.SimpleFormat(lines)
+		fmt.Println(columnized)
+		return nil
+	}
+
+	b, err := json.Marshal(output)
+	if err != nil {
+		return fmt.Errorf("Unable to marshal json: %w", err)
+	}
+
+	fmt.Println(string(b))
+
+	return nil
+}
+
+// CommandProfilesRemove removes a node profile from the k3s cluster
+func CommandProfilesRemove(profileName string) error {
+	if err := validateStoredNodeProfileName(profileName); err != nil {
+		return err
+	}
+
+	if err := common.PropertyDelete("scheduler-k3s", "--global", fmt.Sprintf("node-profile-%s.json", profileName)); err != nil {
+		return fmt.Errorf("Unable to delete node profile: %w", err)
+	}
+
+	if err := DeleteNodeSysctls(context.Background(), profileName); err != nil {
+		return err
+	}
+
+	common.LogInfo1(fmt.Sprintf("Node profile %s removed", profileName))
+	return nil
+}
+
+// CommandReport displays a scheduler-k3s report for one or more apps
+func CommandReport(appName string, format string, infoFlag string) error {
+	if len(appName) == 0 {
+		apps, err := common.DokkuApps()
+		if err != nil {
+			if errors.Is(err, common.NoAppsExist) {
+				common.LogWarn(err.Error())
+				return nil
+			}
+			return err
+		}
+		for _, appName := range apps {
+			if err := ReportSingleApp(appName, format, infoFlag); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	return ReportSingleApp(appName, format, infoFlag)
+}
+
+// CommandSet set or clear a scheduler-k3s property for an app
+func CommandSet(appName string, property string, value string) error {
+	validProperties := DefaultProperties
+	globalProperties := GlobalProperties
+	if strings.HasPrefix(property, "chart.") {
+		common.LogWarn("scheduler-k3s:set chart.* properties are deprecated; use scheduler-k3s:charts:set <chart>.<property> instead")
+
+		if appName != "--global" {
+			return fmt.Errorf("Chart properties can only be set globally")
+		}
+
+		chartParts := strings.SplitN(property, ".", 3)
+		if len(chartParts) != 3 {
+			return fmt.Errorf("Invalid chart property, expected format: chart.$CHART_NAME.$PROPERTY: %s", property)
+		}
+
+		if chartParts[1] == "" {
+			return fmt.Errorf("Invalid chart property, missing chart name")
+		}
+
+		chartName := chartParts[1]
+		chartProperty := chartParts[2]
+		chartFound := false
+		for _, chart := range HelmCharts {
+			if chart.ReleaseName == chartName {
+				chartFound = true
+				break
+			}
+		}
+		if !chartFound {
+			return fmt.Errorf("Invalid chart property, no matching chart found: %s", property)
+		}
+
+		mapProperty := "chart-overrides." + chartName
+		if value != "" {
+			common.LogInfo2Quiet(fmt.Sprintf("Setting %s to %s", property, value))
+			if err := common.PropertyMapSet("scheduler-k3s", "--global", mapProperty, chartProperty, value); err != nil {
+				return fmt.Errorf("Unable to write property: %w", err)
+			}
+			return nil
+		}
+
+		common.LogInfo2Quiet(fmt.Sprintf("Unsetting %s", property))
+		if err := common.PropertyMapDelete("scheduler-k3s", "--global", mapProperty, chartProperty); err != nil {
+			return fmt.Errorf("Unable to delete property: %w", err)
+		}
+		return nil
+	}
+
+	switch property {
+	case "cert-issuer-kind":
+		normalized, err := normalizeCertIssuerKind(value)
+		if err != nil {
+			return err
+		}
+		value = normalized
+	case "cert-issuer-name":
+		if err := validateCertIssuerName(value); err != nil {
+			return err
+		}
+	case "letsencrypt-server":
+		if err := validateLetsencryptServer(value); err != nil {
+			return err
+		}
+	}
+
+	common.CommandPropertySet("scheduler-k3s", appName, property, value, validProperties, globalProperties)
+
+	letsencryptProperties := map[string]bool{
+		"letsencrypt-email-prod": true,
+		"letsencrypt-email-stag": true,
+		"letsencrypt-server":     true,
+	}
+	if appName == "--global" && letsencryptProperties[property] {
+		return applyClusterIssuers(context.Background())
+	}
+
+	return nil
+}
+
+// CommandShowKubeconfig displays the kubeconfig file contents
+func CommandShowKubeconfig() error {
+	kubeconfigPath := getComputedKubeconfigPath()
+	if !common.FileExists(kubeconfigPath) {
+		return fmt.Errorf("Kubeconfig file does not exist: %s", kubeconfigPath)
+	}
+
+	b, err := os.ReadFile(kubeconfigPath)
+	if err != nil {
+		return fmt.Errorf("Unable to read kubeconfig file: %w", err)
+	}
+
+	fmt.Println(string(b))
+
+	return nil
+}
+
+func CommandUninstall() error {
+	if err := isK3sInstalled(); err != nil {
+		return fmt.Errorf("k3s not installed, cannot uninstall: %w", err)
+	}
+
+	common.LogInfo1("Uninstalling k3s")
+	uninstallerCmd, err := common.CallExecCommand(common.ExecCommandInput{
+		Command:     "/usr/local/bin/k3s-uninstall.sh",
+		StreamStdio: true,
+	})
+	if err != nil {
+		return fmt.Errorf("Unable to call k3s uninstaller command: %w", err)
+	}
+	if uninstallerCmd.ExitCode != 0 {
+		return fmt.Errorf("Invalid exit code from k3s uninstaller command: %d", uninstallerCmd.ExitCode)
+	}
+
+	common.LogInfo2Quiet("Removing k3s dependencies")
+	return uninstallHelperCommands(context.Background())
+}

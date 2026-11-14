@@ -25,6 +25,12 @@ func main() {
 		args.Parse(os.Args[2:])
 		appName := args.Arg(0)
 		err = proxy.CommandBuildConfig(appName, *allApps, *parallelCount)
+	case "clear-config":
+		args := flag.NewFlagSet("proxy:clear-config", flag.ExitOnError)
+		allApps := args.Bool("all", false, "--all: build-config for all apps")
+		args.Parse(os.Args[2:])
+		appName := args.Arg(0)
+		err = proxy.CommandClearConfig(appName, *allApps)
 	case "disable":
 		args := flag.NewFlagSet("proxy:disable", flag.ExitOnError)
 		allApps := args.Bool("all", false, "--all: disable proxy for all apps")
@@ -39,49 +45,57 @@ func main() {
 		args.Parse(os.Args[2:])
 		appName := args.Arg(0)
 		err = proxy.CommandEnable(appName, *allApps, *parallelCount)
-	case "ports":
-		args := flag.NewFlagSet("proxy:ports", flag.ExitOnError)
-		args.Parse(os.Args[2:])
-		appName := args.Arg(0)
-		err = proxy.CommandPorts(appName)
-	case "ports-add":
-		args := flag.NewFlagSet("proxy:ports-add", flag.ExitOnError)
-		args.Parse(os.Args[2:])
-		appName := args.Arg(0)
-		_, portMaps := common.ShiftString(args.Args())
-		err = proxy.CommandPortsAdd(appName, portMaps)
-	case "ports-clear":
-		args := flag.NewFlagSet("proxy:ports-clear", flag.ExitOnError)
-		args.Parse(os.Args[2:])
-		appName := args.Arg(0)
-		err = proxy.CommandPortsClear(appName)
-	case "ports-remove":
-		args := flag.NewFlagSet("proxy:ports-remove", flag.ExitOnError)
-		args.Parse(os.Args[2:])
-		appName := args.Arg(0)
-		_, portMaps := common.ShiftString(args.Args())
-		err = proxy.CommandPortsRemove(appName, portMaps)
-	case "ports-set":
-		args := flag.NewFlagSet("proxy:ports-set", flag.ExitOnError)
-		args.Parse(os.Args[2:])
-		appName := args.Arg(0)
-		_, portMaps := common.ShiftString(args.Args())
-		err = proxy.CommandPortsSet(appName, portMaps)
 	case "report":
 		args := flag.NewFlagSet("proxy:report", flag.ExitOnError)
 		format := args.String("format", "stdout", "format: [ stdout | json ]")
-		osArgs, infoFlag, flagErr := common.ParseReportArgs("proxy", os.Args[2:])
+		reportArgs, flagErr := common.ParseReportArgs("proxy", os.Args[2:])
 		if flagErr == nil {
-			args.Parse(osArgs)
+			args.Parse(reportArgs.OSArgs)
 			appName := args.Arg(0)
-			err = proxy.CommandReport(appName, *format, infoFlag)
+			if reportArgs.IsGlobal {
+				appName = "--global"
+			}
+			err = proxy.CommandReport(appName, *format, reportArgs.InfoFlag)
 		}
 	case "set":
 		args := flag.NewFlagSet("proxy:set", flag.ExitOnError)
+		global := args.Bool("global", false, "--global: set a global property")
 		args.Parse(os.Args[2:])
 		appName := args.Arg(0)
-		proxyType := args.Arg(1)
-		err = proxy.CommandSet(appName, proxyType)
+		property := args.Arg(1)
+		value := args.Arg(2)
+		if *global {
+			appName = "--global"
+			property = args.Arg(0)
+			value = args.Arg(1)
+		}
+		err = proxy.CommandSet(appName, property, value)
+	case "route:set":
+		args := flag.NewFlagSet("proxy:route:set", flag.ExitOnError)
+		port := args.Int("port", proxy.DefaultRoutePort, "--port: container port of the target process")
+		stripPrefix := args.Bool("strip-prefix", false, "--strip-prefix: strip the matched prefix before forwarding")
+		args.Parse(os.Args[2:])
+		appName := args.Arg(0)
+		processName := args.Arg(1)
+		path := args.Arg(2)
+		err = proxy.CommandRouteSet(appName, processName, path, *port, *stripPrefix)
+	case "route:remove":
+		args := flag.NewFlagSet("proxy:route:remove", flag.ExitOnError)
+		args.Parse(os.Args[2:])
+		appName := args.Arg(0)
+		path := args.Arg(1)
+		err = proxy.CommandRouteRemove(appName, path)
+	case "route:clear":
+		args := flag.NewFlagSet("proxy:route:clear", flag.ExitOnError)
+		args.Parse(os.Args[2:])
+		appName := args.Arg(0)
+		err = proxy.CommandRouteClear(appName)
+	case "route:report":
+		args := flag.NewFlagSet("proxy:route:report", flag.ExitOnError)
+		format := args.String("format", "stdout", "format: [ stdout | json ]")
+		args.Parse(os.Args[2:])
+		appName := args.Arg(0)
+		err = proxy.CommandRouteReport(appName, *format)
 	default:
 		err = fmt.Errorf("Invalid plugin subcommand call: %s", subcommand)
 	}

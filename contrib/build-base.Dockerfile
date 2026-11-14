@@ -1,6 +1,24 @@
-FROM ubuntu:18.04
+FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-RUN apt-get update -qq && apt-get -qq -y --no-install-recommends install gcc git build-essential wget ruby-dev ruby1.9.1 lintian rpm help2man man-db
-RUN command -v fpm >/dev/null || sudo gem install fpm --no-ri --no-rdoc
+RUN apt-get update -qq && apt-get -qq -y --no-install-recommends install \
+    adduser \
+    build-essential \
+    ca-certificates \
+    coreutils \
+    curl \
+    gcc \
+    git \
+    help2man \
+    jq \
+    libc-bin \
+    lintian \
+    man-db \
+    openssh-client \
+    python3 \
+    rpm \
+    ruby-dev \
+    sudo \
+    wget
+RUN command -v fpm || gem install fpm

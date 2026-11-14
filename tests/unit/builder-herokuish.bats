@@ -10,10 +10,342 @@ teardown() {
   destroy_app
 }
 
+@test "(builder-herokuish:report) info-flag works before deploy" {
+  run /bin/bash -c "dokku builder-herokuish:report $TEST_APP --builder-herokuish-allowed"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku builder-herokuish:set $TEST_APP allowed false"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku builder-herokuish:report $TEST_APP --builder-herokuish-allowed"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "false"
+
+  run /bin/bash -c "dokku builder-herokuish:report $TEST_APP --builder-herokuish-invalid-flag"
+  echo "output: $output"
+  echo "status: $status"
+  assert_failure
+  assert_output_contains "Invalid flag passed"
+}
+
+@test "(builder-herokuish:report) --global --builder-herokuish-global-allowed" {
+  run /bin/bash -c "dokku builder-herokuish:set --global allowed false"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku builder-herokuish:report --global --builder-herokuish-global-allowed"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "false"
+
+  run /bin/bash -c "dokku builder-herokuish:set --global allowed"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+}
+
+@test "(builder-herokuish:report) allowed raw vs computed vs global" {
+  local default_allowed="true"
+  [[ "$(dpkg --print-architecture 2>/dev/null || true)" != "amd64" ]] && default_allowed="false"
+
+  run /bin/bash -c "dokku builder-herokuish:set --global allowed"
+  assert_success
+
+  run /bin/bash -c "dokku builder-herokuish:report $TEST_APP --builder-herokuish-allowed"
+  assert_success
+  assert_output_not_exists
+
+  run /bin/bash -c "dokku builder-herokuish:report $TEST_APP --builder-herokuish-global-allowed"
+  assert_success
+  assert_output_not_exists
+
+  run /bin/bash -c "dokku builder-herokuish:report $TEST_APP --builder-herokuish-computed-allowed"
+  assert_success
+  assert_output "$default_allowed"
+
+  run /bin/bash -c "dokku builder-herokuish:set --global allowed false"
+  assert_success
+
+  run /bin/bash -c "dokku builder-herokuish:report $TEST_APP --builder-herokuish-global-allowed"
+  assert_success
+  assert_output "false"
+
+  run /bin/bash -c "dokku builder-herokuish:report $TEST_APP --builder-herokuish-computed-allowed"
+  assert_success
+  assert_output "false"
+
+  run /bin/bash -c "dokku builder-herokuish:set $TEST_APP allowed true"
+  assert_success
+
+  run /bin/bash -c "dokku builder-herokuish:report $TEST_APP --builder-herokuish-allowed"
+  assert_success
+  assert_output "true"
+
+  run /bin/bash -c "dokku builder-herokuish:report $TEST_APP --builder-herokuish-global-allowed"
+  assert_success
+  assert_output "false"
+
+  run /bin/bash -c "dokku builder-herokuish:report $TEST_APP --builder-herokuish-computed-allowed"
+  assert_success
+  assert_output "true"
+
+  run /bin/bash -c "dokku builder-herokuish:set $TEST_APP allowed"
+  assert_success
+
+  run /bin/bash -c "dokku builder-herokuish:set --global allowed"
+  assert_success
+}
+
+@test "(builder-herokuish:report) stack raw vs computed vs global" {
+  local default_stack="gliderlabs/herokuish:latest-24"
+
+  run /bin/bash -c "dokku builder-herokuish:report $TEST_APP --builder-herokuish-stack"
+  assert_success
+  assert_output_not_exists
+
+  run /bin/bash -c "dokku builder-herokuish:report $TEST_APP --builder-herokuish-global-stack"
+  assert_success
+  assert_output_not_exists
+
+  run /bin/bash -c "dokku builder-herokuish:report $TEST_APP --builder-herokuish-computed-stack"
+  assert_success
+  assert_output "$default_stack"
+
+  run /bin/bash -c "dokku builder-herokuish:set --global stack gliderlabs/herokuish:global"
+  assert_success
+
+  run /bin/bash -c "dokku builder-herokuish:report $TEST_APP --builder-herokuish-global-stack"
+  assert_success
+  assert_output "gliderlabs/herokuish:global"
+
+  run /bin/bash -c "dokku builder-herokuish:report $TEST_APP --builder-herokuish-computed-stack"
+  assert_success
+  assert_output "gliderlabs/herokuish:global"
+
+  run /bin/bash -c "dokku builder-herokuish:set $TEST_APP stack gliderlabs/herokuish:app"
+  assert_success
+
+  run /bin/bash -c "dokku builder-herokuish:report $TEST_APP --builder-herokuish-stack"
+  assert_success
+  assert_output "gliderlabs/herokuish:app"
+
+  run /bin/bash -c "dokku builder-herokuish:report $TEST_APP --builder-herokuish-computed-stack"
+  assert_success
+  assert_output "gliderlabs/herokuish:app"
+
+  run /bin/bash -c "dokku builder-herokuish:set $TEST_APP stack"
+  assert_success
+
+  run /bin/bash -c "dokku builder-herokuish:set --global stack"
+  assert_success
+}
+
 @test "(builder-herouish:build .env)" {
-  run deploy_app python dokku@dokku.me:$TEST_APP
+  run /bin/bash -c "dokku docker-options:add $TEST_APP build '--label=com.dokku.build-test=safe'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run deploy_app python dokku@$DOKKU_DOMAIN:$TEST_APP
   echo "output: $output"
   echo "status: $status"
   assert_success
   assert_output_contains 'DOTENV_KEY=some_value'
+}
+
+@test "(builder-herokuish) builder-herokuish:set allowed" {
+  if [[ "$(dpkg --print-architecture 2>/dev/null || true)" == "amd64" ]]; then
+    skip "this test cannot be performed accurately on amd64 as it tests whether we can enable the plugin on arm64"
+  fi
+
+  run /bin/bash -c "dokku builder-herokuish:set --global allowed"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku builder-herokuish:report $TEST_APP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run deploy_app
+  echo "output: $output"
+  echo "status: $status"
+  assert_failure
+
+  run create_app
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku builder-herokuish:set --global allowed true"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku builder-herokuish:report $TEST_APP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run deploy_app
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku builder-herokuish:set --global allowed"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku builder-herokuish:set $TEST_APP allowed true"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku builder-herokuish:report $TEST_APP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku ps:rebuild $TEST_APP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku builder-herokuish:set $TEST_APP allowed"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku ps:rebuild $TEST_APP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_failure
+}
+
+@test "(builder-herokuish) run" {
+  run /bin/bash -c "dokku config:set $TEST_APP SECRET_KEY=fjdkslafjdk"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku builder:set $TEST_APP selected herokuish"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run deploy_app python dokku@$DOKKU_DOMAIN:$TEST_APP
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku run $TEST_APP python3 task.py test"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "['task.py', 'test']"
+
+  run /bin/bash -c "dokku --quiet run $TEST_APP task"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "['task.py', 'test']"
+
+  run /bin/bash -c "dokku run $TEST_APP env"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output_contains "SECRET_KEY=fjdkslafjdk"
+}
+
+@test "(builder-herokuish) cron:run" {
+  run /bin/bash -c "dokku config:set $TEST_APP SECRET_KEY=fjdkslafjdk"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku builder:set $TEST_APP selected herokuish"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run deploy_app python dokku@$DOKKU_DOMAIN:$TEST_APP cron_run_wrapper
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  cron_id="$(dokku cron:list $TEST_APP --format json | jq -r '.[0].id')"
+  run /bin/bash -c "echo $cron_id"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output_exists
+
+  run /bin/bash -c "dokku cron:run $TEST_APP $cron_id"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "['task.py', 'some', 'cron', 'task']"
+}
+
+@test "(builder-herokuish) ps:rebuild --no-cache" {
+  run /bin/bash -c "dokku builder-herokuish:set $TEST_APP allowed true"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run deploy_app python dokku@$DOKKU_DOMAIN:$TEST_APP
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "docker volume inspect --format '{{.CreatedAt}}' cache-$TEST_APP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  cache_created_at="$output"
+
+  sleep 1
+  run /bin/bash -c "dokku ps:rebuild $TEST_APP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output_contains "Clearing build cache" 0
+
+  run /bin/bash -c "docker volume inspect --format '{{.CreatedAt}}' cache-$TEST_APP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "$cache_created_at"
+
+  sleep 1
+  run /bin/bash -c "dokku ps:rebuild --no-cache $TEST_APP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output_contains "Clearing build cache"
+
+  run /bin/bash -c "docker volume inspect --format '{{.CreatedAt}}' cache-$TEST_APP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  [[ "$output" != "$cache_created_at" ]]
+}
+
+cron_run_wrapper() {
+  local APP="$1"
+  local APP_REPO_DIR="$2"
+  [[ -z "$APP" ]] && local APP="$TEST_APP"
+  APP_REPO_DIR="$(realpath "$APP_REPO_DIR")"
+
+  mv -f "$APP_REPO_DIR/app-cron.json" "$APP_REPO_DIR/app.json"
 }

@@ -1,7 +1,10 @@
 package apps
 
 import (
+	"errors"
 	"fmt"
+	"os"
+	"time"
 
 	"github.com/dokku/dokku/plugins/common"
 )
@@ -41,6 +44,79 @@ func TriggerInstall() error {
 		return fmt.Errorf("Unable to install the apps plugin: %s", err.Error())
 	}
 
+	if err := common.SetupAppData("apps"); err != nil {
+		return err
+	}
+
+	apps, err := common.UnfilteredDokkuApps()
+	if err != nil && !errors.Is(err, common.NoAppsExist) {
+		return nil
+	}
+
+	if err := common.MigrateConfigToProperties("apps", []common.MigrateConfigEntry{
+		{
+			GlobalConfigVar: "DOKKU_DISABLE_APP_AUTOCREATION",
+			Property:        "disable-autocreation",
+		},
+	}); err != nil {
+		return err
+	}
+
+	// migrate all created-at values from app mod-time to property
+	for _, appName := range apps {
+		if common.PropertyExists("apps", appName, "created-at") {
+			continue
+		}
+
+		fi, err := os.Stat(common.AppRoot(appName))
+		if err != nil {
+			// if we can't get the time, just write the current one out as a stub
+			if err := common.PropertyWrite("apps", appName, "created-at", fmt.Sprintf("%d", time.Now().Unix())); err != nil {
+				return err
+			}
+
+			continue
+		}
+
+		if err := common.PropertyWrite("apps", appName, "created-at", fmt.Sprintf("%d", fi.ModTime().Unix())); err != nil {
+			return err
+		}
+	}
+
+	for _, appName := range apps {
+		if err := migrateManualLock(appName); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// migrateManualLock converts a lock created by apps:lock before manual locks
+// had their own file. Deploys write their build id into the deploy lock file,
+// so an empty one that no deploy holds was created by apps:lock.
+func migrateManualLock(appName string) error {
+	lockPath := getLockPath(appName)
+	fi, err := os.Stat(lockPath)
+	if err != nil || fi.Size() != 0 || deployLockHeld(appName) {
+		return nil
+	}
+
+	if err := os.Rename(lockPath, getManualLockPath(appName)); err != nil {
+		return fmt.Errorf("Unable to migrate the deploy lock for %s: %w", appName, err)
+	}
+
+	return nil
+}
+
+// removeLockFiles removes the given lock files, ignoring ones that do not exist
+func removeLockFiles(lockPaths ...string) error {
+	for _, lockPath := range lockPaths {
+		if err := os.Remove(lockPath); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+	}
+
 	return nil
 }
 
@@ -51,7 +127,16 @@ func TriggerPostAppCloneSetup(oldAppName string, newAppName string) error {
 		return err
 	}
 
-	return nil
+	if err := common.CloneAppData("apps", oldAppName, newAppName); err != nil {
+		return err
+	}
+
+	return removeLockFiles(getManualLockPath(newAppName), getLockPath(newAppName))
+}
+
+// TriggerPostAppRename removes the old app data
+func TriggerPostAppRename(oldAppName string, newAppName string) error {
+	return common.MigrateAppDataDirectory("apps", oldAppName, newAppName)
 }
 
 // TriggerPostAppRenameSetup renames apps files
@@ -64,28 +149,26 @@ func TriggerPostAppRenameSetup(oldAppName string, newAppName string) error {
 		return err
 	}
 
-	return nil
+	if err := common.CloneAppData("apps", oldAppName, newAppName); err != nil {
+		return err
+	}
+
+	return removeLockFiles(getLockPath(newAppName))
 }
 
-// TriggerPostDelete is the apps post-delete plugin trigger
+// TriggerPostCreate ensures apps have the correct data directory structure
+func TriggerPostCreate(appName string) error {
+	return common.CreateAppDataDirectory("apps", appName)
+}
+
+// TriggerPostDelete destroys the apps data for a given app container
 func TriggerPostDelete(appName string) error {
-	if err := common.PropertyDestroy("apps", appName); err != nil {
-		common.LogWarn(err.Error())
+	dataErr := common.RemoveAppDataDirectory("apps", appName)
+	propertyErr := common.PropertyDestroy("apps", appName)
+
+	if dataErr != nil {
+		return dataErr
 	}
 
-	imagesByAppLabel, err := listImagesByAppLabel(appName)
-	if err != nil {
-		common.LogWarn(err.Error())
-	}
-
-	imageRepo := common.GetAppImageRepo(appName)
-	imagesByRepo, err := listImagesByImageRepo(imageRepo)
-	if err != nil {
-		common.LogWarn(err.Error())
-	}
-
-	images := append(imagesByAppLabel, imagesByRepo...)
-	common.RemoveImages(images)
-
-	return nil
+	return propertyErr
 }

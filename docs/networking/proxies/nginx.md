@@ -1,0 +1,725 @@
+# Nginx Proxy
+
+Dokku uses nginx as its server for routing requests to specific applications. By default, access and error logs are written for each app to `/var/log/nginx/${APP}-access.log` and `/var/log/nginx/${APP}-error.log` respectively
+
+```
+nginx:access-logs <app> [-t]             # Show the nginx access logs for an application (-t follows)
+nginx:error-logs <app> [-t]              # Show the nginx error logs for an application (-t follows)
+nginx:reload                             # Reloads the nginx server config
+nginx:report [<app>] [<flag>|--format json] # Displays a nginx report for one or more apps
+nginx:set <app> <property> (<value>)     # Set or clear an nginx property for an app
+nginx:show-config <app>                  # Display app nginx config
+nginx:start                              # Starts the nginx server
+nginx:stop                               # Stops the nginx server
+nginx:validate-config [<app>] [--clean]  # Validates and optionally cleans up invalid nginx configurations
+```
+
+## Usage
+
+> [!WARNING]
+> As using multiple proxy plugins on a single Dokku installation can lead to issues routing requests to apps, doing so should be avoided.
+
+### Request Proxying
+
+By default, the `web` process is the only process proxied by the nginx proxy implementation. Proxying to other process types may be handled by a custom `nginx.conf.sigil` file, as generally described [below](/docs/networking/proxies/nginx.md#customizing-the-nginx-configuration)
+
+Nginx will proxy the requests in a [round-robin balancing fashion](http://nginx.org/en/docs/http/ngx_http_upstream_module.html#upstream) to the different deployed (scaled) containers running the `web` proctype. This way, the host's resources can be fully leveraged for single-threaded applications (e.g. `dokku ps:scale node-js-app web=4` on a 4-core machine).
+
+> [!NOTE]
+> Due to how the plugin is implemented, if an app successfully starts up `web` containers but fails to deploy some other containers, nginx may eventually stop routing requests. Users should revert their code in these cases, or manually trigger `dokku proxy:build-config $APP` in order to ensure requests route to the new web containers.
+
+### Upstream Resolution via coredns-docker
+
+> [!IMPORTANT]
+> New as of 0.39.0
+
+Dokku can resolve nginx upstreams through [coredns-docker](https://github.com/dokku/coredns-docker), a CoreDNS plugin that watches the Docker daemon and serves fresh `A` records keyed off container labels. When enabled, the nginx `resolver` directive points at coredns-docker's local socket (`127.0.0.1:1053`) and the rendered upstream is a variable-based `proxy_pass`, which forces nginx to re-resolve at request time honoring DNS TTL. This is how nginx avoids serving the wrong vhost after a host reboot, after `apt upgrade docker`, or after a single container restarts mid-runtime: the on-disk nginx config no longer pins a stale IP. This behavior is opt-in, and nginx uses IP-based `upstream` blocks by default.
+
+`coredns-docker` (>= `0.8.0`) is installed automatically as a transitive `Depends:` of the `dokku` Debian package, so `apt install dokku` and `apt upgrade dokku` pull it in without operator action. The shipped `/etc/coredns/Corefile` already binds `127.0.0.1:1053`, serves the `docker.` zone, and synthesizes `<app>.<process-type>.docker` and `<app>.docker` `A` records from Dokku's existing `com.dokku.app-name` and `com.dokku.process-type` container labels. Multiple containers for the same process type collapse onto one multi-A record set, so scaled apps load-balance across instances via DNS without any per-container configuration. The bundled Docker image of Dokku ships coredns-docker preinstalled and runs it under runit on the same port.
+
+No `systemd-resolved` or `/etc/resolv.conf` change is required - nginx talks to `coredns-docker` directly via the `resolver` directive in each app's `nginx.conf`.
+
+To enable resolver-based upstreams:
+
+```shell
+dokku nginx:set --global dns-resolver 127.0.0.1:1053
+dokku proxy:build-config --all
+```
+
+To revert to the IP-based upstream block, unset the property and rebuild the config:
+
+```shell
+dokku nginx:set --global dns-resolver
+dokku proxy:build-config --all
+```
+
+The behavior is controlled by three nginx properties, each settable per app or globally:
+
+- `dns-resolver` (default: none) - the resolver address nginx talks to. Resolver-based upstreams are only rendered when this is set.
+- `dns-resolver-timeout` (default: `5s`) - how long nginx waits for a DNS response before giving up and returning 502. The default is short so requests fail fast when coredns-docker is unreachable rather than hanging on the nginx built-in default (30s).
+- `dns-zone` (default: `docker`) - the suffix appended to `<app>.<process-type>` when constructing the upstream hostname.
+
+> [!NOTE]
+> When `dns-resolver` is set, no `upstream` block is rendered for the `web` process, so `proxy-keepalive` has no effect on it. Upstreams for [proxy routes](/docs/networking/proxy-management.md#path-based-routing-to-non-web-processes) to other process types remain IP-based.
+
+See [the `nginx.conf.sigil` reference](/docs/appendices/file-formats/nginx-conf-sigil.md) for the sigil variables that drive the resolver-based render, and how vendored templates can adopt or skip it.
+
+### Nginx Configuration for Undeployed Apps
+
+> [!IMPORTANT]
+> New as of 0.38.0
+
+When an app is created but not yet deployed, has no `web` process type, or has no running web processes, Dokku generates a minimal nginx configuration that returns `502 Bad Gateway` responses. This ensures that:
+
+- The app's domain resolves and returns a non-200 status code, allowing monitoring tools to detect the issue.
+- SSL certificate provisioning tools such as letsencrypt can function, as an nginx server is listening on the domain.
+- The `nginx.conf.d/` include directory is available for plugin customization.
+
+The 502 error page includes auto-retry JavaScript that will automatically reload the page when the application becomes available.
+
+Once the app is deployed with running `web` processes, the placeholder configuration is automatically replaced with the full proxy configuration.
+
+### Starting nginx
+
+> [!IMPORTANT]
+> New as of 0.28.0
+
+The nginx server can be started via `nginx:start`.
+
+```shell
+dokku nginx:start
+```
+
+### Stopping nginx
+
+> [!IMPORTANT]
+> New as of 0.28.0
+
+The nginx server can be stopped via `nginx:stop`.
+
+```shell
+dokku nginx:stop
+```
+
+### Reloading nginx
+
+> [!IMPORTANT]
+> New as of 0.38.0
+
+The nginx server can be reloaded via `nginx:reload`. This validates the current nginx configuration and, if valid, signals nginx to reload without restarting the running process. This is the preferred command after editing files in `/etc/nginx/conf.d/` directly.
+
+```shell
+dokku nginx:reload
+```
+
+If the configuration is invalid, the command exits non-zero and prints the validation error without reloading.
+
+### Checking access logs
+
+> [!NOTE]
+> Changing this value globally or on a per-app basis will require rebuilding the nginx config via the `proxy:build-config` command.
+
+You may check nginx access logs via the `nginx:access-logs` command. This assumes that app access logs are being stored in `/var/log/nginx/$APP-access.log`, as is the default in the generated `nginx.conf`.
+
+```shell
+dokku nginx:access-logs node-js-app
+```
+
+You may also follow the logs by specifying the `-t` flag.
+
+```shell
+dokku nginx:access-logs node-js-app -t
+```
+
+### Checking error logs
+
+You may check nginx error logs via the `nginx:error-logs` command. This assumes that app error logs are being stored in `/var/log/nginx/$APP-error.log`, as is the default in the generated `nginx.conf`.
+
+```shell
+dokku nginx:error-logs node-js-app
+```
+
+You may also follow the logs by specifying the `-t` flag.
+
+```shell
+dokku nginx:error-logs node-js-app -t
+```
+
+### Showing the nginx config
+
+For debugging purposes, it may be useful to show the nginx config. This can be achieved via the `nginx:show-config` command.
+
+```shell
+dokku nginx:show-config node-js-app
+```
+
+### Validating nginx configs
+
+App-supplied `nginx.conf.sigil` files are pre-validated automatically at the start of every deploy, immediately after the template is extracted from the source tree and before the build phase runs. The template is rendered with sigil and run through `nginx -t` against a minimal wrapper config; if validation fails, the deploy is aborted before any build work begins. To bypass this behavior, set `disable-custom-config` to `true` (see "Disabling custom nginx config" below).
+
+The wrapper config used for validation does not include the top-level `load_module` directives from the global nginx config, so a `nginx.conf.sigil` that relies on a directive from a dynamically loaded module will fail this validation even when `nginx -t` passes against the real server config. See [Custom nginx modules](/docs/appendices/file-formats/nginx-conf-sigil.md#custom-nginx-modules) for how to supply a custom validation wrapper via the `nginx-app-template-source` trigger's `validate-config` template type.
+
+The wrapper does declare the same `user` directive as the host's main nginx config, so that validating a template which declares a `proxy_cache_path` does not take the running server's cache directory away from the user its workers run as.
+
+It may also be desired to validate an nginx config outside of the deployment process. To do so, run the `nginx:validate-config` command. With no arguments, this will validate all app nginx configs, one at a time. A minimal wrapper nginx config is generated for each app's nginx config, upon which `nginx -t` will be run.
+
+```shell
+dokku nginx:validate-config
+```
+
+As app nginx configs are actually executed within a shared context, it is possible for an individual config to be invalid when being validated standalone but _also_ be valid within the global server context. As such, the exit code for the `nginx:validate-config` command is the exit code of `nginx -t` against the server's real nginx config.
+
+The `nginx:validate-config` command also takes an optional `--clean` flag. If specified, invalid nginx configs will be removed.
+
+> [!WARNING]
+> Invalid app nginx config's will be removed _even if_ the config is valid in the global server context.
+
+```shell
+dokku nginx:validate-config --clean
+```
+
+The `--clean` flag may also be specified for a given app:
+
+```shell
+dokku nginx:validate-config node-js-app --clean
+```
+
+### Displaying nginx reports for an app
+
+You can get a report about the app's nginx configuration using the `nginx:report` command:
+
+```shell
+dokku nginx:report
+```
+
+You can run the command for a specific app also.
+
+```shell
+dokku nginx:report node-js-app
+```
+
+You can pass flags which will output only the value of the specific information you want. For example:
+
+```shell
+dokku nginx:report node-js-app --nginx-bind-address-ipv4
+```
+
+The `nginx:report` command also takes a `--format` flag, with the valid options including `stdout` (default) and `json`. The `json` output format can be used for automation purposes:
+
+```shell
+dokku nginx:report node-js-app --format json
+```
+
+The `--format` flag cannot be combined with an info flag.
+
+### Custom Error Pages
+
+By default, Dokku provides custom error pages for the following three categories of errors:
+
+- 4xx: For all non-404 errors with a 4xx response code.
+- 404: For "404 Not Found" errors.
+- 5xx: For all 5xx error responses
+
+These are provided as an alternative to the generic Nginx error page, are shared for _all_ applications, and their contents are located on disk at `/var/lib/dokku/data/nginx-vhosts/dokku-errors`. To customize them for a specific app, create a custom `nginx.conf.sigil` as described above and change the paths to point elsewhere.
+
+### Default site
+
+> [!IMPORTANT]
+> New as of 0.38.0
+
+On fresh apt installs, Dokku ships a catch-all default site at `/etc/nginx/conf.d/00-default-vhost.conf` that rejects requests whose Host header (or TLS SNI) does not match any deployed app. The catch-all uses [`ssl_reject_handshake on`](https://nginx.org/en/docs/http/ngx_http_ssl_module.html#ssl_reject_handshake) for HTTPS and [`return 444`](https://nginx.org/en/docs/http/ngx_http_rewrite_module.html#return) for HTTP. Both close the connection without sending a response.
+
+The shipped file looks like:
+
+```nginx
+server {
+    listen      80 default_server;
+    listen      [::]:80 default_server;
+    listen      443 ssl default_server;
+    listen      [::]:443 ssl default_server;
+
+    server_name _;
+    access_log  off;
+
+    ssl_reject_handshake on;
+    return 444;
+}
+```
+
+The `00-` prefix forces nginx to load this file before `/etc/nginx/conf.d/dokku.conf`, so its `default_server` markers establish the default for each port before any per-app server blocks are loaded.
+
+On systems running nginx older than 1.19.4 (e.g., Debian Bullseye, which ships nginx 1.18.0), `ssl_reject_handshake` is not available. The postinst detects this and installs an HTTP-only variant instead:
+
+```nginx
+server {
+    listen      80 default_server;
+    listen      [::]:80 default_server;
+
+    server_name _;
+    access_log  off;
+
+    return 444;
+}
+```
+
+On these systems, HTTPS requests to unknown hosts are not rejected by the catch-all - nginx falls through to the lexicographically first port-443 server block and presents that block's certificate, the same behavior as before 0.38.0.
+
+#### TLS handshake behavior
+
+The catch-all does not affect TLS handshakes for legitimate apps. nginx selects the matching server block via SNI before completing the handshake; only requests that have no matching app fall through to the catch-all.
+
+| Request | Result |
+| --- | --- |
+| HTTPS to a configured app's hostname (with matching SNI) and the app has a cert | Handshake completes with the app's cert. Catch-all not consulted. |
+| HTTPS to a configured app's hostname when the app has no cert configured | Handshake rejected by the catch-all on nginx 1.19.4+. On older nginx, falls through to the lexicographically first port-443 server block and presents its cert, producing a cert-mismatch error. |
+| HTTPS to the server's IP with no SNI, or with an SNI matching no app | Handshake rejected on nginx 1.19.4+. On older nginx, falls through to the first port-443 server block. |
+| HTTP to a configured app's hostname | Routed normally to that app. Catch-all not consulted. |
+| HTTP to a hostname matching no app | Catch-all `return 444`. |
+
+#### Conflicting upstream nginx default vhost
+
+A fresh nginx install ships its own default vhost that also claims port 80 with `default_server`, which would cause `nginx -t` to fail with `a duplicate default server for 0.0.0.0:80` once the dokku catch-all is in place. To avoid this, the dokku postinst renames any of the following files in place to `${path}.dokku-disabled` instead of deleting them, preserving any local customizations:
+
+- `/etc/nginx/sites-enabled/default`
+- `/etc/nginx/sites-available/default`
+- `/etc/nginx/conf.d/default.conf`
+
+To recover an original file, inspect the `.dokku-disabled` sibling.
+
+#### Disabling the catch-all on first install
+
+Select "No" at the `dokku/install_default_site` debconf prompt, or pre-seed the answer before installing:
+
+```shell
+echo 'dokku dokku/install_default_site boolean false' | debconf-set-selections
+```
+
+#### Customizing or removing the catch-all after install
+
+To customize the reject behavior, edit `/etc/nginx/conf.d/00-default-vhost.conf` and reload:
+
+```shell
+dokku nginx:reload
+```
+
+For example, replace `return 444;` with `return 410;` to respond with an HTTP 410 Gone error page instead of dropping the connection.
+
+To disable the catch-all without uninstalling dokku:
+
+```shell
+mv /etc/nginx/conf.d/00-default-vhost.conf{,.disabled}
+dokku nginx:reload
+```
+
+#### Installing the catch-all on upgraded or non-apt installs
+
+Existing dokku installs upgraded from earlier versions do not get the catch-all installed automatically; the upgrade leaves their nginx configuration untouched. To install it manually, copy the shipped template into place and reload nginx:
+
+```shell
+cp /var/lib/dokku/core-plugins/available/nginx-vhosts/templates/default-site.conf /etc/nginx/conf.d/00-default-vhost.conf
+dokku nginx:reload
+```
+
+If the upstream nginx default vhost is also active, disable it first (e.g. `mv /etc/nginx/sites-enabled/default{,.disabled}`) to avoid a duplicate-default-server error.
+
+#### App-name based alternative
+
+As an alternative to the catch-all file, you may push an app to your Dokku host with a name like `00-default`. As long as it lists first in `ls /home/dokku/*/nginx.conf | head`, it will be used as the default nginx vhost.
+
+### Customizing the nginx configuration
+
+> [!IMPORTANT]
+> New as of 0.5.0
+
+Dokku uses a templating library by the name of [sigil](https://github.com/gliderlabs/sigil) to generate nginx configuration for each app. This may be overridden by committing the [default configuration template](https://github.com/dokku/dokku/blob/master/plugins/nginx-vhosts/templates/nginx.conf.sigil) to a file named `nginx.conf.sigil`.
+
+The `nginx.conf.sigil` is expected to be found in a specific directory, depending on the deploy approach:
+
+- The `WORKDIR` of the Docker image for deploys resulting from `git:from-image` and `git:load-image` commands.
+- The root of the source code tree for all other deploys (git push, `git:from-archive`, `git:sync`).
+
+Sometimes it may be desirable to set a different path for a given app, e.g. when deploying from a monorepo. This can be done via the `nginx-conf-sigil-path` property:
+
+```shell
+dokku nginx:set node-js-app nginx-conf-sigil-path .dokku/nginx.conf.sigil
+```
+
+The value is the path to the desired file _relative_ to the base search directory, and will never be treated as absolute paths in any context. If that file does not exist within the repository, Dokku will continue the build process as if the repository has no `nginx.conf.sigil`.
+
+The default value may be set by passing an empty value for the option:
+
+```shell
+dokku nginx:set node-js-app nginx-conf-sigil-path
+```
+
+The `nginx-conf-sigil-path` property can also be set globally. The global default is `nginx.conf.sigil`, and the global value is used when no app-specific value is set.
+
+```shell
+dokku nginx:set --global nginx-conf-sigil-path nginx.conf.sigil
+```
+
+The default value may be set by passing an empty value for the option.
+
+```shell
+dokku nginx:set --global nginx-conf-sigil-path
+```
+
+> The [default template](https://github.com/dokku/dokku/blob/master/plugins/nginx-vhosts/templates/nginx.conf.sigil) may change with new releases of Dokku. Please refer to the appropriate template file version for your Dokku version, and make sure to look out for changes when you upgrade.
+
+#### Disabling custom nginx config
+
+> [!NOTE]
+> Changing this value globally or on a per-app basis will require rebuilding the nginx config via the `proxy:build-config` command.
+
+While enabled by default, using a custom nginx config can be disabled via `nginx:set`. This may be useful in cases where you do not want to allow users to override any higher-level customization of app nginx config.
+
+```shell
+# enable fetching custom config (default)
+dokku nginx:set node-js-app disable-custom-config false
+
+# disable fetching custom config
+dokku nginx:set node-js-app disable-custom-config true
+```
+
+Unsetting this value is the same as enabling custom nginx config usage.
+
+#### Available template variables
+
+```
+{{ .APP }}                          Application name
+{{ .APP_SSL_PATH }}                 Path to SSL certificate and key
+{{ .DOKKU_ROOT }}                   Global Dokku root directory (ex: app dir would be `{{ .DOKKU_ROOT }}/{{ .APP }}`)
+{{ .PROXY_PORT }}                   Non-SSL nginx listener port (same as the `proxy-port` property)
+{{ .PROXY_SSL_PORT }}               SSL nginx listener port (same as the `proxy-ssl-port` property)
+{{ .NOSSL_SERVER_NAME }}            List of non-SSL VHOSTS
+{{ .PROXY_PORT_MAP }}               List of port mappings (same as the `map` ports property)
+{{ .PROXY_UPSTREAM_PORTS }}         List of configured upstream ports (derived from the `map` ports property)
+{{ .SSL_INUSE }}                    Boolean set when an app is SSL-enabled
+{{ .SSL_SERVER_NAME }}              List of SSL VHOSTS
+```
+
+Finally, each process type has it's network listeners - a list of IP:PORT pairs for the respective app containers - exposed via an `.DOKKU_APP_${PROCESS_TYPE}_LISTENERS` variable - the `PROCESS_TYPE` will be upper-cased with hyphens transformed into underscores. Users can use the new variables to expose non-web processes via the nginx proxy.
+
+> [!NOTE]
+> Application environment variables are available for use in custom templates. To do so, use the form of `{{ var "FOO" }}` to access a variable named `FOO`.
+
+#### Customizing via configuration files included by the default templates
+
+The default nginx.conf template will include everything from your apps `nginx.conf.d/` subdirectory in the main `server {}` block (see above):
+
+```
+include {{ .DOKKU_ROOT }}/{{ .APP }}/nginx.conf.d/*.conf;
+```
+
+That means you can put additional configuration in separate files. To increase the client request header timeout, the following can be performed:
+
+```shell
+mkdir /home/dokku/node-js-app/nginx.conf.d/
+echo 'client_header_timeout 50s;' > /home/dokku/node-js-app/nginx.conf.d/timeout.conf
+chown dokku:dokku /home/dokku/node-js-app/nginx.conf.d/upload.conf
+service nginx reload
+```
+
+The example above uses additional configuration files directly on the Dokku host. Unlike the `nginx.conf.sigil` file, these additional files will not be copied over from your application repo, and thus need to be placed in the `/home/dokku/node-js-app/nginx.conf.d/` directory manually.
+
+For PHP Buildpack users, you will also need to provide a `Procfile` and an accompanying `nginx.conf` file to customize the nginx config _within_ the container. The following are example contents for your `Procfile`
+
+```
+web: vendor/bin/heroku-php-nginx -C nginx.conf -i php.ini php/
+```
+
+Your `nginx.conf` file - not to be confused with Dokku's `nginx.conf.sigil` - would also need to be configured as shown in this example:
+
+```
+client_header_timeout 50s;
+location / {
+    index index.php;
+    try_files $uri $uri/ /index.php$is_args$args;
+}
+```
+
+Please adjust the `Procfile` and `nginx.conf` file as appropriate.
+
+### Setting Properties for the nginx config
+
+The nginx plugin exposes a variety of properties configurable via the `nginx:set` command. The properties are used to configure the generated `nginx.conf` file from the `nginx.conf.sigil` template. The value precedence is app-specific, then global, and finally the Dokku default.
+
+The nginx:set command takes an app name or the `--global` flag.
+
+```shell
+# set a property for the node-js-app
+dokku nginx:set node-js-app property-name some-value
+
+# set a property globally
+dokku nginx:set --global property-name some-value
+```
+
+Additionally, setting an empty value will result in reverting the value back to it's default. For app-specific values, this means that Dokku will revert to the globally specified (or global default) value.
+
+```shell
+# default the value back to the global value for node-js-app
+dokku nginx:set node-js-app property-name
+
+# use the dokku default as the global value
+dokku nginx:set --global property-name
+```
+
+Changing these value globally or on a per-app basis will require rebuilding the nginx config via the `proxy:build-config` command.
+
+> [!WARNING]
+> Validation is not performed against the values, and they are used as is within Dokku.
+
+| Property                  | Default                               | Type    | Explanation                                                                         |
+| --------------------------|---------------------------------------|---------|-------------------------------------------------------------------------------------|
+| access-log-format         | empty string                          | string  | Name of custom log format to use (log format must be specified elsewhere)           |
+| access-log-path           | `${NGINX_LOG_ROOT}/${APP}-access.log` | string  | Log path for nginx access logs (set to `off` to disable)                            |
+| bind-address-ipv4         | `0.0.0.0`                             | string  | Default IPv4 address to bind to                                                     |
+| bind-address-ipv6         | `[::]`                                | string  | Default IPv6 address to bind to                                                     |
+| client-max-body-size      | `1m`                                  | string  | Size (with units) of client request body (usually modified for file uploads)        |
+| client-body-timeout       | `60s`                                 | string  | Timeout (with units) for reading the client request body                            |
+| client-header-timeout     | `60s`                                 | string  | Timeout (with units) for reading the client request headers                         |
+| error-log-path            | `${NGINX_LOG_ROOT}/${APP}-error.log`  | string  | Log path for nginx error logs (set to `off` to disable)                             |
+| hsts                      | `true`                                | boolean | Enables or disables HSTS for your application                                       |
+| hsts-include-subdomains   | `true`                                | boolean | Forces the browser to apply the HSTS policy to all app subdomains                   |
+| hsts-max-age              | `15724800`                            | integer | Time in seconds to cache HSTS configuration                                         |
+| hsts-preload              | `false`                               | boolean | Tells the browser to include the domain in their HSTS preload lists                 |
+| keepalive-timeout         | `75s`                                 | string  | Timeout (with units) during which a keep-alive client connection will stay open on the server side |
+| lingering-timeout         | `5s`                                  | string  | Timeout (with units) is the maximum waiting time for more client data to arrive     |
+| nginx-conf-sigil-path     | `nginx.conf.sigil`                    | string  | Path in the repository to the `nginx.conf.sigil` file                               |
+| nginx-service-command     |                                       | string  | Full path to an executable script or binary to invoke instead of the system's init process when interacting with nginx |
+| proxy-buffer-size         | `8k` (# is os pagesize)               | string  | Size of the buffer used for reading the first part of proxied server response       |
+| proxy-buffering           | `on`                                  | string  | Enables or disables buffering of responses from the proxied server                  |
+| proxy-buffers             | `8 8k`                                | string  | Number and size of the buffers used for reading the proxied server response, for a single connection |
+| proxy-busy-buffers-size   | `16k`                                 | string  | Limits the total size of buffers that can be busy sending a response to the client while the response is not yet fully read. |
+| proxy-http-version     | `1.1`                                 | string  | The HTTP version to use for establishing a connection to your backend server. Ensure that your backend server supports this.           |
+
+| proxy-connect-timeout     | `60s`                                 | string  | Timeout (with units) for establishing a connection to your backend server           |
+| proxy-keepalive           | empty (disabled)                      | integer | Number of idle keepalive connections to upstream servers (disabled by default)      |
+| proxy-read-timeout        | `60s`                                 | string  | Timeout (with units) for reading response from your backend server                  |
+| proxy-send-timeout        | `60s`                                 | string  | Timeout (with units) for transmitting a request to your backend server              |
+| send-timeout              | `60s`                                 | string  | Timeout (with units) for transmitting a response to your the client                 |
+| underscore-in-headers     | `off`                                 | string  | Enables or disables the use of underscores in client request header fields.         |
+| x-forwarded-for-value     | `$remote_addr`                        | string  | Used for specifying the header value to set for the `X-Forwarded-For` header        |
+| x-forwarded-port-value    | `$server_port`                        | string  | Used for specifying the header value to set for the `X-Forwarded-Port` header       |
+| x-forwarded-proto-value   | `$scheme`                             | string  | Used for specifying the header value to set for the `X-Forwarded-Proto` header      |
+| x-forwarded-ssl           | empty string                          | string  | Less commonly used alternative to `X-Forwarded-Proto` (valid values: `on` or `off`) |
+
+#### Binding to specific addresses
+
+> [!NOTE]
+> Users with apps that contain a custom `nginx.conf.sigil` file will need to modify the files to respect the new `NGINX_BIND_ADDRESS_IPV4` and `NGINX_BIND_ADDRESS_IPV6` variables.
+
+Properties:
+
+- `bind-address-ipv4`
+- `bind-address-ipv6`
+
+This is useful in cases where the proxying should be internal to a network or if there are multiple network interfaces that should respond with different content.
+
+#### HSTS Header
+
+> [!WARNING]
+> if you enable the header and a subsequent deploy of your application results in an HTTP deploy (for whatever reason), the way the header works means that a browser will not attempt to request the HTTP version of your site if the HTTPS version fails until the max-age is reached.
+
+Properties:
+
+- `hsts`
+- `hsts-include-subdomains`
+- `hsts-max-age`
+- `hsts-preload`
+
+If SSL certificates are present, HSTS will be automatically enabled.
+
+#### Running behind another proxy — configuring `X-Forwarded-*` headers
+
+> [!WARNING]
+> These values should only be modified if there is an intermediate Load balancer or CDN between the user and the Dokku server hosting your application.
+
+Properties:
+
+- `x-forwarded-for-value`
+- `x-forwarded-port-value`
+- `x-forwarded-proto-value`
+- `x-forwarded-ssl`
+
+Dokku's default Nginx configuration passes the de-facto standard HTTP headers [`X-Forwarded-For`](https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/X-Forwarded-For), [`X-Forwarded-Proto`](https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/X-Forwarded-Proto), and `X-Forwarded-Port` to your application.
+These headers indicate the IP address of the original client making the request, the protocol of the original request (HTTP or HTTPS), and the port number of the original request, respectively.
+
+If you have another HTTP proxy sitting in between the end user and your server (for example, a load balancer, or a CDN), then the values of these headers will contain information about (e.g. the IP address of) the closest proxy, and not the end user.
+
+To fix this, assuming that the other proxy also passes `X-Forwarded-*` headers, which in turn contain information about the end user, you can tell Nginx include those values in the `X-Forwarded-*` headers that it sends to your application. You can do this via `nginx:set`, like so:
+
+```shell
+dokku nginx:set node-js-app x-forwarded-for-value '$http_x_forwarded_for'
+dokku nginx:set node-js-app x-forwarded-port-value '$http_x_forwarded_port'
+dokku nginx:set node-js-app x-forwarded-proto-value '$http_x_forwarded_proto'
+```
+
+However, note that you should only do this if:
+
+1. Requests to your website always go through a trusted proxy.
+2. That proxy is configured to send the aforementioned `X-Forwarded-*` headers.
+
+Otherwise, if it's possible for clients to make HTTP requests directly against your server, bypassing the other proxy, or if the other proxy is not configured to set these headers, then a client can basically pass any arbitrary values for these headers (which your app then presumably reads) and thereby fake an IP address, for example.
+
+There's also the `X-Forwarded-Ssl` header which a less common alternative to `X-Forwarded-Proto` — and because of that, isn't included in Dokku's default Nginx configuration. It can be turned `on` if need be:
+
+```shell
+# force-setting value to `on`
+dokku nginx:set node-js-app x-forwarded-ssl on
+```
+
+#### Changing log path
+
+> [!WARNING]
+> The defaults should not be changed without verifying that the paths will be writeable by nginx.
+
+Properties:
+
+- `access-log-path`
+- `error-log-path`
+
+These setting can be useful for enabling or disabling logging by setting the values to `off`.
+
+```shell
+dokku nginx:set node-js-app access-log-path off
+dokku nginx:set node-js-app error-log-path off
+```
+
+#### Changing log format
+
+Properties:
+
+- `access-log-format`
+
+Prior to changing the log-format, log formats should be specified at a file such as `/etc/nginx/conf.d/00-log-formats.conf`. This will ensure they are available within your app's nginx context. For instance, the following may be added to the above file. It only needs to be specified once to be used for all apps.
+
+```nginx
+# /etc/nginx/conf.d/00-log-formats.conf
+# escape=json was added in nginx 1.11.8
+log_format json_combined escape=json
+  '{'
+    '"time_local":"$time_local",'
+    '"remote_addr":"$remote_addr",'
+    '"remote_user":"$remote_user",'
+    '"request":"$request",'
+    '"status":"$status",'
+    '"body_bytes_sent":"$body_bytes_sent",'
+    '"request_time":"$request_time",'
+    '"http_referrer":"$http_referer",'
+    '"http_user_agent":"$http_user_agent"'
+  '}';
+```
+
+#### Specifying a read timeout
+
+> [!NOTE]
+> All numeric values _must_ have a trailing time value specified (`s` for seconds, `m` for minutes).
+
+Properties:
+
+- `proxy-read-timeout`
+
+#### Specifying a custom client_max_body_size
+
+> [!NOTE]
+> All numerical values _must_ have a trailing size unit specified (`k` for kilobytes, `m` for megabytes).
+
+Properties:
+
+- `client-max-body-size`
+
+This property is commonly used to increase the max file upload size.
+
+Changing this value when using the PHP buildpack (or any other buildpack that uses an intermediary server) will require changing the value in the server config shipped with that buildpack. Consult your buildpack documentation for further details.
+
+## Other
+
+### Domains plugin
+
+See the [domain configuration documentation](/docs/configuration/domains.md) for more information on how to configure domains for your app.
+
+### Customizing hostnames
+
+See the [customizing hostnames documentation](/docs/configuration/domains.md#customizing-hostnames) for more information on how to configure domains for your app.
+
+### Disabling VHOSTS
+
+See the [enabling and disabling vhosts documentation](/docs/configuration/domains.md#enabling-and-disabling-vhosts) for more information on how to disable domain usage for your app.
+
+### SSL Configuration
+
+See the [ssl documentation](/docs/configuration/ssl.md) for more information on how to configure SSL certificates for your application.
+
+### Disabling Nginx
+
+See the [proxy documentation](/docs/networking/proxy-management.md) for more information on how to disable nginx as the proxy implementation for your app.
+
+### Managing Proxy Port mappings
+
+See the [ports documentation](/docs/networking/port-management.md) for more information on how to manage ports proxied for your app.
+
+### Regenerating nginx config
+
+See the [proxy documentation](/docs/networking/proxy-management.md#regenerating-proxy-config) for more information on how to rebuild the nginx proxy configuration for your app.
+
+## Properties
+
+### Settable properties
+
+All nginx-vhosts properties are settable at both the app and global scope.
+
+| Property | Scope | Default | Report flags | Description |
+| --- | --- | --- | --- | --- |
+| `access-log-format` | app + global | none | `--nginx-access-log-format`, `--nginx-global-access-log-format`, `--nginx-computed-access-log-format` | Custom nginx `log_format` directive used for the access log |
+| `access-log-path` | app + global | _`{nginx-log-root}/{app}-access.log`_ | `--nginx-access-log-path`, `--nginx-global-access-log-path`, `--nginx-computed-access-log-path` | Path inside the nginx container where access logs are written |
+| `bind-address-ipv4` | app + global | none | `--nginx-bind-address-ipv4`, `--nginx-global-bind-address-ipv4`, `--nginx-computed-bind-address-ipv4` | IPv4 address the nginx server block binds to |
+| `bind-address-ipv6` | app + global | `::` | `--nginx-bind-address-ipv6`, `--nginx-global-bind-address-ipv6`, `--nginx-computed-bind-address-ipv6` | IPv6 address the nginx server block binds to |
+| `client-body-timeout` | app + global | `60s` | `--nginx-client-body-timeout`, `--nginx-global-client-body-timeout`, `--nginx-computed-client-body-timeout` | Time allowed to read the request body from the client |
+| `client-header-timeout` | app + global | `60s` | `--nginx-client-header-timeout`, `--nginx-global-client-header-timeout`, `--nginx-computed-client-header-timeout` | Time allowed to read the request header from the client |
+| `client-max-body-size` | app + global | `1m` | `--nginx-client-max-body-size`, `--nginx-global-client-max-body-size`, `--nginx-computed-client-max-body-size` | Maximum allowed request body size |
+| `disable-custom-config` | app + global | `false` | `--nginx-disable-custom-config`, `--nginx-global-disable-custom-config`, `--nginx-computed-disable-custom-config` | When `true`, ignores app-supplied `nginx.conf.d/*.conf` snippets |
+| `dns-resolver` | app + global | none | `--nginx-dns-resolver`, `--nginx-global-dns-resolver`, `--nginx-computed-dns-resolver` | Resolver address used for DNS-based upstreams. When unset, upstreams are IP-based |
+| `dns-resolver-timeout` | app + global | `5s` | `--nginx-dns-resolver-timeout`, `--nginx-global-dns-resolver-timeout`, `--nginx-computed-dns-resolver-timeout` | Time nginx waits for a DNS response from the resolver |
+| `dns-zone` | app + global | `docker` | `--nginx-dns-zone`, `--nginx-global-dns-zone`, `--nginx-computed-dns-zone` | Zone appended to `<app>.<process-type>` for DNS-based upstream hostnames |
+| `error-log-path` | app + global | _`{nginx-log-root}/{app}-error.log`_ | `--nginx-error-log-path`, `--nginx-global-error-log-path`, `--nginx-computed-error-log-path` | Path inside the nginx container where error logs are written |
+| `hsts` | app + global | `true` | `--nginx-hsts`, `--nginx-global-hsts`, `--nginx-computed-hsts` | When `true`, emits a `Strict-Transport-Security` header on HTTPS responses |
+| `hsts-include-subdomains` | app + global | `true` | `--nginx-hsts-include-subdomains`, `--nginx-global-hsts-include-subdomains`, `--nginx-computed-hsts-include-subdomains` | Adds the `includeSubDomains` directive to the HSTS header |
+| `hsts-max-age` | app + global | `15724800` | `--nginx-hsts-max-age`, `--nginx-global-hsts-max-age`, `--nginx-computed-hsts-max-age` | `max-age` value (seconds) in the HSTS header |
+| `hsts-preload` | app + global | `false` | `--nginx-hsts-preload`, `--nginx-global-hsts-preload`, `--nginx-computed-hsts-preload` | Adds the `preload` directive to the HSTS header |
+| `keepalive-timeout` | app + global | `75s` | `--nginx-keepalive-timeout`, `--nginx-global-keepalive-timeout`, `--nginx-computed-keepalive-timeout` | Time an idle keep-alive connection stays open |
+| `lingering-timeout` | app + global | `5s` | `--nginx-lingering-timeout`, `--nginx-global-lingering-timeout`, `--nginx-computed-lingering-timeout` | Time nginx waits for more client data when closing a connection |
+| `nginx-conf-sigil-path` | app + global | `nginx.conf.sigil` | `--nginx-nginx-conf-sigil-path`, `--nginx-global-nginx-conf-sigil-path`, `--nginx-computed-nginx-conf-sigil-path` | Path within the app to a custom `nginx.conf.sigil` template |
+| `nginx-service-command` | app + global | none | `--nginx-nginx-service-command`, `--nginx-global-nginx-service-command`, `--nginx-computed-nginx-service-command` | Override command used by `nginx:start`/`nginx:stop`/`nginx:reload` |
+| `proxy-buffer-size` | app + global | _system pagesize_ | `--nginx-proxy-buffer-size`, `--nginx-global-proxy-buffer-size`, `--nginx-computed-proxy-buffer-size` | Buffer size for reading the first part of the upstream response |
+| `proxy-buffering` | app + global | `on` | `--nginx-proxy-buffering`, `--nginx-global-proxy-buffering`, `--nginx-computed-proxy-buffering` | Whether nginx buffers upstream responses (`on` or `off`) |
+| `proxy-buffers` | app + global | _`8 {pagesize}`_ | `--nginx-proxy-buffers`, `--nginx-global-proxy-buffers`, `--nginx-computed-proxy-buffers` | Number and size of buffers used for an upstream response |
+| `proxy-busy-buffers-size` | app + global | _`2 * pagesize`_ | `--nginx-proxy-busy-buffers-size`, `--nginx-global-proxy-busy-buffers-size`, `--nginx-computed-proxy-busy-buffers-size` | Maximum buffer size that can be busy sending a response to the client |
+| `proxy-http-version` | app + global | `1.1` | `--nginx-proxy-http-version`, `--nginx-global-proxy-http-version`, `--nginx-computed-proxy-http-version` | HTTP version to use for a connection to the upstream |
+| `proxy-connect-timeout` | app + global | `60s` | `--nginx-proxy-connect-timeout`, `--nginx-global-proxy-connect-timeout`, `--nginx-computed-proxy-connect-timeout` | Time to establish a connection to the upstream |
+| `proxy-keepalive` | app + global | none | `--nginx-proxy-keepalive`, `--nginx-global-proxy-keepalive`, `--nginx-computed-proxy-keepalive` | Number of idle keep-alive connections to upstream servers held open per worker |
+| `proxy-read-timeout` | app + global | `60s` | `--nginx-proxy-read-timeout`, `--nginx-global-proxy-read-timeout`, `--nginx-computed-proxy-read-timeout` | Time to read a response from the upstream |
+| `proxy-send-timeout` | app + global | `60s` | `--nginx-proxy-send-timeout`, `--nginx-global-proxy-send-timeout`, `--nginx-computed-proxy-send-timeout` | Time to transmit a request to the upstream |
+| `send-timeout` | app + global | `60s` | `--nginx-send-timeout`, `--nginx-global-send-timeout`, `--nginx-computed-send-timeout` | Time between two successive write operations to the client |
+| `underscore-in-headers` | app + global | `off` | `--nginx-underscore-in-headers`, `--nginx-global-underscore-in-headers`, `--nginx-computed-underscore-in-headers` | Whether to allow underscores in client request header field names |
+| `x-forwarded-for-value` | app + global | `$remote_addr` | `--nginx-x-forwarded-for-value`, `--nginx-global-x-forwarded-for-value`, `--nginx-computed-x-forwarded-for-value` | Value used for the `X-Forwarded-For` header |
+| `x-forwarded-port-value` | app + global | `$server_port` | `--nginx-x-forwarded-port-value`, `--nginx-global-x-forwarded-port-value`, `--nginx-computed-x-forwarded-port-value` | Value used for the `X-Forwarded-Port` header |
+| `x-forwarded-proto-value` | app + global | `$scheme` | `--nginx-x-forwarded-proto-value`, `--nginx-global-x-forwarded-proto-value`, `--nginx-computed-x-forwarded-proto-value` | Value used for the `X-Forwarded-Proto` header |
+| `x-forwarded-ssl` | app + global | none | `--nginx-x-forwarded-ssl`, `--nginx-global-x-forwarded-ssl`, `--nginx-computed-x-forwarded-ssl` | Value used for the `X-Forwarded-Ssl` header (e.g. `on`/`off`) |
+
+### Read-only flags
+
+The following flag surfaces in `nginx:report` but is not managed by `nginx:set`:
+
+| Flag | Description |
+|---|---|
+| `--nginx-last-visited-at` | UNIX timestamp of the last request served by nginx for the app |
+
+### Internal properties
+
+The following properties are recorded internally by the plugin and are not exposed via `nginx:report`:
+
+| Property | Description | Source |
+| --- | --- | --- |
+| `proxy-status` | `started`/`stopped` state of the nginx system service | `cmd-nginx-start`/`cmd-nginx-stop` |
+| `nginx-conf-sigil-migrated` | Migration sentinel set the first time a v1 template is rewritten to the current schema | `plugins/nginx-vhosts/install` writes `"true"` once the install-time migration runs |

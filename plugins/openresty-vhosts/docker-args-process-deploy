@@ -1,0 +1,288 @@
+#!/usr/bin/env bash
+set -eo pipefail
+[[ $DOKKU_TRACE ]] && set -x
+source "$PLUGIN_CORE_AVAILABLE_PATH/common/functions"
+source "$PLUGIN_AVAILABLE_PATH/proxy/functions"
+source "$PLUGIN_AVAILABLE_PATH/openresty-vhosts/internal-functions"
+
+trigger-openresty-vhosts-docker-args-process-deploy() {
+  declare desc="openresty-vhosts docker-args-process-deploy plugin trigger"
+  declare trigger="docker-args-process-deploy"
+  declare APP="$1" IMAGE_SOURCE_TYPE="$2" IMAGE_TAG="$3" PROC_TYPE="$4" CONTAINER_INDEX="$5"
+  local include_dir output value DATA
+  local STDIN=$(cat)
+
+  if [[ "$(plugn trigger proxy-type "$APP")" != "openresty" ]] && [[ "$(plugn trigger proxy-type "$APP")" != "nginx" ]]; then
+    return
+  fi
+
+  if [[ "$PROC_TYPE" != "web" ]]; then
+    # Non-web processes are only labeled when at least one path-based route
+    # targets the process. Otherwise openresty should ignore the container.
+    local route_proc
+    local has_route=false
+    while IFS='|' read -r route_proc _ _ _; do
+      if [[ "$route_proc" == "$PROC_TYPE" ]]; then
+        has_route=true
+        break
+      fi
+    done < <(plugn trigger proxy-routes-list "$APP")
+    if [[ "$has_route" != "true" ]]; then
+      echo -n "$STDIN"
+      return
+    fi
+    fn-openresty-route-labels "$APP" "$PROC_TYPE" "$STDIN"
+    return
+  fi
+
+  if [[ "$(plugn trigger proxy-is-enabled "$APP")" != "true" ]]; then
+    return
+  fi
+
+  if ! plugn trigger domains-vhost-enabled "$APP" 2>/dev/null; then
+    return
+  fi
+
+  # ensure we have a port mapping
+  plugn trigger ports-configure "$APP"
+
+  include_dir="$(fn-openresty-get-http-includes-dir "$APP")"
+  if [[ -d "$include_dir" ]]; then
+    pushd "$include_dir" >/dev/null
+    for filename in *; do
+      if [[ ! -f "$include_dir/$filename" ]]; then
+        continue
+      fi
+
+      if [[ $filename != *.conf ]]; then
+        continue
+      fi
+
+      # check that filename includes only alphanumeric characters, underscores, and dots
+      if [[ "$filename" =~ [^a-zA-Z0-9_.-] ]]; then
+        dokku_log_warn "Skipping include file with non-alphanumeric characters: $filename"
+        continue
+      fi
+
+      # check that filename does not contain any special characters
+      if [[ "$filename" =~ [\'\"\ \$\`\(\)\;] ]]; then
+        dokku_log_warn "Skipping include file with unsafe filename: $filename"
+        continue
+      fi
+
+      DATA="$(base64 -w 0 <"$include_dir/$filename")"
+      output="$output '--label=openresty.include-http-$filename=$DATA'"
+    done
+    popd &>/dev/null || pushd "/tmp" >/dev/null
+  fi
+
+  include_dir="$(fn-openresty-get-location-includes-dir "$APP")"
+  if [[ -d "$include_dir" ]]; then
+    pushd "$include_dir" >/dev/null
+    for filename in *; do
+      if [[ ! -f "$include_dir/$filename" ]]; then
+        continue
+      fi
+
+      if [[ $filename != *.conf ]]; then
+        continue
+      fi
+
+      # check that filename includes only alphanumeric characters, underscores, and dots
+      if [[ "$filename" =~ [^a-zA-Z0-9_.-] ]]; then
+        dokku_log_warn "Skipping include file with non-alphanumeric characters: $filename"
+        continue
+      fi
+
+      # check that filename does not contain any special characters
+      if [[ "$filename" =~ [\'\"\ \$\`\(\)\;] ]]; then
+        dokku_log_warn "Skipping include file with unsafe filename: $filename"
+        continue
+      fi
+
+      DATA="$(base64 -w 0 <"$include_dir/$filename")"
+      output="$output '--label=openresty.include-location-http-$filename=$DATA'"
+    done
+    popd &>/dev/null || pushd "/tmp" >/dev/null
+  fi
+
+  is_app_listening="false"
+  local APP_PORT_MAP="$(plugn trigger ports-get "$APP")"
+  while IFS= read -r port_map; do
+    proxy_scheme="$(awk -F ':' '{ print $1 }' <<<"$port_map")"
+    proxy_host_port="$(awk -F ':' '{ print $2 }' <<<"$port_map")"
+    proxy_container_port="$(awk -F ':' '{ print $3 }' <<<"$port_map")"
+
+    if [[ "$proxy_scheme" == "http" ]]; then
+      is_app_listening="true"
+      if [[ -z "$proxy_container_http_port_candidate" ]]; then
+        proxy_container_http_port_candidate="$proxy_container_port"
+        proxy_host_http_port_candidate="$proxy_host_port"
+      fi
+
+      if [[ "$proxy_host_port" == "80" ]] && [[ -z "$proxy_container_http_port" ]]; then
+        proxy_container_http_port="$proxy_container_port"
+      fi
+    fi
+
+    if [[ "$proxy_scheme" == "https" ]]; then
+      is_app_listening="true"
+      if [[ -z "$proxy_container_https_port_candidate" ]]; then
+        proxy_container_https_port_candidate="$proxy_container_port"
+        proxy_host_https_port_candidate="$proxy_host_port"
+      fi
+
+      if [[ "$proxy_host_port" == "443" ]] && [[ -z "$proxy_container_https_port" ]]; then
+        proxy_container_https_port="$proxy_container_port"
+      fi
+    fi
+  done <<<"$APP_PORT_MAP"
+
+  if [[ -n "$letsencrypt_email" ]] && [[ -z "$proxy_container_https_port" ]]; then
+    proxy_container_https_port_candidate="$proxy_container_http_port_candidate"
+    proxy_host_https_port_candidate="$proxy_host_http_port_candidate"
+    if [[ -n "$proxy_container_http_port" ]]; then
+      proxy_container_https_port_candidate="$proxy_container_http_port"
+      proxy_host_http_port_candidate=443
+    fi
+  fi
+
+  letsencrypt_value="false"
+  if [[ -n "$(fn-openresty-computed-letsencrypt-email)" ]]; then
+    if [[ -n "$proxy_container_https_port" ]] || [[ -n "$proxy_container_https_port_candidate" ]]; then
+      letsencrypt_value="true"
+    fi
+  fi
+
+  output="$output '--label=openresty.letsencrypt=$letsencrypt_value'"
+
+  value="$(fn-openresty-computed-access-log-format "$APP")"
+  [[ -n "$value" ]] && output="$output '--label=openresty.access-log-format=$value'"
+  value="$(fn-openresty-computed-access-log-path "$APP")"
+  [[ -n "$value" ]] && output="$output '--label=openresty.access-log-path=$value'"
+  value="$(fn-openresty-computed-bind-address-ipv4 "$APP")"
+  [[ -n "$value" ]] && output="$output '--label=openresty.bind-address-ipv4=$value'"
+  value="$(fn-openresty-computed-bind-address-ipv6 "$APP")"
+  [[ -n "$value" ]] && output="$output '--label=openresty.bind-address-ipv6=$value'"
+  value="$(fn-openresty-computed-client-body-timeout "$APP")"
+  [[ -n "$value" ]] && output="$output '--label=openresty.client-body-timeout=$value'"
+  value="$(fn-openresty-computed-client-header-timeout "$APP")"
+  [[ -n "$value" ]] && output="$output '--label=openresty.client-header-timeout=$value'"
+  value="$(fn-openresty-computed-client-max-body-size "$APP")"
+  [[ -n "$value" ]] && output="$output '--label=openresty.client-max-body-size=$value'"
+  value="$(fn-openresty-computed-error-log-path "$APP")"
+  [[ -n "$value" ]] && output="$output '--label=openresty.error-log-path=$value'"
+  value="$(fn-openresty-computed-hsts-include-subdomains "$APP")"
+  [[ -n "$value" ]] && output="$output '--label=openresty.hsts-include-subdomains=$value'"
+  value="$(fn-openresty-computed-hsts-max-age "$APP")"
+  [[ -n "$value" ]] && output="$output '--label=openresty.hsts-max-age=$value'"
+  value="$(fn-openresty-computed-hsts-preload "$APP")"
+  [[ -n "$value" ]] && output="$output '--label=openresty.hsts-preload=$value'"
+  value="$(fn-openresty-hsts-is-enabled "$APP")"
+  [[ -n "$value" ]] && output="$output '--label=openresty.hsts=$value'"
+  value="443"
+  [[ -n "$value" ]] && output="$output '--label=openresty.https-port=$value'"
+  value="$(plugn trigger domains-list "$APP" | xargs)"
+  [[ -n "$value" ]] && output="$output '--label=openresty.domains=$value'"
+  value="$(plugn trigger network-get-property "$APP" initial-network)"
+  [[ -n "$value" ]] && output="$output '--label=openresty.initial-network=$value'"
+  value="$(fn-openresty-computed-keepalive-timeout "$APP")"
+  [[ -n "$value" ]] && output="$output '--label=openresty.keepalive-timeout=$value'"
+  value="$(fn-openresty-computed-lingering-timeout "$APP")"
+  [[ -n "$value" ]] && output="$output '--label=openresty.lingering-timeout=$value'"
+  value="$(echo "$APP_PORT_MAP" | xargs)"
+  [[ -n "$value" ]] && output="$output '--label=openresty.port-mapping=$value'"
+  value="$(fn-openresty-computed-proxy-buffer-size "$APP")"
+  [[ -n "$value" ]] && output="$output '--label=openresty.proxy-buffer-size=$value'"
+  value="$(fn-openresty-computed-proxy-buffering "$APP")"
+  [[ -n "$value" ]] && output="$output '--label=openresty.proxy-buffering=$value'"
+  value="$(fn-openresty-computed-proxy-buffers "$APP")"
+  [[ -n "$value" ]] && output="$output '--label=openresty.proxy-buffers=$value'"
+  value="$(fn-openresty-computed-proxy-busy-buffers-size "$APP")"
+  [[ -n "$value" ]] && output="$output '--label=openresty.proxy-busy-buffer-size=$value'"
+  value="$(fn-openresty-computed-proxy-connect-timeout "$APP")"
+  [[ -n "$value" ]] && output="$output '--label=openresty.proxy-connect-timeout=$value'"
+  value="$(fn-openresty-computed-proxy-read-timeout "$APP")"
+  [[ -n "$value" ]] && output="$output '--label=openresty.proxy-read-timeout=$value'"
+  value="$(fn-openresty-computed-proxy-send-timeout "$APP")"
+  [[ -n "$value" ]] && output="$output '--label=openresty.proxy-send-timeout=$value'"
+  value="$(fn-openresty-computed-send-timeout "$APP")"
+  [[ -n "$value" ]] && output="$output '--label=openresty.send-timeout=$value'"
+  value="$(fn-openresty-computed-send-timeout "$APP")"
+  [[ -n "$value" ]] && output="$output '--label=openresty.send-timeout=$value'"
+  value="$(fn-openresty-computed-underscore-in-headers "$APP")"
+  [[ -n "$value" ]] && output="$output '--label=openresty.underscore-in-headers=$value'"
+  value="$(fn-openresty-computed-x-forwarded-for-value "$APP")"
+  [[ -n "$value" ]] && output="$output '--label=openresty.x-forwarded-for-value=$value'"
+  value="$(fn-openresty-computed-x-forwarded-port-value "$APP")"
+  [[ -n "$value" ]] && output="$output '--label=openresty.x-forwarded-port-value=$value'"
+  value="$(fn-openresty-computed-x-forwarded-proto-value "$APP")"
+  [[ -n "$value" ]] && output="$output '--label=openresty.x-forwarded-proto-value=$value'"
+  value="$(fn-openresty-computed-x-forwarded-ssl "$APP")"
+  [[ -n "$value" ]] && output="$output '--label=openresty.x-forwarded-ssl=$value'"
+
+  output="$output$(fn-openresty-healthcheck-labels "$APP")"
+
+  local proxy_labels_file_path=$(fn-proxy-get-labels-file-path "openresty" "$APP")
+  if [[ -f "$proxy_labels_file_path" ]]; then
+    while read -r line; do
+      [[ -z "$line" ]] && continue
+      output="$output --label '$line'"
+    done <"$proxy_labels_file_path"
+  fi
+
+  echo -n "$STDIN $output"
+}
+
+fn-openresty-healthcheck-labels() {
+  declare desc="outputs openresty upstream healthcheck and failover labels derived from the app's web readiness healthcheck"
+  declare APP="$1"
+  local healthcheck hc_path hc_port hc_scheme hc_timeout hc_interval hc_attempts hc_host name value
+
+  healthcheck="$(fn-proxy-get-readiness-healthcheck "$APP")"
+  if [[ -z "$healthcheck" ]]; then
+    return
+  fi
+
+  hc_path="$(echo "$healthcheck" | jq -r ".path // empty")"
+  hc_port="$(echo "$healthcheck" | jq -r ".port // empty")"
+  hc_scheme="$(echo "$healthcheck" | jq -r ".scheme // empty")"
+  hc_timeout="$(echo "$healthcheck" | jq -r ".timeout // 5")"
+  hc_interval="$(echo "$healthcheck" | jq -r ".wait // 5")"
+  hc_attempts="$(echo "$healthcheck" | jq -r ".attempts // 3")"
+
+  if ! fn-proxy-healthcheck-path-is-valid "$hc_path"; then
+    dokku_log_fail "Invalid app.json healthcheck path for openresty: path must start with a / and must not contain whitespace, control characters, quotes, or backslashes"
+  fi
+
+  if ! fn-proxy-healthcheck-scheme-is-valid "$hc_scheme"; then
+    dokku_log_fail "Invalid app.json healthcheck scheme for openresty: scheme must be one of http or https"
+  fi
+
+  hc_host="$(fn-proxy-get-healthcheck-host "$APP" "$healthcheck")"
+
+  echo -n " '--label=openresty.upstream-max-fails=1'"
+  echo -n " '--label=openresty.upstream-fail-timeout=${hc_interval}s'"
+  echo -n " '--label=openresty.proxy-next-upstream-timeout=5s'"
+  echo -n " '--label=openresty.healthcheck-path=$hc_path'"
+  [[ -n "$hc_port" ]] && echo -n " '--label=openresty.healthcheck-port=$hc_port'"
+  [[ -n "$hc_scheme" ]] && echo -n " '--label=openresty.healthcheck-scheme=${hc_scheme,,}'"
+  echo -n " '--label=openresty.healthcheck-timeout=$hc_timeout'"
+  echo -n " '--label=openresty.healthcheck-interval=$hc_interval'"
+  echo -n " '--label=openresty.healthcheck-fall=$hc_attempts'"
+  if [[ -n "$hc_host" ]] && fn-proxy-healthcheck-header-is-valid "Host" "$hc_host"; then
+    echo -n " '--label=openresty.healthcheck-host=$hc_host'"
+  fi
+
+  while IFS=$'\t' read -r name value; do
+    [[ -z "$name" ]] && continue
+    if ! fn-proxy-healthcheck-header-is-valid "$name" "$value"; then
+      dokku_log_warn "Skipping invalid app.json healthcheck header for openresty: $name"
+      continue
+    fi
+
+    echo -n " '--label=openresty.healthcheck-header.$name=$value'"
+  done < <(fn-proxy-get-healthcheck-headers "$healthcheck")
+}
+
+trigger-openresty-vhosts-docker-args-process-deploy "$@"

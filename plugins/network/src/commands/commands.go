@@ -21,13 +21,12 @@ Additional commands:`
     network:create <network>, Creates an attachable docker network
     network:destroy <network>, Destroys a docker network
     network:exists <network>, Checks if a docker network exists
-    network:info <network>, Outputs information about a docker network
-    network:list, Lists all docker networks
-    network:report [<app>] [<flag>], Displays a network report for one or more apps
+    network:info <network> [--format text|json], Outputs information about a docker network
+    network:list [--format text|json] [--dokku-managed], Lists all docker networks
     network:rebuild <app>, Rebuilds network settings for an app
     network:rebuildall, Rebuild network settings for all apps
-    network:set <app> <property> (<value>), Set or clear a network property for an app
-`
+    network:report [<app>] [<flag>], Displays a network report for one or more apps
+    network:set <app> <property> (<value>...), Set or clear a network property for an app`
 )
 
 func main() {
@@ -39,11 +38,11 @@ func main() {
 	case "network", "network:help":
 		usage()
 	case "help":
-		command := common.NewShellCmd(fmt.Sprintf("ps -o command= %d", os.Getppid()))
-		command.ShowOutput = false
-		output, err := command.Output()
-
-		if err == nil && strings.Contains(string(output), "--all") {
+		result, err := common.CallExecCommand(common.ExecCommandInput{
+			Command: "ps",
+			Args:    []string{"-o", "command=", strconv.Itoa(os.Getppid())},
+		})
+		if err == nil && strings.Contains(result.StdoutContents(), "--all") {
 			fmt.Println(helpContent)
 		} else {
 			fmt.Print("\n    network, Manage network settings for an app\n")

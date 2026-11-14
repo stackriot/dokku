@@ -1,27 +1,22 @@
 #!/usr/bin/env bats
 
 load test_helper
-TEST_PLUGIN_NAME=smoke-test-plugin
-TEST_PLUGIN_GIT_REPO=https://github.com/dokku/${TEST_PLUGIN_NAME}.git
-TEST_PLUGIN_LOCAL_REPO="$(mktemp -d)/$TEST_PLUGIN_NAME"
-
-clone_test_plugin() {
-  git clone "$TEST_PLUGIN_GIT_REPO" "$TEST_PLUGIN_LOCAL_REPO"
-}
 
 setup() {
   global_setup
   clone_test_plugin
 }
 
-remove_test_plugin() {
-  rm -rf $PLUGIN_ENABLED_PATH/$TEST_PLUGIN_NAME $PLUGIN_AVAILABLE_PATH/$TEST_PLUGIN_NAME
-  rm -rf $TEST_PLUGIN_LOCAL_REPO
-}
-
 teardown() {
   remove_test_plugin || true
+  restore_enter_plugin
   global_teardown
+}
+
+restore_enter_plugin() {
+  declare desc="re-enables the enter core plugin if a test left it disabled"
+  [[ -e "$PLUGIN_CORE_PATH/enabled/enter" ]] || PLUGIN_PATH="$PLUGIN_CORE_PATH" plugn enable enter || true
+  [[ -e "$PLUGIN_ENABLED_PATH/enter" ]] || PLUGIN_PATH="$PLUGIN_PATH" plugn enable enter || true
 }
 
 @test "(plugin) plugin:help" {
@@ -36,6 +31,70 @@ teardown() {
   echo "status: $status"
   assert_output_contains "Manage installed plugins"
   assert_output "$help_output"
+}
+
+@test "(plugin) plugin:list --format json" {
+  run /bin/bash -c "dokku plugin:list --format nonsense"
+  echo "output: $output"
+  echo "status: $status"
+  assert_failure
+  assert_output_contains "Invalid output format"
+
+  run /bin/bash -c "dokku plugin:list --format json | jq -r '.[] | select(.name == \"apps\") | .core'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "true"
+
+  run /bin/bash -c "dokku plugin:list --format json | jq -r '.[] | select(.name == \"apps\") | .enabled'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "true"
+
+  run /bin/bash -c "dokku plugin:list --format json | jq -r '.[] | select(.name == \"apps\") | .source_url'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output ""
+
+  # Clone a git-based third-party plugin directly into the available path so the
+  # git install source is present without running the (build-dependent) install
+  # trigger. plugn lists it as a disabled plugin.
+  run /bin/bash -c "git clone $TEST_PLUGIN_GIT_REPO $PLUGIN_AVAILABLE_PATH/$TEST_PLUGIN_NAME"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku plugin:list --format json | jq -r '.[] | select(.name == \"$TEST_PLUGIN_NAME\") | .source_url'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "$TEST_PLUGIN_GIT_REPO"
+
+  run /bin/bash -c "dokku plugin:list --format json | jq -r '.[] | select(.name == \"$TEST_PLUGIN_NAME\") | .core'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "false"
+
+  run /bin/bash -c "dokku plugin:list --format json | jq -r '.[] | select(.name == \"$TEST_PLUGIN_NAME\") | .enabled'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "false"
+
+  run /bin/bash -c "dokku plugin:list --format json | jq -r '.[] | select(.name == \"$TEST_PLUGIN_NAME\") | .committish | length'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "40"
+
+  run /bin/bash -c "dokku plugin:list --format json | jq -r '.[] | select(.name == \"$TEST_PLUGIN_NAME\") | .branch'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output_exists
 }
 
 @test "(plugin) plugin:install, plugin:disable, plugin:update plugin:uninstall" {
@@ -64,7 +123,7 @@ teardown() {
   echo "status: $status"
   assert_success
 
-  run /bin/bash -c "sudo -E -u nobody dokku plugin:uninstall $TEST_PLUGIN_NAME"
+  run /bin/bash -c "sudo -u nobody dokku plugin:uninstall $TEST_PLUGIN_NAME"
   echo "output: $output"
   echo "status: $status"
   assert_failure
@@ -106,7 +165,7 @@ teardown() {
   echo "status: $status"
   assert_success
 
-  run /bin/bash -c "sudo -E -u nobody dokku plugin:uninstall $TEST_PLUGIN_NAME"
+  run /bin/bash -c "sudo -u nobody dokku plugin:uninstall $TEST_PLUGIN_NAME"
   echo "output: $output"
   echo "status: $status"
   assert_failure
@@ -160,7 +219,7 @@ teardown() {
 }
 
 @test "(plugin) plugin:install, plugin:disable, plugin:uninstall as non-root user failure" {
-  run /bin/bash -c "sudo -E -u nobody dokku plugin:install $TEST_PLUGIN_GIT_REPO"
+  run /bin/bash -c "sudo -u nobody dokku plugin:install $TEST_PLUGIN_GIT_REPO"
   echo "output: $output"
   echo "status: $status"
   assert_failure
@@ -175,7 +234,7 @@ teardown() {
   echo "status: $status"
   assert_success
 
-  run /bin/bash -c "sudo -E -u nobody dokku plugin:disable $TEST_PLUGIN_NAME"
+  run /bin/bash -c "sudo -u nobody dokku plugin:disable $TEST_PLUGIN_NAME"
   echo "output: $output"
   echo "status: $status"
   assert_failure
@@ -319,4 +378,41 @@ teardown() {
   assert_success
   assert_output_contains "root" "0"
   assert_output_contains "dokku" "3"
+}
+
+@test "(plugin:trigger) forwards the caller environment across the privilege drop" {
+  run /bin/bash -c "DOKKU_TEST_CROSSING=1 DOKKU_TRACE=1 dokku plugin:trigger app-list 2>&1 >/dev/null | grep -q -- '--preserve-env=[^ ]*DOKKU_TEST_CROSSING'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+}
+
+@test "(plugin:enable) core plugin skipped at install" {
+  run /bin/bash -c "rm $PLUGIN_ENABLED_PATH/enter $PLUGIN_CORE_PATH/enabled/enter"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku plugin:list --format json | jq -r '.[] | select(.name == \"enter\") | .enabled'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "false"
+
+  run /bin/bash -c "dokku plugin:enable enter"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output_contains "Plugin enter enabled"
+
+  run /bin/bash -c "dokku plugin:list --format json | jq -r '.[] | select(.name == \"enter\") | .enabled'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "true"
+
+  run /bin/bash -c "test -L $PLUGIN_CORE_PATH/enabled/enter"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
 }

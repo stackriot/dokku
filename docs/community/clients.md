@@ -18,16 +18,6 @@ npm install -g dokku-toolbelt
 
 See [documentation here](https://www.npmjs.com/package/dokku-toolbelt) for more information.
 
-## (python) dokku-client
-
-dokku-client is an extensible python-based cli wrapper for remote Dokku hosts. You can install it via the following shell command (assuming you have python and pip installed):
-
-```shell
-pip install dokku-client
-```
-
-See [documentation here](https://github.com/adamcharnock/dokku-client) for more information.
-
 ## (ruby) Dokku CLI
 
 Dokku CLI is a rubygem that acts as a client for your Dokku installation. You can install it via the following shell command (assuming you have ruby and rubygems installed):
@@ -37,26 +27,6 @@ gem install dokku-cli
 ```
 
 See [documentation here](https://github.com/SebastianSzturo/dokku-cli) for more information.
-
-## (ruby) DokkuClient
-
-DokkuClient is another rubygem that acts as a client for your Dokku installation with built-in support for certain external plugins. You can install it via the following shell command (assuming you have ruby and rubygems installed):
-
-```shell
-gem install dokku_client
-```
-
-See [documentation here](https://github.com/netguru/dokku_client) for more information.
-
-## (ruby) Dokkufy
-
-Dokkufy is a rubygem that handles automation of certain tasks, such as Dokku setup, plugin installation, etc. You can install it via the following shell command (assuming you have ruby and rubygems installed):
-
-```shell
-gem install dokkufy
-```
-
-See [documentation here](https://github.com/cbetta/dokkufy) for more information.
 
 ## (ruby) Dockland
 

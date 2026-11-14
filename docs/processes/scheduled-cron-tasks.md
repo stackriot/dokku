@@ -1,10 +1,15 @@
 # Scheduled Cron Tasks
 
+> [!IMPORTANT]
 > New as of 0.23.0
 
 ```
-cron:list <app>               # List scheduled cron tasks for an app
-cron:report [<app>] [<flag>]  # Display report about an app
+cron:list <app> [--format json|stdout]                      # List scheduled cron tasks for an app
+cron:report [<app>] [<flag>]                                # Display report about an app
+cron:resume <app> <cron_id>                                 # Resume a cron task
+cron:run <app> <cron_id> [--detach] [--ttl-seconds SECONDS] # Run a cron task on the fly
+cron:set [--global|<app>] <key> <value>                     # Set or clear a cron property for an app
+cron:suspend <app> <cron_id>                                # Suspend a cron task
 ```
 
 ## Usage
@@ -15,9 +20,9 @@ Dokku automates scheduled `dokku run` commands via it's `app.json` cron integrat
 
 #### Specifying commands
 
-The `app.json` file for a given app can define a special `cron` key that contains a list of commands to run on given schedules. The following is a simple example `app.json` that simply runs the command `npm run send-email` once a day:
+The `app.json` file for a given app can define a special `cron` key that contains a list of commands to run on given schedules. The following is a simple example `app.json` that effectively runs the command `dokku run $APP npm run send-email` once a day:
 
-```
+```json
 {
   "cron": [
     {
@@ -28,12 +33,18 @@ The `app.json` file for a given app can define a special `cron` key that contain
 }
 ```
 
-A cron entry takes the following properties:
+A cron task takes the following properties:
 
 - `command`: A command to be run within the built app image. Specified commands can also be `Procfile` entries.
+- `maintenance`: A boolean value that decides whether the cron task is in maintenance and therefore executable or not.
 - `schedule`: A [cron-compatible](https://en.wikipedia.org/wiki/Cron#Overview) scheduling definition upon which to run the command. Seconds are generally not supported.
+- `concurrency_policy`: A string (default: `allow`), that controls whether the cron task can be run concurrently with another invocation of itself. Valid options are `allow` (allow concurrency), `forbid` (exit the new cron task if there is an existing one), `replace` (delete any existing cron task and start the new one).
 
-Zero or more cron commands can be specified per app. Cron entries are validated after the build artifact is created but before the app is deployed, and the cron schedule is updated during the post-deploy phase.
+Zero or more cron tasks can be specified per app. Cron tasks are validated after the build artifact is created but before the app is deployed, and the cron schedule is updated during the post-deploy phase.
+
+Cron tasks can run for a maximum of 24 hours, after which they are reaped from the system. The `docker-local` scheduler reaps expired tasks via the `dokku ps:retire` pass that runs every 5 minutes, so a task may overrun its deadline by up to 5 minutes. The `k3s` scheduler enforces the deadline directly through the job's `activeDeadlineSeconds`.
+
+See the [app.json location documentation](/docs/advanced-usage/deployment-tasks.md#changing-the-appjson-location) for more information on where to place your `app.json` file.
 
 #### Task Environment
 
@@ -42,10 +53,73 @@ When running scheduled cron tasks, there are a few items to be aware of:
 - Scheduled cron tasks are performed within the app environment available at runtime. If the app image does not exist, the command may fail to execute.
 - Schedules are performed on the hosting server's timezone, which is typically UTC.
 - At this time, only the `PATH` and `SHELL` environment variables are specified in the cron template.
-- Each scheduled task is executed within a one-off `run` container, and thus inherit any docker-options specified for `run` containers.Resources are never shared between scheduled tasks.
-- Tasks are always executed using the `--rm` flag, and are never executed in detached mode.
-- Scheduled cron tasks are supported on a per-scheduler basis, and are currently only implemented by the `docker-local` scheduler.
-- Tasks for _all_ apps managed by the `docker-local` scheduler are written to a single crontab file owned by the `dokku` user. The `dokku` user's crontab should be considered reserved for this purpose.
+    - A `MAILTO` value can be set via the `cron:set` command.
+    - A `MAILFROM` value can be set via the `cron:set` command.
+    - Tasks injected by plugins via the [`cron-entries` trigger](/docs/development/plugin-triggers.md#cron-entries) may set a `MAILTO` value of their own, which is used for that task instead of the global value. `MAILTO` is reset after the task to the global value, or to the `dokku` user when no global value is set, so no other task is mailed to that address. The output of such a task is mailed to that address as well as appended to the task's log file.
+- Each scheduled task is executed within a one-off `run` container, and thus inherit any docker-options specified for `run` containers. Resources are never shared between scheduled tasks.
+- Scheduled cron tasks are supported on a per-scheduler basis. Schedulers that use the host crontab - such as `docker-local` - have their `app.json` cron tasks written to the `dokku` user crontab, while schedulers that manage their own cron backend - such as `k3s` - schedule them natively.
+- Tasks for _all_ apps managed by a host-crontab scheduler such as `docker-local` are written to a single crontab file owned by the `dokku` user. The `dokku` user's crontab should be considered reserved for this purpose.
+- The `command` is tokenized and exec'd directly inside the container. Shell features such as `;`, `&&`, `|`, and `>` are _not_ interpreted. Commands that contain a bare shell operator are rejected when `app.json` is validated at deploy time, so a malformed cron command will fail the deploy rather than silently fail to run. If shell semantics are required, wrap the command explicitly, for example `"sh -c 'do-thing > /var/log/x.log'"`.
+- Task output is written to the container's stdout and stderr, and can be persisted via Dokku's [vector integration](/docs/deployment/logs.md#configuring-a-cron-task-log-sink). See [persisting cron task output](#persisting-cron-task-output) below.
+- A cron task cannot declare a log file path in `app.json`. The crontab written for the `dokku` user contains only `dokku cron:run <app> <cron_id>` lines, and no path from a deployed repository is ever interpolated into it.
+
+#### Persisting cron task output
+
+Without further configuration, a task's output is only delivered to the `MAILTO` address configured for cron. To retain it, configure a sink via Dokku's [vector integration](/docs/deployment/logs.md#vector-logging-shipping).
+
+Any sink configured for the app already receives cron task output alongside the app's other logs:
+
+```shell
+dokku logs:set node-js-app vector-sink "console://?encoding[codec]=json"
+```
+
+To keep cron output separate, set a `vector-cron-sink` instead. Cron output is then routed there rather than to the app's sink:
+
+```shell
+dokku logs:set node-js-app vector-cron-sink "console://?encoding[codec]=text"
+```
+
+To write it to a file on the host, target the `/var/log/dokku/apps` directory, which is mounted into the vector container. The `dokku_cron_id` field is available for templating, so each task can be given its own file:
+
+```shell
+dokku logs:set node-js-app vector-cron-sink "file://?path=/var/log/dokku/apps/node-js-app/cron-{{ dokku_cron_id }}.log&encoding[codec]=text"
+```
+
+See [configuring a cron task log sink](/docs/deployment/logs.md#configuring-a-cron-task-log-sink) for the routing rules, the available fields, and the caveat around very short-lived tasks.
+
+### Changing cron management settings
+
+The `cron` plugin provides a number of settings that can be used to managed deployments on a per-app basis. The following table outlines ones not covered elsewhere:
+
+| Name                  | Description                                                    | Level       | Global Default |
+|-----------------------|----------------------------------------------------------------|-------------|----------------|
+| `mailfrom`            | Sets the `MAILFROM` variable in a cron file for cron reporting | Global-only | empty string   |
+| `maintenance`         | Whether to have cron running for the app or not.               | App and Global | `false`     |
+| `mailto`              | Sets the `MAILTO` variable in a cron file for cron reporting   | Global-only | empty string   |
+
+All settings can be set via the `cron:set` command. Using `maintenance` as an example:
+
+```shell
+dokku cron:set node-js-app maintenance true
+```
+
+The default value may be set by passing an empty value for the option in question:
+
+```shell
+dokku cron:set node-js-app maintenance
+```
+
+If a property can be set globally - such as `mailto`, use the `--global` flag. If not set for an app, the global value will apply if it exists.
+
+```shell
+dokku cron:set --global maintenance true
+```
+
+The global default value may be set by passing an empty value for the option.
+
+```shell
+dokku cron:set --global maintenance
+```
 
 #### Listing Cron tasks
 
@@ -60,6 +134,71 @@ ID                                    Schedule   Command
 cGhwPT09cGhwIHRlc3QucGhwPT09QGRhaWx5  @daily     node index.js
 cGhwPT09dHJ1ZT09PSogKiAqICogKg==      * * * * *  true
 ```
+
+The output can also be displayed in json format:
+
+```shell
+dokku cron:list node-js-app --format json
+```
+
+```
+[{"id":"cGhwPT09cGhwIHRlc3QucGhwPT09QGRhaWx5","app":"node-js-app","command":"node index.js","schedule":"@daily"}]
+```
+
+To fetch global tasks, use the `--global` flag:
+
+```shell
+dokku cron:list --global
+```
+
+```
+ID                            Schedule  Command
+5cruaotm4yzzpnjlsdunblj8qyjp  @daily    /bin/true
+```
+
+#### Suspending and resuming a specific cron task
+
+Cron tasks can be suspended to temporarily prevent them from running, and later resumed to re-enable them. This is useful for maintenance or debugging purposes.
+
+To suspend a specific cron task, use the `cron:suspend` command with the app name and cron ID:
+
+```shell
+dokku cron:suspend node-js-app cGhwPT09cGhwIHRlc3QucGhwPT09QGRhaWx5
+```
+
+A suspended task will not execute according to its schedule. You can verify a task is suspended by checking the `Maintenance` column in the `cron:list` output, which will show `true (task)` for suspended tasks.
+
+To resume a suspended cron task, use the `cron:resume` command:
+
+```shell
+dokku cron:resume node-js-app cGhwPT09cGhwIHRlc3QucGhwPT09QGRhaWx5
+```
+
+Once resumed, the task will execute according to its schedule again. The cron ID can be retrieved from the `cron:list` output.
+
+#### Executing a cron task on the fly
+
+Cron tasks can be invoked via the `cron:run` command. This command takes an `app` argument and a `cron id` (retrievable from `cron:list` output).
+
+```shell
+dokku cron:run node-js-app cGhwPT09cGhwIHRlc3QucGhwPT09QGRhaWx5
+```
+
+By default, the task is run in an attached container - as supported by the scheduler. To run in a background detached container, specify the `--detach` flag:
+
+```shell
+dokku cron:run node-js-app cGhwPT09cGhwIHRlc3QucGhwPT09QGRhaWx5 --detach
+```
+
+An on-the-fly invocation runs for a maximum of 24 hours (86400 seconds), the same deadline scheduled invocations receive. A different deadline can be requested with the `--ttl-seconds` argument:
+
+```shell
+dokku cron:run node-js-app cGhwPT09cGhwIHRlc3QucGhwPT09QGRhaWx5 --detach --ttl-seconds 600
+```
+
+The value applies only to that invocation - tasks started by the schedule keep the 24 hour default.
+
+All one-off cron executions have their containers terminated after invocation.
 
 #### Displaying reports
 
@@ -97,7 +236,8 @@ dokku cron:report node-js-app --cron-task-count
 
 ### Self Managed Cron
 
-> Warning: Self-managed cron tasks should be considered advanced usage. While the instructions are available, users are highly encouraged to use the built-in scheduled cron task support unless absolutely necessary.
+> [!WARNING]
+> Self-managed cron tasks should be considered advanced usage. While the instructions are available, users are highly encouraged to use the built-in scheduled cron task support unless absolutely necessary.
 
 Some installations may require more fine-grained control over cron usage. The following are advanced instructions for configuring cron.
 
@@ -106,8 +246,7 @@ Some installations may require more fine-grained control over cron usage. The fo
 You can always use a one-off container to run an app task:
 
 ```shell
-dokku --rm run node-js-app some-command
-dokku --rm-container run node-js-app some-command
+dokku run node-js-app some-command
 ```
 
 For tasks that should not be interrupted, run is the _preferred_ method of handling cron tasks, as the container will continue running even during a deploy or scaling event. The trade-off is that there will be an increase in memory usage if there are multiple concurrent tasks running.
@@ -140,9 +279,8 @@ For tasks that will properly resume, you _should_ use the above method, as runni
 
 Regularly scheduled tasks can be a bit of a pain with Dokku. The following are general recommendations to follow to help ensure successful task runs.
 
-- Use the `dokku` user in your cron entry.
-  - If you do not, the `dokku` binary will attempt to execute with `sudo`, and your cron run with fail with `sudo: no tty present and no askpass program specified`.
-
+- Use the `dokku` user in your cron task.
+    - If you do not, the `dokku` binary will attempt to execute with `sudo`, and your cron run with fail with `sudo: no tty present and no askpass program specified`.
 - Add a `MAILTO` environment variable to ship cron emails to yourself.
 - Add a `PATH` environment variable or specify the full path to binaries on the host.
 - Add a `SHELL` environment variable to specify Bash when running commands.
@@ -183,7 +321,7 @@ SHELL=/bin/bash
 ### PLACE ALL CRON TASKS BELOW
 
 # removes unresponsive users from the subscriber list to decrease bounce rates
-0 0 * * * dokku dokku --rm run node-js-app some-command
+0 0 * * * dokku dokku run node-js-app some-command
 
 # sends out our email alerts to users
 0 1 * * * dokku dokku ps:scale node-js-app cron=1 && dokku enter node-js-app cron some-other-command && dokku ps:scale node-js-app cron=0
@@ -191,3 +329,17 @@ SHELL=/bin/bash
 ### PLACE ALL CRON TASKS ABOVE, DO NOT REMOVE THE WHITESPACE AFTER THIS LINE
 
 ```
+
+## Properties
+
+### Settable properties
+
+> [!NOTE]
+> The `Report flags` column lists the CLI argument names accepted by `cron:report`. The JSON keys emitted by `cron:report --format json` are the same names with the leading `--cron-` stripped (e.g. `global-mailto`, `computed-mailto`, `maintenance`). Legacy keys with the `cron-` prefix (e.g. `cron-global-mailto`) are also emitted during the 0.38.x deprecation window and will be removed in a future major release.
+
+| Property | Scope | Default | Report flags | Description |
+| --- | --- | --- | --- | --- |
+| `mailfrom` | global only | none | `--cron-global-mailfrom`, `--cron-computed-mailfrom` | `From:` address used in cron failure emails |
+| `mailto` | global only | none | `--cron-global-mailto`, `--cron-computed-mailto` | Recipient address for cron failure emails; empty disables email |
+| `maintenance` | app + global | `false` | `--cron-maintenance`, `--cron-global-maintenance`, `--cron-computed-maintenance` | When `true`, suspends all cron tasks for the app (or globally) |
+| `maintenance.<cron-id>` | app only | `false` | `--cron-maintenance-<cron-id>` (dynamic per task) | Suspends an individual cron task by its computed ID (one row per task); written by `cron:suspend`/`cron:resume` |

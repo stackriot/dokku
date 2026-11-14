@@ -1,0 +1,245 @@
+#!/usr/bin/env bash
+source "$PLUGIN_CORE_AVAILABLE_PATH/common/functions"
+source "$PLUGIN_AVAILABLE_PATH/proxy/functions"
+source "$PLUGIN_AVAILABLE_PATH/caddy-vhosts/internal-functions"
+set -eo pipefail
+[[ $DOKKU_TRACE ]] && set -x
+
+trigger-caddy-vhosts-docker-args-process-deploy() {
+  declare desc="nginx-vhosts core-post-deploy plugin trigger"
+  declare trigger="docker-args-process-deploy"
+  declare APP="$1" IMAGE_SOURCE_TYPE="$2" IMAGE_TAG="$3" PROC_TYPE="$4" CONTAINER_INDEX="$5"
+  local app_domains caddy_domains is_app_listening letsencrypt_email output proxy_container_port proxy_host_port port_map proxy_scheme proxy_schemes scheme tls_internal
+  local proxy_container_http_port proxy_container_http_port_candidate proxy_host_http_port_candidate
+  local proxy_container_https_port proxy_container_https_port_candidate proxy_host_https_port_candidate
+  local STDIN=$(cat)
+
+  if [[ "$(plugn trigger proxy-type "$APP")" != "caddy" ]]; then
+    return
+  fi
+
+  if [[ "$PROC_TYPE" != "web" ]]; then
+    # Non-web processes are only labeled when at least one path-based route
+    # targets the process. Otherwise caddy-docker-proxy should ignore the
+    # container entirely.
+    local route_proc
+    local has_route=false
+    while IFS='|' read -r route_proc _ _ _; do
+      if [[ "$route_proc" == "$PROC_TYPE" ]]; then
+        has_route=true
+        break
+      fi
+    done < <(plugn trigger proxy-routes-list "$APP")
+    if [[ "$has_route" != "true" ]]; then
+      echo -n "$STDIN"
+      return
+    fi
+    fn-caddy-route-labels "$APP" "$PROC_TYPE" "$STDIN"
+    return
+  fi
+
+  if [[ "$(plugn trigger proxy-is-enabled "$APP")" != "true" ]]; then
+    return
+  fi
+
+  if ! plugn trigger domains-vhost-enabled "$APP" 2>/dev/null; then
+    return
+  fi
+
+  # ensure we have a port mapping
+  plugn trigger ports-configure "$APP"
+
+  # gather port mapping information
+  # we only support proxying a single port for http and https listeners
+  # so this block parses the port mappings and tries to find the correct
+  # mapping to expose
+  is_app_listening="false"
+  while read -r port_map; do
+    proxy_scheme="$(awk -F ':' '{ print $1 }' <<<"$port_map")"
+    proxy_host_port="$(awk -F ':' '{ print $2 }' <<<"$port_map")"
+    proxy_container_port="$(awk -F ':' '{ print $3 }' <<<"$port_map")"
+
+    if [[ "$proxy_scheme" == "http" ]]; then
+      is_app_listening="true"
+      if [[ -z "$proxy_container_http_port_candidate" ]]; then
+        proxy_container_http_port_candidate="$proxy_container_port"
+        proxy_host_http_port_candidate="$proxy_host_port"
+      fi
+
+      if [[ "$proxy_host_port" == "80" ]] && [[ -z "$proxy_container_http_port" ]]; then
+        proxy_container_http_port="$proxy_container_port"
+      fi
+    fi
+
+    if [[ "$proxy_scheme" == "https" ]]; then
+      is_app_listening="true"
+      if [[ -z "$proxy_container_https_port_candidate" ]]; then
+        proxy_container_https_port_candidate="$proxy_container_port"
+        proxy_host_https_port_candidate="$proxy_host_port"
+      fi
+
+      if [[ "$proxy_host_port" == "443" ]] && [[ -z "$proxy_container_https_port" ]]; then
+        proxy_container_https_port="$proxy_container_port"
+      fi
+    fi
+  done < <(plugn trigger ports-get "$APP")
+
+  letsencrypt_email="$(fn-caddy-computed-letsencrypt-email)"
+  if [[ -n "$letsencrypt_email" ]] && [[ -z "$proxy_container_https_port" ]]; then
+    proxy_container_https_port_candidate="$proxy_container_http_port_candidate"
+    proxy_host_https_port_candidate="$proxy_host_http_port_candidate"
+    if [[ -n "$proxy_container_http_port" ]]; then
+      proxy_container_https_port_candidate="$proxy_container_http_port"
+      proxy_host_http_port_candidate=443
+    fi
+  fi
+
+  app_domains="$(plugn trigger domains-list "$APP")"
+  if [[ -n "$app_domains" ]]; then
+    caddy_domains="$(echo "$app_domains" | xargs)"
+    caddy_domains="${caddy_domains// /, }"
+  fi
+
+  # If any path-based route exists for this app, the route emission on the
+  # non-web container puts a `handle @<slug>` block in the site. For caddy to
+  # honor that, web's `reverse_proxy` must also be wrapped in a `handle`
+  # block (both at directive order ~210) so caddy's mutually-exclusive
+  # handle logic picks the route handle for matched paths and falls through
+  # to the catch-all handle for everything else. Without this, web's bare
+  # reverse_proxy (~190) catches every request before any handle runs.
+  local has_routes=false
+  while IFS='|' read -r route_proc _ _ _; do
+    if [[ -n "$route_proc" ]]; then
+      has_routes=true
+      break
+    fi
+  done < <(plugn trigger proxy-routes-list "$APP")
+
+  # add the labels for caddy here
+  # prefer the https:443 mapping to http:80 mapping
+  if [[ "$is_app_listening" == "true" ]] && [[ -n "$caddy_domains" ]]; then
+    has_443_mapping=false
+    tls_internal="$(fn-caddy-computed-tls-internal "$APP")"
+    if [[ -n "$proxy_container_https_port" ]] || [[ -n "$proxy_container_https_port_candidate" ]]; then
+      has_443_mapping=true
+    fi
+
+    ssl_warning_mapping="https:443"
+    if [[ "$tls_internal" == "true" ]]; then
+      if [[ "$has_443_mapping" == "false" ]]; then
+        ssl_warning_mapping="http:80"
+        proxy_host_https_port_candidate="$proxy_host_http_port_candidate"
+        proxy_container_https_port_candidate="$proxy_container_http_port_candidate"
+        proxy_container_https_port="$proxy_container_http_port"
+      fi
+    fi
+
+    scheme="http"
+    if [[ -n "$letsencrypt_email" ]] && [[ "$has_443_mapping" == "true" ]]; then
+      output="--label 'caddy=${caddy_domains}'"
+      if [[ "$tls_internal" == "true" ]]; then
+        output="$output --label caddy.tls=internal"
+      fi
+      scheme="https"
+      if [[ -z "$proxy_container_https_port" ]]; then
+        warning_scheme="$(awk -F ':' '{ print $1 }' <<<"$ssl_warning_mapping")"
+        dokku_log_warn "Warning: $ssl_warning_mapping port mapping not found"
+        dokku_log_warn "Utilizing first $warning_scheme port mapping, http:$proxy_host_https_port_candidate:$proxy_container_https_port_candidate"
+        proxy_container_https_port="$proxy_container_https_port_candidate"
+      fi
+
+      if [[ "$has_routes" == "true" ]]; then
+        # The "9_" prefix orders web's catch-all handle after the route
+        # handles (which the non-web container emits with "0_") in the
+        # docker-proxy generated Caddyfile.
+        output="$output --label \"caddy.9_handle.0_reverse_proxy={{ upstreams $proxy_container_https_port }}\""
+      else
+        output="$output --label \"caddy.reverse_proxy={{ upstreams $proxy_container_https_port }}\""
+      fi
+    elif [[ -n "$proxy_container_http_port" ]] || [[ -n "$proxy_container_http_port_candidate" ]]; then
+      caddy_domains="${caddy_domains//, /:80, }"
+      output="--label 'caddy=${caddy_domains}:80'"
+      if [[ -z "$proxy_container_http_port" ]]; then
+        dokku_log_warn "Warning: http:80 port mapping not found"
+        dokku_log_warn "Utilizing first http port mapping, http:$proxy_host_http_port_candidate:$proxy_container_http_port_candidate"
+        proxy_container_http_port="$proxy_container_http_port_candidate"
+      fi
+
+      if [[ "$has_routes" == "true" ]]; then
+        output="$output --label \"caddy.9_handle.0_reverse_proxy={{ upstreams $proxy_container_http_port }}\""
+      else
+        output="$output --label \"caddy.reverse_proxy={{ upstreams $proxy_container_http_port }}\""
+      fi
+    fi
+
+    if [[ "$output" == *"caddy.reverse_proxy="* ]]; then
+      output="$output$(fn-caddy-healthcheck-labels "$APP")"
+    fi
+  fi
+
+  local proxy_labels_file_path=$(fn-proxy-get-labels-file-path "caddy" "$APP")
+  if [[ -f "$proxy_labels_file_path" ]]; then
+    while read -r line; do
+      [[ -z "$line" ]] && continue
+      output="$output --label '$line'"
+    done <"$proxy_labels_file_path"
+  fi
+
+  echo -n "$STDIN $output"
+}
+
+fn-caddy-healthcheck-labels() {
+  declare desc="outputs caddy reverse_proxy health check and retry labels derived from the app's web readiness healthcheck"
+  declare APP="$1"
+  local healthcheck hc_path hc_port hc_timeout hc_interval hc_attempts hc_host name value
+
+  healthcheck="$(fn-proxy-get-readiness-healthcheck "$APP")"
+  if [[ -z "$healthcheck" ]]; then
+    return
+  fi
+
+  hc_path="$(echo "$healthcheck" | jq -r ".path // empty")"
+  hc_port="$(echo "$healthcheck" | jq -r ".port // empty")"
+  hc_timeout="$(echo "$healthcheck" | jq -r ".timeout // 5")"
+  hc_interval="$(echo "$healthcheck" | jq -r ".wait // 5")"
+  hc_attempts="$(echo "$healthcheck" | jq -r ".attempts // 3")"
+
+  if ! fn-proxy-healthcheck-path-is-valid "$hc_path"; then
+    dokku_log_fail "Invalid app.json healthcheck path for caddy: path must start with a / and must not contain whitespace, control characters, quotes, or backslashes"
+  fi
+
+  hc_host="$(fn-proxy-get-healthcheck-host "$APP" "$healthcheck")"
+
+  echo -n " --label \"caddy.reverse_proxy.health_uri=$hc_path\""
+  [[ -n "$hc_port" ]] && echo -n " --label caddy.reverse_proxy.health_port=$hc_port"
+  echo -n " --label caddy.reverse_proxy.health_interval=${hc_interval}s"
+  echo -n " --label caddy.reverse_proxy.health_timeout=${hc_timeout}s"
+  echo -n " --label caddy.reverse_proxy.health_fails=$hc_attempts"
+  if [[ -n "$hc_host" ]] && fn-proxy-healthcheck-header-is-valid "Host" "$hc_host" && [[ "$hc_host" != *[[:space:]]* ]]; then
+    echo -n " --label caddy.reverse_proxy.health_headers.Host=$hc_host"
+  fi
+
+  while IFS=$'\t' read -r name value; do
+    [[ -z "$name" ]] && continue
+    if ! fn-caddy-healthcheck-header-name-is-valid "$name" || ! fn-proxy-healthcheck-header-is-valid "$name" "$value"; then
+      dokku_log_warn "Skipping invalid app.json healthcheck header for caddy: $name"
+      continue
+    fi
+
+    echo -n " --label 'caddy.reverse_proxy.health_headers.$name=\"$value\"'"
+  done < <(fn-proxy-get-healthcheck-headers "$healthcheck")
+
+  echo -n " --label caddy.reverse_proxy.lb_try_duration=5s"
+  echo -n " --label caddy.reverse_proxy.lb_try_interval=250ms"
+}
+
+fn-caddy-healthcheck-header-name-is-valid() {
+  declare desc="checks that a healthcheck header name can be used as a caddy label segment, which may not contain dots or end in an _<number> ordering suffix"
+  declare NAME="$1"
+
+  [[ "$NAME" == *.* ]] && return 1
+  [[ "$NAME" =~ _[0-9]+$ ]] && return 1
+  return 0
+}
+
+trigger-caddy-vhosts-docker-args-process-deploy "$@"

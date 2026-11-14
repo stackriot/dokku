@@ -4,10 +4,136 @@ load test_helper
 
 setup() {
   create_app
+  DOCKERFILE="$BATS_TMPDIR/Dockerfile"
 }
 
 teardown() {
+  rm -f "$DOCKERFILE"
   destroy_app
+}
+
+@test "(builder-dockerfile:report) info-flag works before deploy" {
+  run /bin/bash -c "dokku builder-dockerfile:report $TEST_APP --builder-dockerfile-dockerfile-path"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku builder-dockerfile:set $TEST_APP dockerfile-path second.Dockerfile"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku builder-dockerfile:report $TEST_APP --builder-dockerfile-dockerfile-path"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "second.Dockerfile"
+
+  run /bin/bash -c "dokku builder-dockerfile:report $TEST_APP --builder-dockerfile-invalid-flag"
+  echo "output: $output"
+  echo "status: $status"
+  assert_failure
+  assert_output_contains "Invalid flag passed"
+}
+
+@test "(builder-dockerfile:report) --global --format json" {
+  run /bin/bash -c "dokku builder-dockerfile:report --global --format json | jq -e ."
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku builder-dockerfile:report --global --format json | jq -r '.\"global-dockerfile-path\"'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output ""
+
+  run /bin/bash -c "dokku builder-dockerfile:report --global --format json | jq -r 'has(\"dockerfile-path\")'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "false"
+
+  run /bin/bash -c "dokku builder-dockerfile:report --global"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output_contains "global builder-dockerfile information"
+
+  run /bin/bash -c "dokku builder-dockerfile:report --global --builder-dockerfile-global-dockerfile-path"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output ""
+
+  run /bin/bash -c "dokku builder-dockerfile:set --global dockerfile-path Dockerfile.custom"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku builder-dockerfile:report --global --builder-dockerfile-global-dockerfile-path"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "Dockerfile.custom"
+
+  run /bin/bash -c "dokku builder-dockerfile:set --global dockerfile-path"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+}
+
+@test "(builder-dockerfile:report) dockerfile-path raw vs computed vs global" {
+  run /bin/bash -c "dokku builder-dockerfile:set --global dockerfile-path"
+  assert_success
+
+  run /bin/bash -c "dokku builder-dockerfile:report $TEST_APP --builder-dockerfile-dockerfile-path"
+  assert_success
+  assert_output_not_exists
+
+  run /bin/bash -c "dokku builder-dockerfile:report $TEST_APP --builder-dockerfile-global-dockerfile-path"
+  assert_success
+  assert_output_not_exists
+
+  run /bin/bash -c "dokku builder-dockerfile:report $TEST_APP --builder-dockerfile-computed-dockerfile-path"
+  assert_success
+  assert_output "Dockerfile"
+
+  run /bin/bash -c "dokku builder-dockerfile:set --global dockerfile-path Dockerfile.global"
+  assert_success
+
+  run /bin/bash -c "dokku builder-dockerfile:report $TEST_APP --builder-dockerfile-global-dockerfile-path"
+  assert_success
+  assert_output "Dockerfile.global"
+
+  run /bin/bash -c "dokku builder-dockerfile:report $TEST_APP --builder-dockerfile-computed-dockerfile-path"
+  assert_success
+  assert_output "Dockerfile.global"
+
+  run /bin/bash -c "dokku builder-dockerfile:set $TEST_APP dockerfile-path Dockerfile.app"
+  assert_success
+
+  run /bin/bash -c "dokku builder-dockerfile:report $TEST_APP --builder-dockerfile-dockerfile-path"
+  assert_success
+  assert_output "Dockerfile.app"
+
+  run /bin/bash -c "dokku builder-dockerfile:report $TEST_APP --builder-dockerfile-global-dockerfile-path"
+  assert_success
+  assert_output "Dockerfile.global"
+
+  run /bin/bash -c "dokku builder-dockerfile:report $TEST_APP --builder-dockerfile-computed-dockerfile-path"
+  assert_success
+  assert_output "Dockerfile.app"
+
+  run /bin/bash -c "dokku builder-dockerfile:set $TEST_APP dockerfile-path"
+  assert_success
+
+  run /bin/bash -c "dokku builder-dockerfile:set --global dockerfile-path"
+  assert_success
+
+  run /bin/bash -c "dokku builder-dockerfile:report $TEST_APP --builder-dockerfile-computed-dockerfile-path"
+  assert_success
+  assert_output "Dockerfile"
 }
 
 @test "(builder-dockerfile:set)" {
@@ -47,4 +173,264 @@ teardown() {
   echo "status: $status"
   assert_success
   assert_output_contains 'echo hi' 0
+}
+
+@test "(builder-dockerfile) exec" {
+  run /bin/bash -c "dokku builder-dockerfile:set $TEST_APP dockerfile-path exec.Dockerfile"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku app-json:set $TEST_APP appjson-path app.json-fake"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku ps:set $TEST_APP procfile-path exec.Procfile"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run deploy_app python dokku@$DOKKU_DOMAIN:$TEST_APP
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku run $TEST_APP task"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output_contains "Found 'task' in Procfile, running that command"
+  assert_output_contains 'hi dokku'
+}
+
+@test "(builder-dockerfile) config export" {
+  run /bin/bash -c "dokku config:set $TEST_APP GITHUB_TOKEN=custom-value"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku docker-options:add $TEST_APP build '--build-arg GITHUB_TOKEN'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run deploy_app dockerfile
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output_contains "TOKEN is: custom-value" 2
+}
+
+@test "(builder-dockerfile) port exposure (dockerfile raw port)" {
+  source "$PLUGIN_CORE_AVAILABLE_PATH/builder-dockerfile/internal-functions"
+  cat <<EOF >$DOCKERFILE
+EXPOSE 3001/udp
+EXPOSE 3003
+EXPOSE  3000/tcp
+EOF
+  run fn-builder-dockerfile-get-ports-from-dockerfile $DOCKERFILE
+  echo "output: $output"
+  echo "status: $status"
+  assert_output "3001/udp 3003 3000/tcp"
+}
+
+@test "(builder-dockerfile) port exposure (dockerfile tcp port)" {
+  source "$PLUGIN_CORE_AVAILABLE_PATH/builder-dockerfile/internal-functions"
+  cat <<EOF >$DOCKERFILE
+EXPOSE 3001/udp
+EXPOSE  3000/tcp
+EXPOSE 3003
+EOF
+  run fn-builder-dockerfile-get-ports-from-dockerfile $DOCKERFILE
+  echo "output: $output"
+  echo "status: $status"
+  assert_output "3001/udp 3000/tcp 3003"
+}
+
+@test "(builder-dockerfile) core-post-extract renames the configured dockerfile" {
+  echo "FROM scratch" >"$BATS_TEST_TMPDIR/second.Dockerfile"
+
+  run /bin/bash -c "dokku builder-dockerfile:set $TEST_APP dockerfile-path second.Dockerfile"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run_plugin_script builder-dockerfile core-post-extract "$TEST_APP" "$BATS_TEST_TMPDIR" HEAD
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "test -f $BATS_TEST_TMPDIR/Dockerfile"
+  assert_success
+
+  run /bin/bash -c "test ! -e $BATS_TEST_TMPDIR/second.Dockerfile"
+  assert_success
+}
+
+@test "(builder-dockerfile) ps:rebuild fetches files from image" {
+  run /bin/bash -c "dokku --trace git:from-image $TEST_APP dokku/smoke-test-app:dockerfile"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku ps:rebuild $TEST_APP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+}
+
+@test "(builder-dockerfile) run" {
+  run /bin/bash -c "dokku config:set $TEST_APP SECRET_KEY=fjdkslafjdk"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku builder:set $TEST_APP selected dockerfile"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run deploy_app python dokku@$DOKKU_DOMAIN:$TEST_APP convert_to_dockerfile
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku run $TEST_APP python3 task.py test"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "['task.py', 'test']"
+
+  run /bin/bash -c "dokku --quiet run $TEST_APP task"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "['task.py', 'test']"
+
+  run /bin/bash -c "dokku run $TEST_APP env"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output_contains "SECRET_KEY=fjdkslafjdk"
+}
+
+@test "(builder-dockerfile) cron:run" {
+  run /bin/bash -c "dokku config:set $TEST_APP SECRET_KEY=fjdkslafjdk"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku builder:set $TEST_APP selected dockerfile"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run deploy_app python dokku@$DOKKU_DOMAIN:$TEST_APP cron_run_wrapper
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  cron_id="$(dokku cron:list $TEST_APP --format json | jq -r '.[0].id')"
+  run /bin/bash -c "echo $cron_id"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output_exists
+
+  run /bin/bash -c "dokku cron:run $TEST_APP $cron_id"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "['task.py', 'some', 'cron', 'task']"
+}
+
+@test "(builder-dockerfile) ps:rebuild --no-cache" {
+  run deploy_app python dokku@$DOKKU_DOMAIN:$TEST_APP convert_to_dockerfile
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku ps:rebuild $TEST_APP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output_contains "CACHED" -1
+
+  run /bin/bash -c "dokku ps:rebuild --no-cache $TEST_APP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output_contains "CACHED" 1
+
+  run /bin/bash -c "dokku ps:rebuild $TEST_APP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output_contains "CACHED" -1
+}
+
+@test "(builder-dockerfile) failed build restores previous image" {
+  local CUSTOM_TMP=$(mktemp -d "/tmp/${DOKKU_DOMAIN}.XXXXX")
+  trap 'popd &>/dev/null || true; rm -rf "$CUSTOM_TMP"' INT TERM
+
+  CUSTOM_TMP="$CUSTOM_TMP" run deploy_app python "dokku@$DOKKU_DOMAIN:$TEST_APP" convert_to_dockerfile
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  local previous_image
+  previous_image="$(docker container inspect "$TEST_APP.web.1" --format '{{.Image}}')"
+  [[ -n "$previous_image" ]]
+
+  run failing_build_callback "$TEST_APP" "$CUSTOM_TMP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run git -C "$CUSTOM_TMP" add Dockerfile
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run git -C "$CUSTOM_TMP" commit -m 'Break the build'
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run git -C "$CUSTOM_TMP" push target master:master
+  echo "output: $output"
+  echo "status: $status"
+  assert_failure
+  assert_output_contains "App build failed"
+  assert_output_contains "Removing invalid image tag" 0
+
+  run /bin/bash -c "docker image inspect dokku/$TEST_APP:latest --format '{{.Id}}'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "$previous_image"
+
+  run /bin/bash -c "dokku ps:restart $TEST_APP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  rm -rf "$CUSTOM_TMP"
+}
+
+cron_run_wrapper() {
+  local APP="$1"
+  local APP_REPO_DIR="$2"
+  [[ -z "$APP" ]] && local APP="$TEST_APP"
+  APP_REPO_DIR="$(realpath "$APP_REPO_DIR")"
+
+  convert_to_dockerfile "$APP" "$APP_REPO_DIR"
+  mv -f "$APP_REPO_DIR/app-cron.json" "$APP_REPO_DIR/app.json"
+}
+
+failing_build_callback() {
+  local APP="$1"
+  local APP_REPO_DIR="$2"
+  echo "RUN exit 1" >>"$APP_REPO_DIR/Dockerfile"
 }

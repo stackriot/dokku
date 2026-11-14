@@ -27,17 +27,21 @@ func main() {
 		args := flag.NewFlagSet("ps:rebuild", flag.ExitOnError)
 		allApps := args.Bool("all", false, "--all: rebuild all apps")
 		parallelCount := args.Int("parallel", ps.RunInSerial, "--parallel: number of apps to rebuild in parallel, -1 to match cpu count")
+		noCache := args.Bool("no-cache", false, "--no-cache: rebuild without using the build cache")
 		args.Parse(os.Args[2:])
 		appName := args.Arg(0)
-		err = ps.CommandRebuild(appName, *allApps, *parallelCount)
+		err = ps.CommandRebuild(appName, *allApps, *parallelCount, *noCache)
 	case "report":
 		args := flag.NewFlagSet("ps:report", flag.ExitOnError)
 		format := args.String("format", "stdout", "format: [ stdout | json ]")
-		osArgs, infoFlag, flagErr := common.ParseReportArgs("ps", os.Args[2:])
+		reportArgs, flagErr := common.ParseReportArgs("ps", os.Args[2:])
 		if flagErr == nil {
-			args.Parse(osArgs)
+			args.Parse(reportArgs.OSArgs)
 			appName := args.Arg(0)
-			err = ps.CommandReport(appName, *format, infoFlag)
+			if reportArgs.IsGlobal {
+				appName = "--global"
+			}
+			err = ps.CommandReport(appName, *format, reportArgs.InfoFlag)
 		}
 	case "restart":
 		args := flag.NewFlagSet("ps:restart", flag.ExitOnError)
@@ -62,16 +66,32 @@ func main() {
 	case "scale":
 		args := flag.NewFlagSet("ps:scale", flag.ExitOnError)
 		skipDeploy := args.Bool("skip-deploy", false, "--skip-deploy: skip deploy of the app")
+		clearFormation := args.Bool("clear", false, "--clear: reset the formation to the default scale")
+		replace := args.Bool("replace", false, "--replace: replace the formation and scale unspecified process types to zero")
+		format := args.String("format", "stdout", "format: [ stdout | json ]")
 		args.Parse(os.Args[2:])
 		appName := args.Arg(0)
 		_, processTuples := common.ShiftString(args.Args())
-		err = ps.CommandScale(appName, *skipDeploy, processTuples)
+		err = ps.CommandScale(ps.CommandScaleInput{
+			AppName:       appName,
+			Clear:         *clearFormation,
+			Format:        *format,
+			ProcessTuples: processTuples,
+			Replace:       *replace,
+			SkipDeploy:    *skipDeploy,
+		})
 	case "set":
 		args := flag.NewFlagSet("ps:set", flag.ExitOnError)
+		global := args.Bool("global", false, "--global: set a global property")
 		args.Parse(os.Args[2:])
 		appName := args.Arg(0)
 		property := args.Arg(1)
 		value := args.Arg(2)
+		if *global {
+			appName = "--global"
+			property = args.Arg(0)
+			value = args.Arg(1)
+		}
 		err = ps.CommandSet(appName, property, value)
 	case "start":
 		args := flag.NewFlagSet("ps:start", flag.ExitOnError)

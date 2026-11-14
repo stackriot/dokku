@@ -22,14 +22,13 @@ Manage log integration for an app
 Additional commands:`
 
 	helpContent = `
-    logs [-h] [-t|--tail] [-n|--num num] [-q|--quiet] [-p|--ps process] <app>, Display recent log output
+    logs [-h|--help] [-t|--tail] [-n|--num num] [-q|--quiet] [-p|--ps process] <app>, Display recent log output
     logs:failed [--all|<app>], Shows the last failed deploy logs
     logs:report [<app>] [<flag>], Displays a logs report for one or more apps
     logs:set [--global|<app>] <key> <value>, Set or clear a logs property for an app
     logs:vector-logs [--num num] [--tail], Display vector log output
     logs:vector-start, Start the vector logging container
-    logs:vector-stop, Stop the vector logging container
-`
+    logs:vector-stop, Stop the vector logging container`
 )
 
 func main() {
@@ -40,7 +39,7 @@ func main() {
 	switch cmd {
 	case "logs":
 		args := flag.NewFlagSet("logs", flag.ExitOnError)
-		help := args.Bool("h", false, "-h: print help for the command")
+		help := args.BoolP("help", "h", false, "print help for the command")
 		num := args.Int64P("num", "n", 100, "the number of lines to display")
 		ps := args.StringP("ps", "p", "", "only display logs from the given process")
 		tail := args.BoolP("tail", "t", false, "continually stream logs")
@@ -59,11 +58,11 @@ func main() {
 	case "logs:help":
 		usage()
 	case "help":
-		command := common.NewShellCmd(fmt.Sprintf("ps -o command= %d", os.Getppid()))
-		command.ShowOutput = false
-		output, err := command.Output()
-
-		if err == nil && strings.Contains(string(output), "--all") {
+		result, err := common.CallExecCommand(common.ExecCommandInput{
+			Command: "ps",
+			Args:    []string{"-o", "command=", strconv.Itoa(os.Getppid())},
+		})
+		if err == nil && strings.Contains(result.StdoutContents(), "--all") {
 			fmt.Println(helpContent)
 		} else {
 			fmt.Print("\n    logs, Manage log integration for an app\n")

@@ -21,10 +21,10 @@
     # - `DOKKU_IP`
     # - `FORWARDED_PORT`.
     cd path/to/dokku
-    
+
     # for most users
     vagrant up
-    
+
     # windows users must instead use the following in an elevated command prompt
     vagrant up dokku-windows
     ```
@@ -36,13 +36,13 @@
         Port 22
     ```
 
-    > For users that have customized the IP address of their VM - either in a custom `Vagrantfile` or via the `DOKKU_IP` environment variable - and are not using `10.0.0.2` for the Vagrant IP, you'll need to instead use the output of `vagrant ssh-config dokku` for your `~/.ssh/config` entry. 
+    > For users that have customized the IP address of their VM - either in a custom `Vagrantfile` or via the `DOKKU_IP` environment variable - and are not using `10.0.0.2` for the Vagrant IP, you'll need to instead use the output of `vagrant ssh-config dokku` for your `~/.ssh/config` entry.
 
-6. Connect to the server and add your ssh key to the install. Additionally, set the global domain name to `dokku.me`.
+6. Connect to the server via `vagrant ssh` and add your ssh key to the install. Additionally, set the global domain name to `dokku.me`.
 
     ```shell
     # usually your key is already available under the current user's `~/.ssh/authorized_keys` file
-    cat ~/.ssh/authorized_keys | dokku ssh-keys:add admin
+    cat ~/.ssh/authorized_keys | sudo dokku ssh-keys:add admin
 
     # you can use any domain you already have access to
     dokku domains:set-global dokku.me

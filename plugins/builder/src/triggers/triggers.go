@@ -21,6 +21,23 @@ func main() {
 	case "builder-detect":
 		appName := flag.Arg(0)
 		err = builder.TriggerBuilderDetect(appName)
+	case "builder-get-property":
+		appName := flag.Arg(0)
+		property := flag.Arg(1)
+		err = builder.TriggerBuilderGetProperty(appName, property)
+	case "builder-image-is-cnb":
+		appName := flag.Arg(0)
+		image := flag.Arg(1)
+		err = builder.TriggerBuilderImageIsCNB(appName, image)
+	case "builder-image-is-herokuish":
+		appName := flag.Arg(0)
+		image := flag.Arg(1)
+		err = builder.TriggerBuilderImageIsHerokuish(appName, image)
+	case "builder-set-property":
+		appName := flag.Arg(0)
+		property := flag.Arg(1)
+		value := flag.Arg(2)
+		err = builder.TriggerBuilderSetProperty(appName, property, value)
 	case "core-post-extract":
 		appName := flag.Arg(0)
 		sourceWorkDir := flag.Arg(1)
@@ -38,6 +55,10 @@ func main() {
 	case "post-delete":
 		appName := flag.Arg(0)
 		err = builder.TriggerPostDelete(appName)
+	case "post-release-builder":
+		builderType := flag.Arg(0)
+		appName := flag.Arg(1)
+		err = builder.TriggerPostReleaseBuilder(builderType, appName)
 	case "report":
 		appName := flag.Arg(0)
 		err = builder.ReportSingleApp(appName, "", "")

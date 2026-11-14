@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+source "$PLUGIN_CORE_AVAILABLE_PATH/common/functions"
+source "$PLUGIN_CORE_AVAILABLE_PATH/common/property-functions"
+set -eo pipefail
+[[ $DOKKU_TRACE ]] && set -x
+
+fn-builder-railpack-computed-railpackjson-path() {
+  declare APP="$1"
+
+  file="$(fn-builder-railpack-railpackjson-path "$APP")"
+  if [[ "$file" == "" ]]; then
+    file="$(fn-builder-railpack-global-railpackjson-path "$APP")"
+  fi
+  if [[ "$file" == "" ]]; then
+    file="railpack.json"
+  fi
+
+  echo "$file"
+}
+
+fn-builder-railpack-global-railpackjson-path() {
+  declare APP="$1"
+
+  fn-plugin-property-get "builder-railpack" "--global" "railpackjson-path" ""
+}
+
+fn-builder-railpack-railpackjson-path() {
+  declare APP="$1"
+
+  fn-plugin-property-get "builder-railpack" "$APP" "railpackjson-path" ""
+}

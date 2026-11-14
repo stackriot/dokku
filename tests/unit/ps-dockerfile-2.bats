@@ -12,16 +12,20 @@ teardown() {
   global_teardown
 }
 
-@test "(ps:scale) dockerfile dokku-scale" {
+@test "(ps:scale) dockerfile app-json formations" {
   run /bin/bash -c "dokku ps:scale $TEST_APP web=2"
   echo "output: $output"
   echo "status: $status"
   assert_success
 
-  deploy_app dockerfile-dokku-scale
+  run deploy_app dockerfile-app-json-formations
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
   CIDS=""
   for CID_FILE in $DOKKU_ROOT/$TEST_APP/CONTAINER.web.*; do
-    CIDS+=$(< $CID_FILE)
+    CIDS+=$(<$CID_FILE)
     CIDS+=" "
   done
   CIDS_PATTERN=$(echo $CIDS | sed -e "s: :|:g")
@@ -42,13 +46,17 @@ teardown() {
 }
 
 @test "(ps) dockerfile with procfile" {
-  deploy_app dockerfile-procfile
+  run deploy_app dockerfile-procfile
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
   run /bin/bash -c "dokku ps:stop $TEST_APP"
   echo "output: $output"
   echo "status: $status"
   assert_success
   for CID_FILE in $DOKKU_ROOT/$TEST_APP/CONTAINER.*; do
-    run /bin/bash -c "docker ps -q --no-trunc | grep -q $(< $CID_FILE)"
+    run /bin/bash -c "docker ps -q --no-trunc | grep -q $(<$CID_FILE)"
     echo "output: $output"
     echo "status: $status"
     assert_failure
@@ -59,7 +67,7 @@ teardown() {
   echo "status: $status"
   assert_success
   for CID_FILE in $DOKKU_ROOT/$TEST_APP/CONTAINER.*; do
-    run /bin/bash -c "docker ps -q --no-trunc | grep -q $(< $CID_FILE)"
+    run /bin/bash -c "docker ps -q --no-trunc | grep -q $(<$CID_FILE)"
     echo "output: $output"
     echo "status: $status"
     assert_success
@@ -70,7 +78,7 @@ teardown() {
   echo "status: $status"
   assert_success
   for CID_FILE in $DOKKU_ROOT/$TEST_APP/CONTAINER.*; do
-    run /bin/bash -c "docker ps -q --no-trunc | grep -q $(< $CID_FILE)"
+    run /bin/bash -c "docker ps -q --no-trunc | grep -q $(<$CID_FILE)"
     echo "output: $output"
     echo "status: $status"
     assert_success
@@ -81,7 +89,7 @@ teardown() {
   echo "status: $status"
   assert_success
   for CID_FILE in $DOKKU_ROOT/$TEST_APP/CONTAINER.*; do
-    run /bin/bash -c "docker ps -q --no-trunc | grep -q $(< $CID_FILE)"
+    run /bin/bash -c "docker ps -q --no-trunc | grep -q $(<$CID_FILE)"
     echo "output: $output"
     echo "status: $status"
     assert_success
@@ -106,7 +114,11 @@ teardown() {
   echo "status: $status"
   assert_success
 
-  deploy_app dockerfile-procfile
+  run deploy_app dockerfile-procfile
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
   for PROC_TYPE in web worker; do
     run /bin/bash -c "docker ps --format '{{.ID}} {{.Command}}' --no-trunc"
     echo "output: $output"
@@ -114,7 +126,7 @@ teardown() {
     assert_success
     goodlines=""
     for CID_FILE in $DOKKU_ROOT/$TEST_APP/CONTAINER.$PROC_TYPE.*; do
-      cid=$(< $CID_FILE)
+      cid=$(<$CID_FILE)
       assert_output_contains "$cid"
       goodlines+=$(echo "$output" | grep "$cid")
     done
@@ -133,7 +145,7 @@ teardown() {
     assert_success
     goodlines=""
     for CID_FILE in $DOKKU_ROOT/$TEST_APP/CONTAINER.$PROC_TYPE.*; do
-      cid=$(< $CID_FILE)
+      cid=$(<$CID_FILE)
       assert_output_contains "$cid"
       goodlines+=$(echo "$output" | grep "$cid")
     done
@@ -149,7 +161,7 @@ teardown() {
     CIDS=""
     shopt -s nullglob
     for CID_FILE in $DOKKU_ROOT/$TEST_APP/CONTAINER.$PROC_TYPE.*; do
-      CIDS+=$(< $CID_FILE)
+      CIDS+=$(<$CID_FILE)
       CIDS+=" "
     done
     shopt -u nullglob
@@ -158,4 +170,19 @@ teardown() {
     echo "status: $status"
     assert_success
   done
+}
+
+@test "(ps:scale) dockerfile unchanged process" {
+  run deploy_app dockerfile
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku ps:scale $TEST_APP worker=2"
+  echo "output: $output"
+  echo "status: $status"
+  assert_output_contains "Scaling $TEST_APP processes: worker=2"
+  assert_output_contains "Deploying worker"
+  assert_output_contains "Deploying web" 0
+  assert_success
 }

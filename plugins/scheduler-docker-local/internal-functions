@@ -5,66 +5,88 @@ source "$PLUGIN_AVAILABLE_PATH/config/functions"
 set -eo pipefail
 [[ $DOKKU_TRACE ]] && set -x
 
-cmd-scheduler-docker-local-report() {
-  declare desc="displays a scheduler-docker-local report for one or more apps"
-  declare cmd="scheduler-docker-local:report"
-  [[ "$1" == "$cmd" ]] && shift 1
-  declare APP="$1" INFO_FLAG="$2"
-  local INSTALLED_APPS=$(dokku_apps)
-
-  if [[ -n "$APP" ]] && [[ "$APP" == --* ]]; then
-    INFO_FLAG="$APP"
-    APP=""
-  fi
-
-  if [[ -z "$APP" ]] && [[ -z "$INFO_FLAG" ]]; then
-    INFO_FLAG="true"
-  fi
-
-  if [[ -z "$APP" ]]; then
-    for app in $INSTALLED_APPS; do
-      cmd-scheduler-docker-local-report-single "$app" "$INFO_FLAG" | tee || true
-    done
-  else
-    cmd-scheduler-docker-local-report-single "$APP" "$INFO_FLAG"
-  fi
+fn-scheduler-docker-local-init-process() {
+  declare APP="$1"
+  fn-plugin-property-get-default "scheduler-docker-local" "$APP" "init-process" ""
 }
 
-cmd-scheduler-docker-local-report-single() {
-  declare APP="$1" INFO_FLAG="$2"
-  if [[ "$INFO_FLAG" == "true" ]]; then
-    INFO_FLAG=""
+fn-scheduler-docker-local-computed-init-process() {
+  declare APP="$1"
+  local value
+  value="$(fn-scheduler-docker-local-init-process "$APP")"
+  if [[ -z "$value" ]]; then
+    value="$(fn-scheduler-docker-local-global-init-process "$APP")"
   fi
-  verify_app_name "$APP"
-  local flag_map=(
-    "--scheduler-docker-local-disable-chown: $(fn-plugin-property-get "scheduler-docker-local" "$APP" "disable-chown" "")"
-    "--scheduler-docker-local-parallel-schedule-count: $(fn-plugin-property-get "scheduler-docker-local" "$APP" "parallel-schedule-count" "")"
-  )
+  if [[ -z "$value" ]]; then
+    value="true"
+  fi
+  echo "$value"
+}
 
-  if [[ -z "$INFO_FLAG" ]]; then
-    dokku_log_info2_quiet "${APP} scheduler-docker-local information"
-    for flag in "${flag_map[@]}"; do
-      key="$(echo "${flag#--}" | cut -f1 -d' ' | tr - ' ')"
-      dokku_log_verbose "$(printf "%-30s %-25s" "${key^}" "${flag#*: }")"
-    done
-  else
-    local match=false
-    local value_exists=false
-    for flag in "${flag_map[@]}"; do
-      valid_flags="${valid_flags} $(echo "$flag" | cut -d':' -f1)"
-      if [[ "$flag" == "${INFO_FLAG}:"* ]]; then
-        value=${flag#*: }
-        size="${#value}"
-        if [[ "$size" -ne 0 ]]; then
-          echo "$value" && match=true && value_exists=true
-        else
-          match=true
-        fi
-      fi
-    done
-    [[ "$match" == "true" ]] || dokku_log_fail "Invalid flag passed, valid flags:${valid_flags}"
-    [[ "$value_exists" == "true" ]] || dokku_log_fail "not deployed"
+fn-scheduler-docker-local-global-init-process() {
+  declare APP="$1"
+  fn-plugin-property-get-default "scheduler-docker-local" "--global" "init-process" ""
+}
+
+fn-scheduler-docker-local-parallel-schedule-count() {
+  declare APP="$1"
+  fn-plugin-property-get-default "scheduler-docker-local" "$APP" "parallel-schedule-count" ""
+}
+
+fn-scheduler-docker-local-computed-parallel-schedule-count() {
+  declare APP="$1"
+  local value
+  value="$(fn-scheduler-docker-local-parallel-schedule-count "$APP")"
+  if [[ -z "$value" ]]; then
+    value="$(fn-scheduler-docker-local-global-parallel-schedule-count "$APP")"
   fi
+  if [[ -z "$value" ]]; then
+    value="1"
+  fi
+  echo "$value"
+}
+
+fn-scheduler-docker-local-global-parallel-schedule-count() {
+  declare APP="$1"
+  fn-plugin-property-get-default "scheduler-docker-local" "--global" "parallel-schedule-count" ""
+}
+
+fn-scheduler-docker-local-get-checks-file-path() {
+  declare APP="$1"
+
+  echo "${DOKKU_LIB_ROOT}/data/scheduler-docker-local/$APP/CHECKS"
+}
+
+fn-scheduler-docker-local-get-process-specific-checks-file-path() {
+  declare APP="$1"
+
+  checks_path="$(fn-scheduler-docker-local-get-checks-file-path "$APP")"
+  process_specific_checks_path="$checks_path.$DOKKU_PID"
+  if [[ -f "$process_specific_checks_path" ]]; then
+    echo "$process_specific_checks_path"
+    return
+  fi
+
+  echo "$checks_path"
+}
+
+fn-scheduler-docker-local-has-checks-file() {
+  declare APP="$1"
+
+  checks_path="$(fn-scheduler-docker-local-get-checks-file-path "$APP")"
+  if [[ -f "$checks_path.$DOKKU_PID.missing" ]]; then
+    return 1
+  fi
+
+  if [[ -f "$checks_path.$DOKKU_PID" ]]; then
+    return 0
+  fi
+
+  if [[ -f "$checks_path" ]]; then
+    return 0
+  fi
+
+  return 1
 }
 
 fn-scheduler-docker-local-retire-container() {
@@ -77,18 +99,17 @@ fn-scheduler-docker-local-retire-container() {
     return
   fi
 
-  DOKKU_DOCKER_STOP_TIMEOUT="$(config_get "$APP" DOKKU_DOCKER_STOP_TIMEOUT || true)"
+  DOKKU_DOCKER_STOP_TIMEOUT="$(plugn trigger ps-get-property "$APP" stop-timeout-seconds || true)"
   [[ $DOKKU_DOCKER_STOP_TIMEOUT ]] && DOCKER_STOP_TIME_ARG="--time=${DOKKU_DOCKER_STOP_TIMEOUT}"
 
   if [[ "$STATE" == "restarting" ]]; then
-    "$DOCKER_BIN" container update --restart=no "$CID" >/dev/null 2>&1
+    "$DOCKER_BIN" container update --restart=no "$CID" &>/dev/null
   fi
 
   if [[ "$STATE" != "dead" ]] && [[ "$STATE" != "exited" ]]; then
     # Attempt to stop, if that fails, then force a kill as docker seems
     # to not send SIGKILL as the docs would indicate. If that fails, move
     # on to the next.
-    # shellcheck disable=SC2086
     "$DOCKER_BIN" container stop $DOCKER_STOP_TIME_ARG "$CID" \
       || "$DOCKER_BIN" container kill "$CID" \
       || dokku_log_warn "Unable to kill container ${CID}"
@@ -143,8 +164,8 @@ fn-scheduler-docker-local-retire-containers() {
       continue
     fi
 
-    "$DOCKER_BIN" container rm --force "$CID" >/dev/null 2>&1 || true
-    if "$DOCKER_BIN" container inspect "${CID}" >/dev/null 2>&1; then
+    "$DOCKER_BIN" container rm --force "$CID" &>/dev/null || true
+    if "$DOCKER_BIN" container inspect "${CID}" &>/dev/null; then
       dokku_log_warn "Container ${CID} still running"
       continue
     fi
@@ -165,6 +186,15 @@ fn-scheduler-docker-local-retire-images() {
   if [[ ! -f "$DEAD_IMAGE_FILE" ]]; then
     return
   fi
+
+  local -A SOURCE_IMAGE_APPS=()
+  local source_app source_image source_image_id
+  for source_app in $(dokku_apps "false" 2>/dev/null); do
+    source_image="$(plugn trigger git-get-property "$source_app" "source-image" 2>/dev/null || true)"
+    [[ -z "$source_image" ]] && continue
+    source_image_id="$("$DOCKER_BIN" image inspect --format '{{ .Id }}' "$source_image" 2>/dev/null | cut -d: -f2 || true)"
+    [[ -n "$source_image_id" ]] && SOURCE_IMAGE_APPS["$source_image_id"]="$source_app"
+  done
 
   DEAD_IMAGES=()
   while read line; do
@@ -188,8 +218,19 @@ fn-scheduler-docker-local-retire-images() {
       continue
     fi
 
+    if [[ -n "${SOURCE_IMAGE_APPS[$IMAGE_ID]}" ]]; then
+      dokku_log_warn "Image ${IMAGE_ID} is the source image for ${SOURCE_IMAGE_APPS[$IMAGE_ID]}, removing from retire list"
+      DEAD_IMAGES+=("$IMAGE_ID")
+      continue
+    fi
+
+    if fn-scheduler-docker-local-image-is-app-latest "$RETIRE_APP" "$STATE"; then
+      dokku_log_warn "Image ${IMAGE_ID} is the current image for ${RETIRE_APP}, skipping rm"
+      continue
+    fi
+
     dokku_log_verbose_quiet "Attempting to retire $RETIRE_APP image $IMAGE_ID"
-    if RM_OUTPUT="$("$DOCKER_BIN" image rm "$IMAGE_ID" 2>&1)"; then
+    if RM_OUTPUT="$("$DOCKER_BIN" image remove "$IMAGE_ID" 2>&1)"; then
       DEAD_IMAGES+=("$IMAGE_ID")
       continue
     fi
@@ -207,6 +248,11 @@ fn-scheduler-docker-local-retire-images() {
     fi
 
     if echo "$RM_OUTPUT" | grep -q "image is being used by running container"; then
+      if fn-scheduler-docker-local-image-in-use-by-app "$RETIRE_APP" "$IMAGE_ID" ""; then
+        dokku_log_warn "Image ${IMAGE_ID} is still in use by ${RETIRE_APP}, removing from retire list"
+        DEAD_IMAGES+=("$IMAGE_ID")
+        continue
+      fi
       dokku_log_warn "Image ${IMAGE_ID} has running containers, skipping rm"
       continue
     fi
@@ -219,6 +265,15 @@ fn-scheduler-docker-local-retire-images() {
   done
 
   sort -o "$DEAD_IMAGE_FILE" -r "$DEAD_IMAGE_FILE"
+}
+
+fn-scheduler-docker-local-image-is-app-latest() {
+  declare desc="returns 0 if IMAGE_ID is the image currently tagged as the app's latest image"
+  declare APP="$1" IMAGE_ID="$2"
+  local LATEST_IMAGE_ID
+
+  LATEST_IMAGE_ID="$("$DOCKER_BIN" image inspect --format "{{ .Id }}" "$(get_app_image_repo "$APP"):latest" 2>/dev/null || true)"
+  [[ -n "$LATEST_IMAGE_ID" ]] && [[ "$LATEST_IMAGE_ID" == "$IMAGE_ID" ]]
 }
 
 fn-scheduler-docker-local-register-retired() {
@@ -237,16 +292,49 @@ fn-scheduler-docker-local-register-retired() {
   fi
 }
 
+fn-scheduler-docker-local-image-in-use-by-app() {
+  declare desc="returns 0 if IMAGE_ID is used by an app container that is not already pending retirement"
+  declare APP="$1" IMAGE_ID="$2" EXCLUDE_CONTAINER_ID="$3"
+  local DEAD_CONTAINER_FILE="${DOKKU_LIB_ROOT}/data/scheduler-docker-local/dead-containers"
+  local cid exclude_full_id container_image short_cid
+
+  if [[ -z "$IMAGE_ID" ]]; then
+    return 1
+  fi
+
+  if [[ -n "$EXCLUDE_CONTAINER_ID" ]]; then
+    exclude_full_id="$("$DOCKER_BIN" container inspect "$EXCLUDE_CONTAINER_ID" --format '{{.Id}}' 2>/dev/null || true)"
+  fi
+
+  for cid in $("$DOCKER_BIN" container ls -q --no-trunc -f label=com.dokku.app-name="$APP" 2>/dev/null); do
+    [[ -z "$cid" ]] && continue
+    if [[ -n "$exclude_full_id" ]] && [[ "$cid" == "$exclude_full_id" ]]; then
+      continue
+    fi
+
+    short_cid="${cid:0:12}"
+    if [[ -f "$DEAD_CONTAINER_FILE" ]] && grep -q "$short_cid" "$DEAD_CONTAINER_FILE"; then
+      continue
+    fi
+
+    container_image="$("$DOCKER_BIN" container inspect "$cid" --format '{{.Image}}' 2>/dev/null | cut -d: -f2 || true)"
+    if [[ -n "$container_image" ]] && [[ "$container_image" == "$IMAGE_ID" ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
 fn-scheduler-docker-local-start-app-container() {
   declare desc="starts a single app container"
   declare APP="$1"
   shift
 
-  local DOCKER_ARGS
+  declare -a DOCKER_ARGS
   for i in "$@"; do
-    DOCKER_ARGS="$DOCKER_ARGS \"$i\""
+    DOCKER_ARGS+=("$i")
   done
-  eval set -- $DOCKER_ARGS
+  set -- "${DOCKER_ARGS[@]}"
 
   eval "$(config_export app "$APP" --merged)"
   # shellcheck disable=SC2124

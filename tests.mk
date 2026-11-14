@@ -1,5 +1,7 @@
-SYSTEM := $(shell sh -c 'uname -s 2>/dev/null')
 DOKKU_SSH_PORT ?= 22
+DOKKU_DOMAIN ?= dokku.me
+GO_PLUGINS := $(shell sh -c 'find plugins -type f -name "go.mod" -exec dirname "{}" \; | sort -u | sed -e "s/$$/\/.../" | xargs')
+SYSTEM := $(shell sh -c 'uname -s 2>/dev/null')
 
 bats:
 ifeq ($(SYSTEM),Darwin)
@@ -13,7 +15,7 @@ else
 endif
 
 shellcheck:
-ifneq ($(shell shellcheck --version >/dev/null 2>&1 ; echo $$?),0)
+ifneq ($(shell shellcheck --version >/dev/null 2>&1; echo $$?),0)
 ifeq ($(SYSTEM),Darwin)
 	brew install shellcheck
 else
@@ -22,11 +24,11 @@ endif
 endif
 
 shfmt:
-ifneq ($(shell shfmt --version >/dev/null 2>&1 ; echo $$?),0)
-ifeq ($(shfmt),Darwin)
+ifneq ($(shell shfmt --version >/dev/null 2>&1; echo $$?),0)
+ifeq ($(SYSTEM),Darwin)
 	brew install shfmt
 else
-	wget -qO /tmp/shfmt https://github.com/mvdan/sh/releases/download/v2.6.2/shfmt_v2.6.2_linux_amd64
+	wget -qO /tmp/shfmt https://github.com/mvdan/sh/releases/download/v3.5.1/shfmt_v3.5.1_linux_${TARGETARCH}
 	chmod +x /tmp/shfmt
 	sudo mv /tmp/shfmt /usr/local/bin/shfmt
 endif
@@ -41,15 +43,23 @@ else
 endif
 endif
 
-ci-dependencies: bats shellcheck xmlstarlet
+ci-dependencies: bats shellcheck xmlstarlet docker-apt-repo
+
+docker-apt-repo:
+ifdef INSTALL_DOCKER_REPO
+	curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor --yes -o /usr/share/keyrings/docker.gpg
+	echo "deb [arch=amd64 signed-by=/usr/share/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(shell . /etc/os-release && echo "$$VERSION_CODENAME") stable" | sudo tee /etc/apt/sources.list.d/docker.list
+	sudo apt update
+	sudo apt-get -qq -y --no-install-recommends install docker-buildx-plugin docker-compose-plugin
+endif
 
 setup-deploy-tests:
 ifdef ENABLE_DOKKU_TRACE
 	echo "-----> Enable dokku trace"
 	dokku trace:on
 endif
-	@echo "Setting dokku.me in /etc/hosts"
-	sudo /bin/bash -c "[[ `ping -c1 dokku.me >/dev/null 2>&1; echo $$?` -eq 0 ]] || echo \"127.0.0.1  dokku.me *.dokku.me www.test.app.dokku.me\" >> /etc/hosts"
+	@echo "Setting $(DOKKU_DOMAIN) in /etc/hosts"
+	sudo /bin/bash -c "[[ `ping -c1 $(DOKKU_DOMAIN) >/dev/null 2>&1; echo $$?` -eq 0 ]] || echo \"127.0.0.1  $(DOKKU_DOMAIN) *.$(DOKKU_DOMAIN) www.test.app.$(DOKKU_DOMAIN)\" >> /etc/hosts"
 
 	@echo "-----> Generating keypair..."
 	mkdir -p /root/.ssh
@@ -61,10 +71,10 @@ endif
 
 	@echo "-----> Setting up ssh config..."
 ifneq ($(shell ls /root/.ssh/config >/dev/null 2>&1 ; echo $$?),0)
-	echo "Host dokku.me \\r\\n Port $(DOKKU_SSH_PORT) \\r\\n RequestTTY yes \\r\\n IdentityFile /root/.ssh/dokku_test_rsa" >> /root/.ssh/config
+	echo "Host $(DOKKU_DOMAIN) \\r\\n Port $(DOKKU_SSH_PORT) \\r\\n RequestTTY yes \\r\\n IdentityFile /root/.ssh/dokku_test_rsa" >> /root/.ssh/config
 	echo "Host 127.0.0.1 \\r\\n Port 22333 \\r\\n RequestTTY yes \\r\\n IdentityFile /root/.ssh/dokku_test_rsa" >> /root/.ssh/config
-else ifeq ($(shell grep dokku.me /root/.ssh/config),)
-	echo "Host dokku.me \\r\\n Port $(DOKKU_SSH_PORT) \\r\\n RequestTTY yes \\r\\n IdentityFile /root/.ssh/dokku_test_rsa" >> /root/.ssh/config
+else ifeq ($(shell grep $(DOKKU_DOMAIN) /root/.ssh/config),)
+	echo "Host $(DOKKU_DOMAIN) \\r\\n Port $(DOKKU_SSH_PORT) \\r\\n RequestTTY yes \\r\\n IdentityFile /root/.ssh/dokku_test_rsa" >> /root/.ssh/config
 	echo "Host 127.0.0.1 \\r\\n Port 22333 \\r\\n RequestTTY yes \\r\\n IdentityFile /root/.ssh/dokku_test_rsa" >> /root/.ssh/config
 else
 	sed --in-place 's/Port 22 \r/Port $(DOKKU_SSH_PORT) \r/g' /root/.ssh/config
@@ -76,7 +86,11 @@ ifneq ($(wildcard /etc/ssh/sshd_config),)
 ifeq ($(shell grep 22333 /etc/ssh/sshd_config),)
 	sed --in-place "s:^Port 22:Port 22 \\nPort 22333:g" /etc/ssh/sshd_config
 endif
-	service ssh restart
+ifeq ($(shell grep 22333 /usr/lib/systemd/system/ssh.socket),)
+	sed --in-place "s:^ListenStream=22:ListenStream=22 \\nListenStream=22333:g" /usr/lib/systemd/system/ssh.socket
+endif
+	systemctl daemon-reload || true
+	systemctl restart ssh.socket || service ssh restart
 endif
 
 	@echo "-----> Installing SSH public key..."
@@ -86,9 +100,9 @@ endif
 	chmod 700 /home/dokku/.ssh
 	chmod 600 /home/dokku/.ssh/authorized_keys
 
-ifeq ($(shell grep dokku.me /home/dokku/VHOST 2>/dev/null),)
-	@echo "-----> Setting default VHOST to dokku.me..."
-	echo "dokku.me" > /home/dokku/VHOST
+ifeq ($(shell grep $(DOKKU_DOMAIN) /home/dokku/VHOST 2>/dev/null),)
+	@echo "-----> Setting default VHOST to $(DOKKU_DOMAIN)..."
+	echo "$(DOKKU_DOMAIN)" > /home/dokku/VHOST
 endif
 ifeq ($(DOKKU_SSH_PORT), 22)
 	$(MAKE) prime-ssh-known-hosts
@@ -105,21 +119,24 @@ endif
 
 prime-ssh-known-hosts:
 	@echo "-----> Intitial SSH connection to populate known_hosts..."
-	@echo "=====> SSH dokku.me"
-	ssh -o StrictHostKeyChecking=no dokku@dokku.me help >/dev/null
+	@echo "=====> SSH $(DOKKU_DOMAIN)"
+	ssh -o StrictHostKeyChecking=no dokku@$(DOKKU_DOMAIN) help
 	@echo "=====> SSH 127.0.0.1"
-	ssh -o StrictHostKeyChecking=no dokku@127.0.0.1 help >/dev/null
+	ssh -o StrictHostKeyChecking=no dokku@127.0.0.1 help
 
 lint-setup:
 	@mkdir -p test-results/shellcheck tmp/shellcheck
 	@find . -not -path '*/\.*' -not -path './debian/*' -not -path './docs/*' -not -path './tests/*' -not -path './vendor/*' -type f | xargs file | grep text | awk -F ':' '{ print $$1 }' | xargs head -n1 | grep -B1 "bash" | grep "==>" | awk '{ print $$2 }' > tmp/shellcheck/test-files
-	@cat tests/shellcheck-exclude | sed -n -e '/^# SC/p' | cut -d' ' -f2 | paste -d, -s > tmp/shellcheck/exclude
+	@cat .shellcheckrc | sed -n -e '/^# SC/p' | cut -d' ' -f2 | paste -d, -s > tmp/shellcheck/exclude
 
 lint-ci: lint-setup
 	# these are disabled due to their expansive existence in the codebase. we should clean it up though
-	@cat tests/shellcheck-exclude | sed -n -e '/^# SC/p'
+	@cat .shellcheckrc | sed -n -e '/^# SC/p'
 	@echo linting...
-	@cat tmp/shellcheck/test-files | xargs shellcheck -e $(shell cat tmp/shellcheck/exclude) | tests/shellcheck-to-junit --output test-results/shellcheck/results.xml --files tmp/shellcheck/test-files --exclude $(shell cat tmp/shellcheck/exclude)
+	@cat tmp/shellcheck/test-files | xargs shellcheck | tests/shellcheck-to-junit --output test-results/shellcheck/results.xml --files tmp/shellcheck/test-files --exclude $(shell cat tmp/shellcheck/exclude)
+
+lint-golang:
+	golangci-lint run $(GO_PLUGINS)
 
 lint-shfmt: shfmt
 	# verifying via shfmt
@@ -129,14 +146,18 @@ lint-shfmt: shfmt
 lint: lint-shfmt lint-ci
 
 ci-go-coverage:
+	@$(MAKE) ci-go-coverage-plugin PLUGIN_NAME=certs
 	@$(MAKE) ci-go-coverage-plugin PLUGIN_NAME=common
 	@$(MAKE) ci-go-coverage-plugin PLUGIN_NAME=config
+	@$(MAKE) ci-go-coverage-plugin PLUGIN_NAME=docker-options
 	@$(MAKE) ci-go-coverage-plugin PLUGIN_NAME=network
+	@$(MAKE) ci-go-coverage-plugin PLUGIN_NAME=buildpacks
 
 ci-go-coverage-plugin:
 	mkdir -p test-results/coverage
 	docker run --rm \
 		-e DOKKU_ROOT=/home/dokku \
+		-e DOKKU_LIB_ROOT=/var/lib/dokku \
 		-e CODACY_TOKEN=$$CODACY_TOKEN \
 		-e CIRCLE_SHA1=$$CIRCLE_SHA1 \
 		-e GO111MODULE=on \
@@ -144,24 +165,47 @@ ci-go-coverage-plugin:
 		-w $(GO_REPO_ROOT) \
 		$(BUILD_IMAGE) \
 		bash -c "cd plugins/$(PLUGIN_NAME) && \
-			go get github.com/onsi/gomega github.com/schrej/godacov github.com/haya14busa/goverage && \
+			echo 'installing gomega' && \
+			go get github.com/onsi/gomega && \
+			echo 'installing godacov' && \
+			go get github.com/schrej/godacov && \
+			echo 'installing goverage' && \
+			go get github.com/haya14busa/goverage && \
+			go install github.com/haya14busa/goverage && \
+			echo 'running goverage' && \
 			goverage -v -coverprofile=./../../test-results/coverage/$(PLUGIN_NAME).out && \
+			echo 'running godacov' && \
 			(godacov -r ./../../test-results/coverage/$(PLUGIN_NAME).out -c $$CIRCLE_SHA1 -t $$CODACY_TOKEN || true)" || exit $$?
 
 go-tests:
+	@$(MAKE) go-test-plugin PLUGIN_NAME=certs
 	@$(MAKE) go-test-plugin PLUGIN_NAME=common
 	@$(MAKE) go-test-plugin PLUGIN_NAME=config
+	@$(MAKE) go-test-plugin PLUGIN_NAME=cron
+	@$(MAKE) go-test-plugin PLUGIN_NAME=datastore
+	@$(MAKE) go-test-plugin PLUGIN_NAME=docker-options
+	@$(MAKE) go-test-plugin PLUGIN_NAME=logs
 	@$(MAKE) go-test-plugin PLUGIN_NAME=network
+	@$(MAKE) go-test-plugin PLUGIN_NAME=nginx-vhosts
+	@$(MAKE) go-test-plugin PLUGIN_NAME=ps
+	@$(MAKE) go-test-plugin PLUGIN_NAME=registry
+	@$(MAKE) go-test-plugin PLUGIN_NAME=resource
+	@$(MAKE) go-test-plugin PLUGIN_NAME=buildpacks
+	@$(MAKE) go-test-plugin PLUGIN_NAME=scheduler-k3s
+	@$(MAKE) go-test-plugin PLUGIN_NAME=storage
+	@$(MAKE) go-test-plugin PLUGIN_NAME=traefik-vhosts
 
 go-test-plugin:
+	cd plugins/$(PLUGIN_NAME) && DOKKU_ROOT=/home/dokku DOKKU_LIB_ROOT=/var/lib/dokku go test -v -p 1 -race -mod=readonly || exit $$?
+
+go-test-plugin-in-docker:
 	@echo running go unit tests...
 	docker run --rm \
-		-e DOKKU_ROOT=/home/dokku \
 		-e GO111MODULE=on \
 		-v $$PWD:$(GO_REPO_ROOT) \
 		-w $(GO_REPO_ROOT) \
 		$(BUILD_IMAGE) \
-		bash -c "cd plugins/$(PLUGIN_NAME) && go get github.com/onsi/gomega && go test -v -p 1 -race " || exit $$?
+		bash -c "make go-test-plugin PLUGIN_NAME=$(PLUGIN_NAME)" || exit $$?
 
 unit-tests: go-tests
 	@echo running bats unit tests...
@@ -173,87 +217,95 @@ endif
 
 deploy-test-go-fail-predeploy:
 	@echo deploying go-fail-predeploy app...
-	cd tests && ./test_deploy ./apps/go-fail-predeploy dokku.me '' true
+	cd tests && ./test_deploy ./apps/go-fail-predeploy $(DOKKU_DOMAIN) '' true
 
 deploy-test-go-fail-postdeploy:
 	@echo deploying go-fail-postdeploy app...
-	cd tests && ./test_deploy ./apps/go-fail-postdeploy dokku.me '' true
+	cd tests && ./test_deploy ./apps/go-fail-postdeploy $(DOKKU_DOMAIN) '' true
 
 deploy-test-checks-root:
 	@echo deploying checks-root app...
-	cd tests && ./test_deploy ./apps/checks-root dokku.me '' true
+	cd tests && ./test_deploy ./apps/checks-root $(DOKKU_DOMAIN) '' true
 
 deploy-test-main-branch:
 	@echo deploying checks-root app to main branch...
-	cd tests && ./test_deploy ./apps/checks-root dokku.me '' true main
+	cd tests && ./test_deploy ./apps/checks-root $(DOKKU_DOMAIN) '' true main
 
 deploy-test-clojure:
 	@echo deploying config app...
-	cd tests && ./test_deploy ./apps/clojure dokku.me
+	cd tests && ./test_deploy ./apps/clojure $(DOKKU_DOMAIN)
 
 deploy-test-config:
 	@echo deploying config app...
-	cd tests && ./test_deploy ./apps/config dokku.me
+	cd tests && ./test_deploy ./apps/config $(DOKKU_DOMAIN)
+
+deploy-test-coredns-docker-outage:
+	@echo testing nginx-vhosts behavior when coredns-docker is unavailable...
+	cd tests && ./test_coredns_outage $(DOKKU_DOMAIN) docker
 
 deploy-test-dockerfile:
 	@echo deploying dockerfile app...
-	cd tests && ./test_deploy ./apps/dockerfile dokku.me
+	cd tests && ./test_deploy ./apps/dockerfile $(DOKKU_DOMAIN)
 
 deploy-test-dockerfile-noexpose:
 	@echo deploying dockerfile-noexpose app...
-	cd tests && ./test_deploy ./apps/dockerfile-noexpose dokku.me
+	cd tests && ./test_deploy ./apps/dockerfile-noexpose $(DOKKU_DOMAIN)
 
 deploy-test-dockerfile-procfile:
 	@echo deploying dockerfile-procfile app...
-	cd tests && ./test_deploy ./apps/dockerfile-procfile dokku.me
+	cd tests && ./test_deploy ./apps/dockerfile-procfile $(DOKKU_DOMAIN)
 
 deploy-test-gitsubmodules:
 	@echo deploying gitsubmodules app...
-	cd tests && ./test_deploy ./apps/gitsubmodules dokku.me
+	cd tests && ./test_deploy ./apps/gitsubmodules $(DOKKU_DOMAIN)
 
 deploy-test-go:
 	@echo deploying go app...
-	cd tests && ./test_deploy ./apps/go dokku.me
+	cd tests && ./test_deploy ./apps/go $(DOKKU_DOMAIN)
 
 deploy-test-java:
 	@echo deploying java app...
-	cd tests && ./test_deploy ./apps/java dokku.me
+	cd tests && ./test_deploy ./apps/java $(DOKKU_DOMAIN)
 
 deploy-test-multi:
 	@echo deploying multi app...
-	cd tests && ./test_deploy ./apps/multi dokku.me
+	cd tests && ./test_deploy ./apps/multi $(DOKKU_DOMAIN)
 
 deploy-test-nodejs-express:
 	@echo deploying nodejs-express app...
-	cd tests && ./test_deploy ./apps/nodejs-express dokku.me
+	cd tests && ./test_deploy ./apps/nodejs-express $(DOKKU_DOMAIN)
 
 deploy-test-nodejs-express-noprocfile:
 	@echo deploying nodejs-express app with no Procfile...
-	cd tests && ./test_deploy ./apps/nodejs-express-noprocfile dokku.me
+	cd tests && ./test_deploy ./apps/nodejs-express-noprocfile $(DOKKU_DOMAIN)
 
 deploy-test-nodejs-worker:
 	@echo deploying nodejs-worker app...
-	cd tests && ./test_deploy ./apps/nodejs-worker dokku.me
+	cd tests && ./test_deploy ./apps/nodejs-worker $(DOKKU_DOMAIN)
 
 deploy-test-php:
 	@echo deploying php app...
-	cd tests && ./test_deploy ./apps/php dokku.me
+	cd tests && ./test_deploy ./apps/php $(DOKKU_DOMAIN)
 
 deploy-test-python-flask:
 	@echo deploying python-flask app...
-	cd tests && ./test_deploy ./apps/python-flask dokku.me
+	cd tests && ./test_deploy ./apps/python-flask $(DOKKU_DOMAIN)
 
 deploy-test-ruby:
 	@echo deploying ruby app...
-	cd tests && ./test_deploy ./apps/ruby dokku.me
+	cd tests && ./test_deploy ./apps/ruby $(DOKKU_DOMAIN)
 
 deploy-test-scala:
 	@echo deploying scala app...
-	cd tests && ./test_deploy ./apps/scala dokku.me
+	cd tests && ./test_deploy ./apps/scala $(DOKKU_DOMAIN)
 
 deploy-test-static:
 	@echo deploying static app...
-	cd tests && ./test_deploy ./apps/static dokku.me
+	cd tests && ./test_deploy ./apps/static $(DOKKU_DOMAIN)
+
+test-ci-binaries:
+	docker exec dokku bash -c "whereis logrotate" || { echo "logrotate not found" ; exit 1; }
+	docker exec dokku bash -c "whereis rsyslog" || { echo "rsyslog not found" ; exit 1; }
 
 deploy-tests:
 	@echo running deploy tests...
@@ -290,4 +342,34 @@ tests-ci-retry-failed:
 	tar xzf /tmp/bats-retry.tgz -C /usr/local/bin
 	bats-retry --execute test-results/bats
 
-test-ci-docker: setup-docker-deploy-tests deploy-test-checks-root deploy-test-config deploy-test-multi deploy-test-go-fail-predeploy deploy-test-go-fail-postdeploy
+deploy-test-storage-lib-host-root:
+	@echo deploy-test-storage-lib-host-root
+	cd tests/docker && bats storage.bats
+
+test-ci-docker: setup-docker-deploy-tests deploy-test-checks-root deploy-test-config deploy-test-multi deploy-test-go-fail-predeploy deploy-test-go-fail-postdeploy deploy-test-storage-lib-host-root deploy-test-coredns-docker-outage test-ci-binaries
+
+generate-ssl-tars: generate-ssl-tar generate-ssl-sans-tar generate-ssl-wildcard-tar
+
+generate-ssl-tar:
+	rm -rf /tmp/dokku-server_ssl
+	mkdir -p /tmp/dokku-server_ssl
+	openssl req -x509 -newkey rsa:4096 -sha256 -nodes -keyout /tmp/dokku-server_ssl/server.key          -out /tmp/dokku-server_ssl/server.crt -subj "/CN=$(DOKKU_DOMAIN)" -days 3650
+	rm tests/unit/server_ssl.tar
+	cd /tmp/dokku-server_ssl && tar cvf $(PWD)/tests/unit/server_ssl.tar server.key server.crt
+	tar -tvf tests/unit/server_ssl.tar
+
+generate-ssl-sans-tar:
+	rm -rf /tmp/dokku-server_ssl_sans
+	mkdir -p /tmp/dokku-server_ssl_sans
+	openssl req -x509 -newkey rsa:4096 -sha256 -nodes -keyout /tmp/dokku-server_ssl_sans/server.key     -out /tmp/dokku-server_ssl_sans/server.crt -subj "/CN=test.$(DOKKU_DOMAIN)" -days 3650 -addext "subjectAltName = DNS:www.test.$(DOKKU_DOMAIN), DNS:www.test.app.$(DOKKU_DOMAIN)"
+	rm tests/unit/server_ssl_sans.tar
+	cd /tmp/dokku-server_ssl_sans && tar cvf $(PWD)/tests/unit/server_ssl_sans.tar server.key server.crt
+	tar -tvf tests/unit/server_ssl_sans.tar
+
+generate-ssl-wildcard-tar:
+	rm -rf /tmp/dokku-server_ssl_wildcard
+	mkdir -p /tmp/dokku-server_ssl_wildcard
+	openssl req -x509 -newkey rsa:4096 -sha256 -nodes -keyout /tmp/dokku-server_ssl_wildcard/server.key -out /tmp/dokku-server_ssl_wildcard/server.crt -subj "/CN=*.$(DOKKU_DOMAIN)" -days 3650
+	rm tests/unit/server_ssl_wildcard.tar
+	cd /tmp/dokku-server_ssl_wildcard && tar cvf $(PWD)/tests/unit/server_ssl_wildcard.tar server.key server.crt
+	tar -tvf tests/unit/server_ssl_wildcard.tar

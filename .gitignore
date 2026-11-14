@@ -11,3 +11,6 @@ test-results/
 stack.tgz
 tmp
 coverage.out
+site
+go.work.sum
+node_modules

@@ -6,7 +6,7 @@
 
 1. Login to your [DigitalOcean](https://m.do.co/c/fe06b043a083) account.
 2. Click **Create a Droplet**.
-3. Under **Choose an image > Marketplace**, search latest **Dokku** release for Ubuntu 20.04 _(version numbers may vary)_.
+3. Under **Choose an image > Marketplace**, search latest **Dokku** release for Ubuntu 24.04 _(version numbers may vary)_.
 4. Under **Choose a size**, select your machine spec.
 5. Under **Choose a datacenter region**, select your region.
 6. Add an SSH Key.
@@ -18,5 +18,17 @@
      1. Simply add a checkmark next to the existing keys you'd like to add.
 7. Under **Finalize and create**, give your Droplet a hostname _(not required)_ and click **Create**.
 8. Once created, copy the IP address to your clipboard.
-9. In a browser, go to the IP address you copied above and fill out the presented form to complete configuration. _Failure to do so may allow others to reconfigure SSH access on your server._
-10. Once the web UI has been submitted, you will be redirected to our [application deployment tutorial](/docs/deployment/application-deployment.md), which will guide you through deploying a sample application to your Dokku server.
+9. In a terminal, ssh onto the server by running `ssh root@$SERVER_IP`, where `$SERVER_IP` is your server's IP address.
+10. Remove the default nginx site via `rm /etc/nginx/sites-enabled/default`
+11. If you added more than one key, use the `dokku ssh-keys:add` to add an ssh key to the dokku user:
+
+    ```shell
+    echo "$CONTENTS_OF_YOUR_PUBLIC_SSH_KEY_HERE" | dokku ssh-keys:add KEY_NAME
+    ```
+
+12. Ensure your server has a correct global hostname via `dokku domains:set-global`
+
+    ```shell
+    # replace dokku.me with a hostname pointed at your server
+    dokku domains:set-global dokku.me
+    ```

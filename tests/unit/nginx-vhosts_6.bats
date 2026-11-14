@@ -9,13 +9,16 @@ setup() {
 }
 
 teardown() {
-  destroy_app 0 $TEST_APP
+  destroy_app
   [[ -f "$DOKKU_ROOT/VHOST.bak" ]] && mv "$DOKKU_ROOT/VHOST.bak" "$DOKKU_ROOT/VHOST" && chown dokku:dokku "$DOKKU_ROOT/VHOST"
   global_teardown
 }
 
 @test "(nginx-vhosts) nginx (no server tokens)" {
-  deploy_app
+  run deploy_app
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
   run /bin/bash -c "curl -s -D - $(dokku url $TEST_APP) -o /dev/null | grep -E '^Server' | grep -E '[0-9]+'"
   echo "output: $output"
   echo "status: $status"
@@ -30,7 +33,7 @@ teardown() {
   echo "output: $output"
   echo "status: $status"
   assert_success
-  assert_output_contains "Enabling HSTS"
+  assert_output_contains "Enabling HSTS" 2
 
   run /bin/bash -c "test -f $HSTS_CONF"
   echo "output: $output"
@@ -53,7 +56,7 @@ teardown() {
   echo "output: $output"
   echo "status: $status"
   assert_success
-  run /bin/bash -c "dokku nginx:build-config $TEST_APP"
+  run /bin/bash -c "dokku proxy:build-config $TEST_APP"
   echo "output: $output"
   echo "status: $status"
   assert_success
@@ -66,7 +69,7 @@ teardown() {
   echo "output: $output"
   echo "status: $status"
   assert_success
-  run /bin/bash -c "dokku nginx:build-config $TEST_APP"
+  run /bin/bash -c "dokku proxy:build-config $TEST_APP"
   echo "output: $output"
   echo "status: $status"
   assert_success
@@ -79,7 +82,7 @@ teardown() {
   echo "output: $output"
   echo "status: $status"
   assert_success
-  run /bin/bash -c "dokku nginx:build-config $TEST_APP"
+  run /bin/bash -c "dokku proxy:build-config $TEST_APP"
   echo "output: $output"
   echo "status: $status"
   assert_success
@@ -93,7 +96,7 @@ teardown() {
   echo "status: $status"
   assert_success
 
-  run /bin/bash -c "dokku nginx:build-config $TEST_APP"
+  run /bin/bash -c "dokku proxy:build-config $TEST_APP"
   echo "output: $output"
   echo "status: $status"
   assert_success
@@ -113,7 +116,7 @@ teardown() {
   echo "output: $output"
   echo "status: $status"
   assert_success
-  assert_output_contains "Enabling HSTS"
+  assert_output_contains "Enabling HSTS" 2
 
   # disable hsts globally
   run /bin/bash -c "dokku nginx:set --global hsts false"
@@ -171,7 +174,7 @@ teardown() {
   echo "status: $status"
   assert_success
 
-  run /bin/bash -c "dokku nginx:build-config $TEST_APP"
+  run /bin/bash -c "dokku proxy:build-config $TEST_APP"
   echo "output: $output"
   echo "status: $status"
   assert_success
@@ -192,7 +195,7 @@ teardown() {
   echo "status: $status"
   assert_success
 
-  run /bin/bash -c "dokku nginx:build-config $TEST_APP"
+  run /bin/bash -c "dokku proxy:build-config $TEST_APP"
   echo "output: $output"
   echo "status: $status"
   assert_success
@@ -205,7 +208,10 @@ teardown() {
 }
 
 @test "(nginx-vhosts) nginx:validate-config" {
-  deploy_app
+  run deploy_app
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
   run /bin/bash -c "dokku nginx:validate-config"
   echo "output: $output"
   echo "status: $status"
@@ -216,7 +222,7 @@ teardown() {
   echo "status: $status"
   assert_success
 
-  echo "invalid config" > "/home/dokku/${TEST_APP}/nginx.conf"
+  echo "invalid config" >"/home/dokku/${TEST_APP}/nginx.conf"
 
   run /bin/bash -c "dokku nginx:validate-config"
   echo "output: $output"
@@ -238,7 +244,7 @@ teardown() {
   echo "status: $status"
   assert_success
 
-  echo "invalid config" > "/home/dokku/${TEST_APP}/nginx.conf"
+  echo "invalid config" >"/home/dokku/${TEST_APP}/nginx.conf"
 
   run /bin/bash -c "dokku nginx:validate-config $TEST_APP --clean"
   echo "output: $output"

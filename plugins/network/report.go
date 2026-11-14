@@ -8,28 +8,46 @@ import (
 
 // ReportSingleApp is an internal function that displays the network report for one or more apps
 func ReportSingleApp(appName string, format string, infoFlag string) error {
-	if err := common.VerifyAppName(appName); err != nil {
-		return err
+	if appName != "--global" {
+		if err := common.VerifyAppName(appName); err != nil {
+			return err
+		}
 	}
 
-	flags := map[string]common.ReportFunc{
-		"--network-bind-all-interfaces":          reportBindAllInterfaces,
-		"--network-attach-post-create":           reportAttachPostCreate,
-		"--network-attach-post-deploy":           reportAttachPostDeploy,
-		"--network-computed-attach-post-create":  reportComputedAttachPostCreate,
-		"--network-computed-attach-post-deploy":  reportComputedAttachPostDeploy,
-		"--network-computed-bind-all-interfaces": reportComputedBindAllInterfaces,
-		"--network-computed-initial-network":     reportComputedInitialNetwork,
-		"--network-computed-tld":                 reportComputedTld,
-		"--network-global-attach-post-create":    reportGlobalAttachPostCreate,
-		"--network-global-attach-post-deploy":    reportGlobalAttachPostDeploy,
-		"--network-global-bind-all-interfaces":   reportGlobalBindAllInterfaces,
-		"--network-global-initial-network":       reportGlobalInitialNetwork,
-		"--network-global-tld":                   reportGlobalTld,
-		"--network-initial-network":              reportInitialNetwork,
-		"--network-static-web-listener":          reportStaticWebListener,
-		"--network-tld":                          reportTld,
-		"--network-web-listeners":                reportWebListeners,
+	var flags map[string]common.ReportFunc
+	if appName == "--global" {
+		flags = map[string]common.ReportFunc{
+			"--network-computed-attach-post-create":  reportComputedAttachPostCreate,
+			"--network-computed-attach-post-deploy":  reportComputedAttachPostDeploy,
+			"--network-computed-bind-all-interfaces": reportComputedBindAllInterfaces,
+			"--network-computed-initial-network":     reportComputedInitialNetwork,
+			"--network-computed-tld":                 reportComputedTld,
+			"--network-global-attach-post-create":    reportGlobalAttachPostCreate,
+			"--network-global-attach-post-deploy":    reportGlobalAttachPostDeploy,
+			"--network-global-bind-all-interfaces":   reportGlobalBindAllInterfaces,
+			"--network-global-initial-network":       reportGlobalInitialNetwork,
+			"--network-global-tld":                   reportGlobalTld,
+		}
+	} else {
+		flags = map[string]common.ReportFunc{
+			"--network-bind-all-interfaces":          reportBindAllInterfaces,
+			"--network-attach-post-create":           reportAttachPostCreate,
+			"--network-attach-post-deploy":           reportAttachPostDeploy,
+			"--network-computed-attach-post-create":  reportComputedAttachPostCreate,
+			"--network-computed-attach-post-deploy":  reportComputedAttachPostDeploy,
+			"--network-computed-bind-all-interfaces": reportComputedBindAllInterfaces,
+			"--network-computed-initial-network":     reportComputedInitialNetwork,
+			"--network-computed-tld":                 reportComputedTld,
+			"--network-global-attach-post-create":    reportGlobalAttachPostCreate,
+			"--network-global-attach-post-deploy":    reportGlobalAttachPostDeploy,
+			"--network-global-bind-all-interfaces":   reportGlobalBindAllInterfaces,
+			"--network-global-initial-network":       reportGlobalInitialNetwork,
+			"--network-global-tld":                   reportGlobalTld,
+			"--network-initial-network":              reportInitialNetwork,
+			"--network-static-web-listener":          reportStaticWebListener,
+			"--network-tld":                          reportTld,
+			"--network-web-listeners":                reportWebListeners,
+		}
 	}
 
 	flagKeys := []string{}
@@ -37,10 +55,18 @@ func ReportSingleApp(appName string, format string, infoFlag string) error {
 		flagKeys = append(flagKeys, flagKey)
 	}
 
-	trimPrefix := false
-	uppercaseFirstCharacter := true
 	infoFlags := common.CollectReport(appName, infoFlag, flags)
-	return common.ReportSingleApp("network", appName, infoFlag, infoFlags, flagKeys, format, trimPrefix, uppercaseFirstCharacter)
+	return common.ReportSingleApp(common.ReportSingleAppInput{
+		ReportType:              "network",
+		AppName:                 appName,
+		InfoFlag:                infoFlag,
+		InfoFlags:               infoFlags,
+		InfoFlagKeys:            flagKeys,
+		Format:                  format,
+		TrimPrefix:              true,
+		UppercaseFirstCharacter: true,
+		EmitLegacyPrefix:        true,
+	})
 }
 
 func reportAttachPostCreate(appName string) string {
@@ -78,6 +104,9 @@ func reportComputedBindAllInterfaces(appName string) string {
 	if value == "" {
 		value = reportGlobalBindAllInterfaces(appName)
 	}
+	if value == "" {
+		value = "false"
+	}
 
 	return value
 }
@@ -109,7 +138,7 @@ func reportGlobalAttachPostDeploy(appName string) string {
 }
 
 func reportGlobalBindAllInterfaces(appName string) string {
-	return common.PropertyGetDefault("network", "--global", "bind-all-interfaces", "false")
+	return common.PropertyGet("network", "--global", "bind-all-interfaces")
 }
 
 func reportGlobalInitialNetwork(appName string) string {

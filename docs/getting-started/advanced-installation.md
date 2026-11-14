@@ -12,7 +12,6 @@ As well, you may wish to customize your installation in some other fashion. or e
 
 - [Debian Package Installation Notes](/docs/getting-started/install/debian.md)
 - [Docker-based Installation Notes](/docs/getting-started/install/docker.md)
-- [RPM Package Installation Notes](/docs/getting-started/install/rpm.md)
 - [Vagrant Installation Notes](/docs/getting-started/install/vagrant.md)
 - [Advanced Install Customization](/docs/getting-started/advanced-installation.md)
 - [Automated deployment via ansible](https://github.com/dokku/ansible-dokku)
@@ -23,7 +22,7 @@ You can always install Dokku straight from the latest - potentially unstable - `
 
 ```shell
 # using a branch results in installing from source
-wget https://raw.githubusercontent.com/dokku/dokku/master/bootstrap.sh;
+wget -NP . https://dokku.com/install/master/bootstrap.sh;
 sudo DOKKU_BRANCH=master bash bootstrap.sh
 ```
 
@@ -37,6 +36,12 @@ cd dokku
 sudo make install
 ```
 
+The `Makefile` installs dependencies and builds plugins for the architecture of the host it runs on. The `TARGETARCH` environment variable overrides the architecture used for both the downloaded dependencies and the plugin builds, while the `GOARCH` environment variable overrides the architecture used for the plugin builds only. Example:
+
+```shell
+sudo TARGETARCH=arm64 make install
+```
+
 The `Makefile` allows source URLs to be overridden to include customizations from your own repositories. The `DOCKER_URL`, `PLUGN_URL`, `SSHCOMMAND_URL` and `STACK_URL` environment variables may be set to override the defaults (see the `Makefile` for how these apply). Example:
 
 ```shell
@@ -48,14 +53,39 @@ sudo SSHCOMMAND_URL=https://raw.githubusercontent.com/yourusername/sshcommand/ma
 The bootstrap script allows the Dokku repository URL to be overridden to bootstrap a host from your own clone of Dokku using the `DOKKU_REPO` environment variable. Example:
 
 ```shell
-wget https://raw.githubusercontent.com/dokku/dokku/master/bootstrap.sh;
+wget -NP . https://dokku.com/install/master/bootstrap.sh;
 chmod +x bootstrap.sh
 sudo DOKKU_REPO=https://github.com/yourusername/dokku.git DOKKU_BRANCH=master ./bootstrap.sh
 ```
 
+## Bootstrap script output and logs
+
+When run from a terminal, the bootstrap script shows each install step with a spinner and the last few lines of output from the running step. When the output is not a terminal - such as in CI, Vagrant, or when piping to a file - it prints one line when each step starts and one when it finishes.
+
+All command output is written to a log file at `/var/log/dokku/install-<timestamp>.log`, with a timestamp on every line. If a step fails, the full output of the failed step is printed along with the path to the full log.
+
+The following environment variables change the output:
+
+- `DOKKU_VERBOSE=1`: Stream the full output of every command instead of the condensed view.
+- `TRACE=1`: Same as `DOKKU_VERBOSE=1`, and also enables `set -x`.
+- `NO_COLOR=1`: Disable colors.
+
+```shell
+sudo DOKKU_TAG=v0.38.32 DOKKU_VERBOSE=1 bash bootstrap.sh
+```
+
+## Automatic configuration by the bootstrap script
+
+After installing, the bootstrap script fills in configuration that is still missing:
+
+- SSH keys: If no SSH keys have been added to Dokku, `DOKKU_SKIP_KEY_FILE` is not `true`, and `/root/.ssh/authorized_keys` contains keys, each key is added via `dokku ssh-keys:add`. The first key is named `admin`, and any others are named `admin-2`, `admin-3`, and so on.
+- Global domain: If no global domain is set, it is set to the server's primary IPv4 address via `dokku domains:set-global`. On a server behind NAT, this is the private address.
+
+Anything already configured - for example via the `DOKKU_KEY_FILE` or `DOKKU_HOSTNAME` debconf settings - is left as is. The summary at the end of the install shows what was configured, along with the commands to configure anything that was not.
+
 ## Custom Herokuish build
 
-Dokku ships with a pre-built version of version of the [Herokuish](https://github.com/gliderlabs/herokuish) component by default. If you want to build your own version you can specify that with an environment variable.
+Dokku ships with a pre-built version of the [Herokuish](https://github.com/gliderlabs/herokuish) component by default. If you want to build your own version you can specify that with an environment variable.
 
 ```shell
 git clone https://github.com/dokku/dokku.git
@@ -79,7 +109,7 @@ Follow the [user management documentation](/docs/deployment/user-management.md) 
 
 ## VMs with less than 1 GB of memory
 
-Having less than 1 GB of system memory available for Dokku and its containers may result in unexpected errors, such as `! [remote rejected] master -> master (pre-receive hook declined)` during installation of NPM dependencies (https://github.com/npm/npm/issues/3867).
+Having less than 1 GB of system memory available for Dokku and its containers may result in unexpected errors, such as `! [remote rejected] master -> master (pre-receive hook declined)` [during installation of NPM dependencies](https://github.com/npm/npm/issues/3867).
 
 To work around this issue, it might suffice to augment the Linux swap file size to a maximum of twice the physical memory size.
 
@@ -90,6 +120,7 @@ cd /var
 touch swap.img
 chmod 600 swap.img
 
+swapoff /var/swap.img
 dd if=/dev/zero of=/var/swap.img bs=1024k count=1000
 mkswap /var/swap.img
 swapon /var/swap.img
@@ -98,4 +129,8 @@ free
 echo "/var/swap.img    none    swap    sw    0    0" >> /etc/fstab
 ```
 
+Note: it may be necessary to call swapoff, mkswap and swapon explicitly: `sudo /sbin/swapoff /var/swap.img`, etc.
+
 [Reference](https://www.digitalocean.com/community/tutorials/how-to-configure-virtual-memory-swap-file-on-a-vps)
+
+[Add'l Reference](https://serverfault.com/questions/994297/increase-swap-file-size-that-already-exists-ec-2-linux)

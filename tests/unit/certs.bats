@@ -41,11 +41,261 @@ teardown() {
   assert_output "$help_output"
 }
 
+@test "(certs:report) info-flag works before deploy" {
+  run /bin/bash -c "dokku certs:report $TEST_APP --ssl-hostnames"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku certs:report $TEST_APP --ssl-dir"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output_contains "/$TEST_APP/tls"
+
+  run /bin/bash -c "dokku certs:report $TEST_APP --ssl-fingerprint"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output ""
+
+  run /bin/bash -c "dokku certs:report $TEST_APP --ssl-serial"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output ""
+
+  run /bin/bash -c "dokku certs:report $TEST_APP --ssl-invalid-flag"
+  echo "output: $output"
+  echo "status: $status"
+  assert_failure
+  assert_output_contains "Invalid flag passed"
+}
+
+@test "(certs:report) --global --format json" {
+  run /bin/bash -c "dokku certs:report --global --format json | jq -e ."
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "{}"
+
+  run /bin/bash -c "dokku certs:report --global"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output_contains "global ssl information"
+
+  run /bin/bash -c "dokku certs:report --global --ssl-bogus"
+  echo "output: $output"
+  echo "status: $status"
+  assert_failure
+  assert_output_contains "Invalid flag passed"
+}
+
+@test "(certs:report) reports hostnames and subject for a CN-only certificate" {
+  run /bin/bash -c "dokku certs:add $TEST_APP $BATS_TMPDIR/tls/server.crt $BATS_TMPDIR/tls/server.key"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku certs:report $TEST_APP --ssl-hostnames"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "dokku.me"
+
+  run /bin/bash -c "dokku certs:report $TEST_APP --ssl-subject"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "CN=dokku.me"
+}
+
+@test "(certs:report) preserves multi-field subject order" {
+  run /bin/bash -c "dokku certs:add $TEST_APP $BATS_TMPDIR/tls/domain.com.crt $BATS_TMPDIR/tls/domain.com.key"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku certs:report $TEST_APP --ssl-subject"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "C=US; ST=California; L=San Francisco; O=Expa; OU=Operations; CN=node-js-app.dokku.me"
+
+  run /bin/bash -c "dokku certs:report $TEST_APP --ssl-hostnames"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "node-js-app.dokku.me"
+}
+
+@test "(certs:report) reports the certificate fingerprint and serial" {
+  local EXPECTED_FINGERPRINT EXPECTED_SERIAL
+  EXPECTED_FINGERPRINT="$(openssl x509 -in "$BATS_TMPDIR/tls/server.crt" -noout -fingerprint -sha256 | cut -d= -f2-)"
+  EXPECTED_SERIAL="$(openssl x509 -in "$BATS_TMPDIR/tls/server.crt" -noout -serial | cut -d= -f2-)"
+
+  run /bin/bash -c "dokku certs:add $TEST_APP $BATS_TMPDIR/tls/server.crt $BATS_TMPDIR/tls/server.key"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku certs:report $TEST_APP --ssl-fingerprint"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "$EXPECTED_FINGERPRINT"
+
+  run /bin/bash -c "dokku certs:report $TEST_APP --ssl-serial"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "$EXPECTED_SERIAL"
+
+  run /bin/bash -c "dokku certs:report $TEST_APP --format json | jq -r '.fingerprint'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "$EXPECTED_FINGERPRINT"
+
+  run /bin/bash -c "dokku certs:report $TEST_APP --format json | jq -r '.serial'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "$EXPECTED_SERIAL"
+}
+
+@test "(certs:report) fingerprint and serial follow a replaced certificate" {
+  local EXPECTED_FINGERPRINT EXPECTED_SERIAL
+  EXPECTED_FINGERPRINT="$(openssl x509 -in "$BATS_TMPDIR/tls/domain.com.crt" -noout -fingerprint -sha256 | cut -d= -f2-)"
+  EXPECTED_SERIAL="$(openssl x509 -in "$BATS_TMPDIR/tls/domain.com.crt" -noout -serial | cut -d= -f2-)"
+
+  run /bin/bash -c "dokku certs:add $TEST_APP $BATS_TMPDIR/tls/server.crt $BATS_TMPDIR/tls/server.key"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku certs:report $TEST_APP --ssl-fingerprint"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_not_output "$EXPECTED_FINGERPRINT"
+
+  run /bin/bash -c "dokku certs:update $TEST_APP $BATS_TMPDIR/tls/domain.com.crt $BATS_TMPDIR/tls/domain.com.key"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku certs:report $TEST_APP --ssl-fingerprint"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "$EXPECTED_FINGERPRINT"
+
+  run /bin/bash -c "dokku certs:report $TEST_APP --ssl-serial"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "$EXPECTED_SERIAL"
+}
+
+@test "(certs:report) reports the CN and all SANs as hostnames" {
+  local SANS_TLS="$BATS_TMPDIR/tls-sans"
+  mkdir -p "$SANS_TLS"
+  tar xf "$BATS_TEST_DIRNAME/server_ssl_sans.tar" -C "$SANS_TLS"
+  sudo chown -R dokku:dokku "$SANS_TLS"
+
+  run /bin/bash -c "dokku certs:add $TEST_APP $SANS_TLS/server.crt $SANS_TLS/server.key"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku certs:report $TEST_APP --ssl-hostnames"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "test.dokku.me www.test.app.dokku.me www.test.dokku.me"
+
+  rm -rf "$SANS_TLS"
+}
+
+@test "(certs) get_ssl_hostnames parses a CN-only certificate" {
+  run /bin/bash -c "dokku certs:add $TEST_APP $BATS_TMPDIR/tls/server.crt $BATS_TMPDIR/tls/server.key"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  source "$PLUGIN_CORE_AVAILABLE_PATH/certs/functions"
+  run get_ssl_hostnames "$TEST_APP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "dokku.me"
+}
+
+@test "(certs) get_ssl_hostnames includes the CN and SANs" {
+  local SANS_TLS="$BATS_TMPDIR/tls-sans"
+  mkdir -p "$SANS_TLS"
+  tar xf "$BATS_TEST_DIRNAME/server_ssl_sans.tar" -C "$SANS_TLS"
+  sudo chown -R dokku:dokku "$SANS_TLS"
+
+  run /bin/bash -c "dokku certs:add $TEST_APP $SANS_TLS/server.crt $SANS_TLS/server.key"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  source "$PLUGIN_CORE_AVAILABLE_PATH/certs/functions"
+  run get_ssl_hostnames "$TEST_APP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_line "test.dokku.me"
+  assert_line "www.test.dokku.me"
+  assert_line "www.test.app.dokku.me"
+  assert_line_count 3
+
+  rm -rf "$SANS_TLS"
+}
+
 @test "(certs) certs:add" {
   run /bin/bash -c "dokku certs:add $TEST_APP $BATS_TMPDIR/tls/server.crt $BATS_TMPDIR/tls/server.key"
   echo "output: $output"
   echo "status: $status"
   assert_success
+}
+
+@test "(certs:add) preserves explicit https:443 port mapping" {
+  run /bin/bash -c "dokku ports:set $TEST_APP http:80:80 https:443:443"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku certs:add $TEST_APP $BATS_TMPDIR/tls/server.crt $BATS_TMPDIR/tls/server.key"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku --quiet ports:report $TEST_APP --ports-map"
+  echo "output: $output"
+  echo "status: $status"
+  assert_output "http:80:80 https:443:443"
+}
+
+@test "(certs:add) adds default https:443 mapping when none exists" {
+  run /bin/bash -c "dokku ports:set $TEST_APP http:80:5000"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku certs:add $TEST_APP $BATS_TMPDIR/tls/server.crt $BATS_TMPDIR/tls/server.key"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku --quiet ports:report $TEST_APP --ports-map"
+  echo "output: $output"
+  echo "status: $status"
+  assert_output "http:80:5000 https:443:5000"
 }
 
 @test "(certs) certs:add with multiple dots in the filename" {
@@ -92,6 +342,44 @@ teardown() {
   assert_success
 }
 
+@test "(certs) certs-set plugin trigger" {
+  run_plugn_trigger certs-set "$TEST_APP" "$BATS_TMPDIR/tls/server.crt" "$BATS_TMPDIR/tls/server.key"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  [[ -f "$DOKKU_ROOT/$TEST_APP/tls/server.crt" ]]
+  [[ -f "$DOKKU_ROOT/$TEST_APP/tls/server.key" ]]
+}
+
+@test "(certs) certs-set plugin trigger missing key file" {
+  run_plugn_trigger certs-set "$TEST_APP" "$BATS_TMPDIR/tls/server.crt" "/nonexistent/server.key"
+  echo "output: $output"
+  echo "status: $status"
+  assert_failure
+  assert_output_contains "KEY file specified not found"
+}
+
+@test "(certs) certs-remove plugin trigger" {
+  run /bin/bash -c "dokku certs:add $TEST_APP $BATS_TMPDIR/tls/server.crt $BATS_TMPDIR/tls/server.key"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run_plugn_trigger certs-remove "$TEST_APP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  [[ ! -d "$DOKKU_ROOT/$TEST_APP/tls" ]]
+}
+
+@test "(certs) certs-remove plugin trigger without endpoint" {
+  run_plugn_trigger certs-remove "$TEST_APP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_failure
+  assert_output_contains "An app-specific SSL endpoint is not defined"
+}
+
 @test "(certs) certs:show" {
   run /bin/bash -c "dokku certs:show fake-app-name 2>&1"
   echo "output: $output"
@@ -114,6 +402,6 @@ teardown() {
   run /bin/bash -c "dokku certs:add $TEST_APP < $BATS_TEST_DIRNAME/server_ssl.tar && dokku certs:show $TEST_APP key"
   echo "output: $output"
   echo "status: $status"
-  assert_output_contains "-----END RSA PRIVATE KEY-----"
+  assert_output_contains "-----END PRIVATE KEY-----"
   assert_success
 }

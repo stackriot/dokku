@@ -4,16 +4,20 @@
 DOKKU_ROOT=${DOKKU_ROOT:=~dokku}
 DOCKER_BIN=${DOCKER_BIN:="docker"}
 DOKKU_LIB_ROOT=${DOKKU_LIB_PATH:="/var/lib/dokku"}
+DOKKU_DOMAIN=${DOKKU_DOMAIN:="dokku.me"}
 PLUGIN_PATH=${PLUGIN_PATH:="$DOKKU_LIB_ROOT/plugins"}
 PLUGIN_AVAILABLE_PATH=${PLUGIN_AVAILABLE_PATH:="$PLUGIN_PATH/available"}
 PLUGIN_ENABLED_PATH=${PLUGIN_ENABLED_PATH:="$PLUGIN_PATH/enabled"}
 PLUGIN_CORE_PATH=${PLUGIN_CORE_PATH:="$DOKKU_LIB_ROOT/core-plugins"}
 PLUGIN_CORE_AVAILABLE_PATH=${PLUGIN_CORE_AVAILABLE_PATH:="$PLUGIN_CORE_PATH/available"}
-CUSTOM_TEMPLATE_SSL_DOMAIN=customssltemplate.dokku.me
+CUSTOM_TEMPLATE_SSL_DOMAIN="customssltemplate.${DOKKU_DOMAIN}"
 UUID=$(uuidgen)
 TEST_APP="rdmtestapp-${UUID}"
 TEST_NETWORK="test-network-${UUID}"
 SKIPPED_TEST_ERR_MSG="previous test failed! skipping remaining tests..."
+TEST_PLUGIN_NAME=smoke-test-plugin
+TEST_PLUGIN_GIT_REPO=https://github.com/dokku/${TEST_PLUGIN_NAME}.git
+TEST_PLUGIN_LOCAL_REPO="$(mktemp -d)/$TEST_PLUGIN_NAME"
 
 # global setup() and teardown()
 # skips remaining tests on first failure
@@ -27,6 +31,7 @@ global_setup() {
 
 global_teardown() {
   [[ -n "$BATS_TEST_COMPLETED" ]] || touch "${BATS_PARENT_TMPNAME}.skip"
+  rm -f "${BATS_PARENT_TMPNAME}.skip" || true
   cleanup_apps
   cleanup_containers
 }
@@ -44,6 +49,15 @@ cleanup_containers() {
   fi
 }
 
+clone_test_plugin() {
+  git clone "$TEST_PLUGIN_GIT_REPO" "$TEST_PLUGIN_LOCAL_REPO"
+}
+
+remove_test_plugin() {
+  rm -rf "${PLUGIN_ENABLED_PATH:?}/$TEST_PLUGIN_NAME" "${PLUGIN_AVAILABLE_PATH:?}/$TEST_PLUGIN_NAME"
+  rm -rf "$TEST_PLUGIN_LOCAL_REPO"
+}
+
 # test functions
 flunk() {
   {
@@ -57,8 +71,6 @@ flunk() {
 }
 
 # ShellCheck doesn't know about $status from Bats
-# shellcheck disable=SC2154
-# shellcheck disable=SC2120
 assert_success() {
   if [[ "$status" -ne 0 ]]; then
     flunk "command failed with exit status $status"
@@ -68,8 +80,6 @@ assert_success() {
 }
 
 # ShellCheck doesn't know about $status from Bats
-# shellcheck disable=SC2154
-# shellcheck disable=SC2120
 assert_failure() {
   if [[ "$status" -eq 0 ]]; then
     flunk "expected failed exit status"
@@ -97,7 +107,6 @@ assert_not_equal() {
 }
 
 # ShellCheck doesn't know about $output from Bats
-# shellcheck disable=SC2154
 assert_output() {
   local expected
   if [[ $# -eq 0 ]]; then
@@ -109,7 +118,6 @@ assert_output() {
 }
 
 # ShellCheck doesn't know about $output from Bats
-# shellcheck disable=SC2154
 assert_not_output() {
   local expected
   if [[ $# -eq 0 ]]; then
@@ -121,33 +129,38 @@ assert_not_output() {
 }
 
 # ShellCheck doesn't know about $output from Bats
-# shellcheck disable=SC2154
 assert_output_exists() {
   [[ -n "$output" ]] || flunk "expected output, found none"
 }
 
 # ShellCheck doesn't know about $output from Bats
-# shellcheck disable=SC2154
 assert_output_not_exists() {
   [[ -z "$output" ]] || flunk "expected no output, found some"
 }
 
 # ShellCheck doesn't know about $output from Bats
-# shellcheck disable=SC2154
 assert_output_contains() {
   local input="$output"
   local expected="$1"
   local count="${2:-1}"
-  local found=0
-  until [ "${input/$expected/}" = "$input" ]; do
-    input="${input/$expected/}"
-    found=$((found + 1))
-  done
-  assert_equal "$count" "$found"
+  local found
+  found=$(printf '%s' "$input" | { grep -F -o -- "$expected" || true; } | wc -l | tr -d ' ')
+
+  if [[ "$count" -eq -1 ]]; then
+    if [[ "$found" -gt 0 ]]; then
+      return 0
+    fi
+    flunk "expected at least 1 occurrence of '$expected', found $found"
+  fi
+
+  [[ "$count" -eq "$found" ]] || flunk "expected $count occurrences of '$expected', found $found"
+}
+
+assert_output_not_contains() {
+  assert_output_contains "$1" 0
 }
 
 # ShellCheck doesn't know about $lines from Bats
-# shellcheck disable=SC2154
 assert_line() {
   if [[ "$1" -ge 0 ]] 2>/dev/null; then
     assert_equal "$2" "${lines[$1]}"
@@ -161,7 +174,6 @@ assert_line() {
 }
 
 # ShellCheck doesn't know about $lines from Bats
-# shellcheck disable=SC2154
 assert_line_count() {
   declare EXPECTED="$1"
   local num_lines="${#lines[@]}"
@@ -206,9 +218,7 @@ create_key() {
 }
 
 destroy_app() {
-  local RC="$1"
-  local RC=${RC:=0}
-  local APP="$2"
+  declare RC="${1:-0}" APP="$2"
   local TEST_APP=${APP:=$TEST_APP}
   dokku --force apps:destroy "$TEST_APP"
   return "$RC"
@@ -218,11 +228,70 @@ destroy_key() {
   rm -f /tmp/testkey* &>/dev/null || true
 }
 
-add_domain() {
-  dokku domains:add "$TEST_APP" "$1"
+# Run a plugn trigger via `dokku plugin:trigger`, capturing $output/$status via bats `run`.
+# Optional VAR=VAL pairs before <trigger> are forwarded as extra env vars on the bash command line.
+# Usage: run_plugn_trigger [VAR=VAL ...] <trigger> <args...>
+run_plugn_trigger() {
+  local extra_env=""
+  while [[ "$1" == *=* ]]; do
+    extra_env+=" $1"
+    shift
+  done
+  local TRIGGER="$1"
+  shift
+  run /bin/bash -c "${extra_env} dokku plugin:trigger $TRIGGER $* < /dev/null"
 }
 
-# shellcheck disable=SC2119
+# Run a single plugin's trigger script directly so other plugins' handlers do not fire.
+# Captures $output/$status via bats `run`.
+# Usage: run_plugin_script <plugin_name> <script_name> <args...>
+run_plugin_script() {
+  local PLUGIN_NAME="$1" SCRIPT_NAME="$2"
+  shift 2
+  run /bin/bash -c "PLUGIN_PATH=$PLUGIN_PATH PLUGIN_AVAILABLE_PATH=$PLUGIN_AVAILABLE_PATH PLUGIN_ENABLED_PATH=$PLUGIN_ENABLED_PATH PLUGIN_CORE_AVAILABLE_PATH=$PLUGIN_CORE_AVAILABLE_PATH DOKKU_LIB_ROOT=$DOKKU_LIB_ROOT $PLUGIN_ENABLED_PATH/$PLUGIN_NAME/$SCRIPT_NAME $*"
+}
+
+# Hold the deploy lock for $TEST_APP from a background process, as an in-progress deploy would.
+# Call release_deploy_lock (typically from teardown) to release it.
+hold_deploy_lock() {
+  DEPLOY_LOCK_FILE="$DOKKU_LIB_ROOT/data/apps/$TEST_APP/.deploy.lock"
+  DEPLOY_LOCK_HOLDER_PID_FILE="$(mktemp "/tmp/${DOKKU_DOMAIN}.XXXXX")"
+  chown dokku:dokku "$DEPLOY_LOCK_HOLDER_PID_FILE"
+
+  # the holder writes a build id like a deploy would, then becomes the sleep
+  # process so that killing its pid releases the lock
+  sudo -u dokku bash -c "exec 200>>'$DEPLOY_LOCK_FILE'; flock -n 200 || exit 1; echo test-lock-holder >'$DEPLOY_LOCK_FILE'; echo \$\$ >'$DEPLOY_LOCK_HOLDER_PID_FILE'; exec sleep 120" >/dev/null 2>&1 3>&- &
+
+  local i
+  for i in $(seq 1 20); do
+    if [[ -s "$DEPLOY_LOCK_HOLDER_PID_FILE" ]] && ! flock -n "$DEPLOY_LOCK_FILE" true; then
+      return 0
+    fi
+    sleep 0.5
+  done
+
+  echo "unable to acquire the deploy lock for $TEST_APP"
+  return 1
+}
+
+release_deploy_lock() {
+  if [[ -z "$DEPLOY_LOCK_HOLDER_PID_FILE" ]]; then
+    return 0
+  fi
+
+  local holder_pid i
+  if [[ -s "$DEPLOY_LOCK_HOLDER_PID_FILE" ]]; then
+    holder_pid="$(cat "$DEPLOY_LOCK_HOLDER_PID_FILE")"
+    kill "$holder_pid" &>/dev/null || true
+    for i in $(seq 1 20); do
+      kill -0 "$holder_pid" &>/dev/null || break
+      sleep 0.5
+    done
+  fi
+  rm -f "$DEPLOY_LOCK_FILE" "$DEPLOY_LOCK_HOLDER_PID_FILE"
+  DEPLOY_LOCK_HOLDER_PID_FILE=""
+}
+
 check_urls() {
   local PATTERN="$1"
   run /bin/bash -c "dokku urls $TEST_APP | grep -E \"${PATTERN}\""
@@ -237,6 +306,52 @@ assert_http_success() {
   echo "output: $output"
   echo "status: $status"
   assert_output "200"
+}
+
+assert_http_localhost_response() {
+  local scheme="$1" domain="$2" port="${3:-80}" path="${4:-}" content="${5:-}" status_code="${6:-200}"
+  local retries="${HTTP_ASSERT_RETRIES:-30}" attempt=1
+  while [[ "$attempt" -lt "$retries" ]]; do
+    run curl --connect-to "$domain:$port:localhost:$port" -kSso /dev/null -w "%{http_code}" "$scheme://$domain:$port$path"
+    [[ "$output" == "$status_code" ]] && break
+    sleep 1
+    attempt=$((attempt + 1))
+  done
+  echo "curl: curl --connect-to $domain:$port:localhost:$port -kSso /dev/null -w %{http_code} $scheme://$domain:$port$path"
+  echo "output: $output"
+  echo "status: $status"
+  echo "attempts: $attempt"
+  assert_output "$status_code"
+
+  if [[ -n "$content" ]]; then
+    run curl --connect-to "$domain:$port:localhost:$port" -kSs "$scheme://$domain:$port$path"
+    echo "output: $output"
+    echo "status: $status"
+    assert_output "$content"
+  fi
+}
+
+assert_http_localhost_response_contains() {
+  local scheme="$1" domain="$2" port="${3:-80}" path="${4:-}" content="${5:-}" status_code="${6:-200}"
+  local retries="${HTTP_ASSERT_RETRIES:-30}" attempt=1
+  while [[ "$attempt" -lt "$retries" ]]; do
+    run curl --connect-to "$domain:$port:localhost:$port" -kSso /dev/null -w "%{http_code}" "$scheme://$domain:$port$path"
+    [[ "$output" == "$status_code" ]] && break
+    sleep 1
+    attempt=$((attempt + 1))
+  done
+  echo "curl: curl --connect-to $domain:$port:localhost:$port -kSso /dev/null -w %{http_code} $scheme://$domain:$port$path"
+  echo "output: $output"
+  echo "status: $status"
+  echo "attempts: $attempt"
+  assert_output "$status_code"
+
+  if [[ -n "$content" ]]; then
+    run curl --connect-to "$domain:$port:localhost:$port" -kSs "$scheme://$domain:$port$path"
+    echo "output: $output"
+    echo "status: $status"
+    assert_output_contains "$content"
+  fi
 }
 
 assert_ssl_domain() {
@@ -288,10 +403,14 @@ assert_not_external_port() {
 
 assert_url() {
   url="$1"
-  run /bin/bash -c "dokku url $TEST_APP"
+  run /bin/bash -c "dokku url $TEST_APP | xargs"
+  echo "VHOST: $(cat $DOKKU_ROOT/$TEST_APP/VHOST | xargs)"
+  echo "tls: $(ls $DOKKU_ROOT/$TEST_APP/tls || true)"
+  echo "proxy-is-enabled: $(dokku plugin:trigger proxy-is-enabled "$TEST_APP")"
+  echo "port-map: $(dokku ports:report "$TEST_APP" --ports-map)"
+  echo "url: $(dokku urls $TEST_APP)"
   echo "output: $output"
   echo "status: $status"
-  echo "url: ${url}"
   assert_output "${url}"
 }
 
@@ -299,27 +418,33 @@ assert_urls() {
   # shellcheck disable=SC2124
   urls="$@"
   run /bin/bash -c "dokku urls $TEST_APP | xargs"
+  echo "VHOST: $(cat $DOKKU_ROOT/$TEST_APP/VHOST | xargs)"
+  echo "tls: $(ls $DOKKU_ROOT/$TEST_APP/tls || true)"
+  echo "proxy-is-enabled: $(dokku plugin:trigger proxy-is-enabled "$TEST_APP")"
+  echo "port-map: $(dokku ports:report "$TEST_APP" --ports-map)"
+  echo "urls: $(dokku urls $TEST_APP)"
   echo "output: $output"
   echo "status: $status"
-  echo "urls:" "$urls"
-  assert_output "$urls"
+  for url in "$@"; do
+    assert_output_contains "$url"
+  done
 }
 
 deploy_app() {
   declare APP_TYPE="$1" GIT_REMOTE="$2" CUSTOM_TEMPLATE="$3" CUSTOM_PATH="$4"
   local APP_TYPE=${APP_TYPE:="python"}
-  local GIT_REMOTE=${GIT_REMOTE:="dokku@dokku.me:$TEST_APP"}
+  local GIT_REMOTE=${GIT_REMOTE:="dokku@${DOKKU_DOMAIN}:$TEST_APP"}
   local GIT_REMOTE_BRANCH=${GIT_REMOTE_BRANCH:="master"}
-  local TMP=${CUSTOM_TMP:=$(mktemp -d "/tmp/dokku.me.XXXXX")}
+  local TMP=${CUSTOM_TMP:=$(mktemp -d "/tmp/${DOKKU_DOMAIN}.XXXXX")}
 
   rmdir "$TMP" && cp -r "${BATS_TEST_DIRNAME}/../../tests/apps/$APP_TYPE" "$TMP"
 
-  # shellcheck disable=SC2086
   [[ -n "$CUSTOM_TEMPLATE" ]] && $CUSTOM_TEMPLATE $TEST_APP $TMP/$CUSTOM_PATH
 
   pushd "$TMP" &>/dev/null || exit 1
   [[ -z "$CUSTOM_TMP" ]] && trap 'popd &>/dev/null || true; rm -rf "$TMP"' RETURN INT TERM
 
+  git config --global init.defaultBranch master
   git init
   git config user.email "robot@example.com"
   git config user.name "Test Robot"
@@ -332,23 +457,13 @@ deploy_app() {
   git push target "master:${GIT_REMOTE_BRANCH}" || destroy_app $?
 }
 
-setup_client_repo() {
-  local TMP
-  TMP=$(mktemp -d "/tmp/dokku.me.XXXXX")
-  rmdir "$TMP" && cp -r "${BATS_TEST_DIRNAME}/../../tests/apps/nodejs-express" "$TMP"
-  cd "$TMP" || exit 1
-  git init
-  git config user.email "robot@example.com"
-  git config user.name "Test Robot"
-
-  [[ -f gitignore ]] && mv gitignore .gitignore
-  git add .
-  git commit -m 'initial commit'
-}
-
 setup_test_tls() {
   local TLS_TYPE="$1"
   local TLS="/home/dokku/$TEST_APP/tls"
+
+  if ! dokku apps:exists "$TEST_APP" &>/dev/null; then
+    create_app "$TEST_APP"
+  fi
   mkdir -p "$TLS"
 
   case "$TLS_TYPE" in
@@ -364,6 +479,11 @@ setup_test_tls() {
   esac
   tar xf "$BATS_TEST_DIRNAME/$TLS_ARCHIVE" -C "$TLS"
   sudo chown -R dokku:dokku "${TLS}/.."
+}
+
+teardown_test_tls() {
+  local TLS="/home/dokku/$TEST_APP/tls"
+  rm -rf "$TLS"
 }
 
 custom_ssl_nginx_template() {
@@ -388,15 +508,14 @@ server {
 }
 {{ else if eq \$scheme "https"}}
 server {
-  listen      [::]:{{ $.PROXY_SSL_PORT }} ssl spdy;
-  listen      {{ $.PROXY_SSL_PORT }} ssl spdy;
+  listen      [::]:{{ $.PROXY_SSL_PORT }} ssl;
+  listen      {{ $.PROXY_SSL_PORT }} ssl;
   {{ if $.SSL_SERVER_NAME }}server_name {{ $.SSL_SERVER_NAME }} $CUSTOM_TEMPLATE_SSL_DOMAIN; {{ end }}
   {{ if $.NOSSL_SERVER_NAME }}server_name {{ $.NOSSL_SERVER_NAME }} $CUSTOM_TEMPLATE_SSL_DOMAIN; {{ end }}
   ssl_certificate     {{ $.APP_SSL_PATH }}/server.crt;
   ssl_certificate_key {{ $.APP_SSL_PATH }}/server.key;
 
   keepalive_timeout   70;
-  add_header          Alternate-Protocol  {{ \$listen_port }}:npn-spdy/2;
   location    / {
     proxy_pass  http://{{ $.APP }}-{{ \$upstream_port }};
     proxy_http_version 1.1;
@@ -442,7 +561,7 @@ custom_nginx_template() {
 server {
   listen      [::]:{{ \$listen_port }};
   listen      {{ \$listen_port }};
-  server_name {{ $.NOSSL_SERVER_NAME }} customtemplate.dokku.me;
+  server_name {{ $.NOSSL_SERVER_NAME }} customtemplate.${DOKKU_DOMAIN};
 
   location    / {
     proxy_pass  http://{{ $.APP }}-{{ \$upstream_port }};
@@ -511,74 +630,190 @@ add_release_command() {
   echo "release: touch /app/release.test" >>"$APP_REPO_DIR/Procfile"
 }
 
-add_postdeploy_command() {
+move_dockerfile_into_place() {
   local APP="$1"
   local APP_REPO_DIR="$2"
   [[ -z "$APP" ]] && local APP="$TEST_APP"
-  touch "$APP_REPO_DIR/app.json"
-  contents=$(jq '.scripts.postdeploy = "touch /app/heroku-postdeploy.test"' "$APP_REPO_DIR/app.json")
-  echo "${contents}" >"$APP_REPO_DIR/app.json"
+  mv "$APP_REPO_DIR/alt.Dockerfile" "$APP_REPO_DIR/Dockerfile"
+}
+
+move_expose_dockerfile_into_place() {
+  local APP="$1"
+  local APP_REPO_DIR="$2"
+  [[ -z "$APP" ]] && local APP="$TEST_APP"
+  cat "$APP_REPO_DIR/expose.Dockerfile"
+  mv "$APP_REPO_DIR/expose.Dockerfile" "$APP_REPO_DIR/Dockerfile"
 }
 
 add_requirements_txt() {
   local APP="$1"
   local APP_REPO_DIR="$2"
   [[ -z "$APP" ]] && local APP="$TEST_APP"
+  APP_REPO_DIR="$(realpath "$APP_REPO_DIR")"
+
   echo "flask" >>"$APP_REPO_DIR/requirements.txt"
 }
 
-build_nginx_config() {
-  # simulate nginx post-deploy
-  dokku domains:setup "$TEST_APP"
-  dokku proxy:build-config "$TEST_APP"
+add_requirements_txt_cnb() {
+  local APP="$1"
+  local APP_REPO_DIR="$2"
+  [[ -z "$APP" ]] && local APP="$TEST_APP"
+
+  mv "$APP_REPO_DIR/app-cnb.json" "$APP_REPO_DIR/app.json"
+  add_requirements_txt "$APP" "$APP_REPO_DIR"
 }
 
 create_network() {
-  local NETWORK_NAME="$1:=$TEST_NETWORK"
+  local NETWORK_NAME="${1:-$TEST_NETWORK}"
 
   NETWORK=$(docker network ls -q -f name="$NETWORK_NAME")
   [[ -z "$NETWORK" ]] && docker network create "$NETWORK_NAME"
 }
 
 attach_network() {
-  local NETWORK_NAME="$1:=$TEST_NETWORK"
+  local NETWORK_NAME="${1:-$TEST_NETWORK}"
 
   NETWORK=$(docker network ls -q -f name="$NETWORK_NAME")
   [[ -n "$NETWORK" ]] && docker network connect "$NETWORK_NAME" "${TEST_APP}.web.1"
 }
 
 create_attach_network() {
-  local NETWORK_NAME="$1:=$TEST_NETWORK"
+  local NETWORK_NAME="${1:-$TEST_NETWORK}"
 
   create_network "$NETWORK_NAME"
   attach_network "$NETWORK_NAME"
 }
 
 delete_network() {
-  local NETWORK_NAME="$1:=$TEST_NETWORK"
+  local NETWORK_NAME="${1:-$TEST_NETWORK}"
 
   NETWORK=$(docker network ls -q -f name="$NETWORK_NAME")
   [[ -n "$NETWORK" ]] && docker network rm "$NETWORK_NAME"
 }
 
 detach_network() {
-  local NETWORK_NAME="$1:=$TEST_NETWORK"
+  local NETWORK_NAME="${1:-$TEST_NETWORK}"
 
   NETWORK=$(docker network ls -q -f name="$NETWORK_NAME")
   [[ -z "$NETWORK" ]] && docker network disconnect "$NETWORK_NAME" "${TEST_APP}.web.1"
 }
 
 detach_delete_network() {
-  local NETWORK_NAME="$1:=$TEST_NETWORK"
+  local NETWORK_NAME="${1:-$TEST_NETWORK}"
 
   detach_network "$NETWORK_NAME"
   delete_network "$NETWORK_NAME"
 }
 
+convert_to_dockerfile() {
+  local APP="$1"
+  local APP_REPO_DIR="$2"
+  [[ -z "$APP" ]] && local APP="$TEST_APP"
+  APP_REPO_DIR="$(realpath "$APP_REPO_DIR")"
+
+  mv "$APP_REPO_DIR/dockerfile.Dockerfile" "$APP_REPO_DIR/Dockerfile"
+}
+
 install_pack() {
-  if ! command -v "pack" &>/dev/null; then
-    add-apt-repository --yes ppa:cncf-buildpacks/pack-cli
-    apt-get update
-    apt-get --yes install pack-cli
+  if [[ ! -x /usr/bin/pack ]]; then
+    local DEPS_FILE="${BATS_TEST_DIRNAME}/../../contrib/dependencies.json"
+    local PACK_URL
+    PACK_URL="$(jq -r --arg arch "$(dpkg --print-architecture)" '.dependencies[] | select(.name == "pack") | .urls[$arch]' "$DEPS_FILE")"
+    curl -fsSL "$PACK_URL" | tar -C /usr/bin --no-same-owner -xzf - pack
+    chmod +x /usr/bin/pack
   fi
+}
+
+install_nixpacks() {
+  if ! command -v "nixpacks" &>/dev/null; then
+    curl -sSL https://nixpacks.com/install.sh | FORCE=1 bash
+  fi
+}
+
+install_railpack() {
+  if ! command -v "railpack" &>/dev/null; then
+    curl -sSL https://railpack.com/install.sh | FORCE=1 bash
+  fi
+}
+
+install_k3s() {
+  run /bin/bash -c "dokku proxy:set --global k3s"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku registry:set --global server hub.docker.com"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  local test_basename
+  test_basename="$(basename "$BATS_TEST_FILENAME" .bats)"
+
+  run /bin/bash -c "dokku registry:set --global image-repo-template '$DOCKERHUB_USERNAME/$test_basename-{{ .AppName }}'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku registry:set --global push-on-release true"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku scheduler:set --global selected k3s"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku registry:login docker.io $DOCKERHUB_USERNAME $DOCKERHUB_TOKEN"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output_contains "Login Succeeded"
+
+  INGRESS_CLASS="${INGRESS_CLASS:-traefik}"
+  local args="--ingress-class $INGRESS_CLASS"
+  if [[ "$TAINT_SCHEDULING" == "true" ]]; then
+    args="$args --taint-scheduling"
+  fi
+
+  if [[ -n "$CI_SERVER_IP" ]]; then
+    args="$args --server-ip $CI_SERVER_IP"
+  fi
+
+  if [[ -n "$KUBELET_ARGS" ]]; then
+    args="$args --kubelet-args $KUBELET_ARGS"
+  fi
+
+  run /bin/bash -c "dokku scheduler-k3s:initialize ${args}"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+}
+
+uninstall_k3s() {
+  run /bin/bash -c "dokku scheduler-k3s:uninstall"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+}
+
+run_concurrently() {
+  declare desc="runs a command COUNT times in parallel, appending the run number as the last argument, and fails if any run fails"
+  declare COUNT="$1"
+  shift 1
+  local i pid failed=0
+  local pids=()
+
+  for i in $(seq 1 "$COUNT"); do
+    "$@" "$i" &
+    pids+=("$!")
+  done
+
+  for pid in "${pids[@]}"; do
+    wait "$pid" || failed=$((failed + 1))
+  done
+
+  echo "failed runs: $failed"
+  [[ "$failed" -eq 0 ]]
 }

@@ -27,11 +27,14 @@ func main() {
 	case "report":
 		args := flag.NewFlagSet("logs:report", flag.ExitOnError)
 		format := args.String("format", "stdout", "format: [ stdout | json ]")
-		osArgs, infoFlag, flagErr := common.ParseReportArgs("logs", os.Args[2:])
+		reportArgs, flagErr := common.ParseReportArgs("logs", os.Args[2:])
 		if flagErr == nil {
-			args.Parse(osArgs)
+			args.Parse(reportArgs.OSArgs)
 			appName := args.Arg(0)
-			err = logs.CommandReport(appName, *format, infoFlag)
+			if reportArgs.IsGlobal {
+				appName = "--global"
+			}
+			err = logs.CommandReport(appName, *format, reportArgs.InfoFlag)
 		}
 	case "set":
 		args := flag.NewFlagSet("logs:set", flag.ExitOnError)
@@ -54,7 +57,7 @@ func main() {
 		err = logs.CommandVectorLogs(*num, *tail)
 	case "vector-start":
 		args := flag.NewFlagSet("logs:vector-start", flag.ExitOnError)
-		vectorImage := args.String("vector-image", logs.VectorImage, "--vector-image: the name of the docker image to run for vector")
+		vectorImage := args.String("vector-image", "", "--vector-image: the name of the docker image to run for vector")
 		args.Parse(os.Args[2:])
 		err = logs.CommandVectorStart(*vectorImage)
 	case "vector-stop":

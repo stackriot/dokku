@@ -8,6 +8,183 @@ setup() {
 
 teardown() {
   global_teardown
+  docker image rm "dokku-test/$TEST_APP:shared" &>/dev/null || true
+  start_retire_timer
+}
+
+@test "(scheduler-docker-local:report) --global raw and computed keys" {
+  run /bin/bash -c "dokku scheduler-docker-local:report --global --scheduler-docker-local-global-init-process"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output ""
+
+  run /bin/bash -c "dokku scheduler-docker-local:report --global --scheduler-docker-local-computed-init-process"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "true"
+
+  run /bin/bash -c "dokku scheduler-docker-local:report --global --scheduler-docker-local-global-parallel-schedule-count"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output ""
+
+  run /bin/bash -c "dokku scheduler-docker-local:report --global --scheduler-docker-local-computed-parallel-schedule-count"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "1"
+}
+
+@test "(scheduler-docker-local:report) info-flag works before deploy" {
+  run create_app
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku scheduler-docker-local:report $TEST_APP --scheduler-docker-local-parallel-schedule-count"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output ""
+
+  run /bin/bash -c "dokku scheduler-docker-local:report $TEST_APP --scheduler-docker-local-computed-parallel-schedule-count"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "1"
+
+  run /bin/bash -c "dokku scheduler-docker-local:report $TEST_APP --scheduler-docker-local-global-parallel-schedule-count"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output ""
+
+  run /bin/bash -c "dokku scheduler-docker-local:report $TEST_APP --scheduler-docker-local-init-process"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output ""
+
+  run /bin/bash -c "dokku scheduler-docker-local:report $TEST_APP --scheduler-docker-local-computed-init-process"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "true"
+
+  run /bin/bash -c "dokku scheduler-docker-local:report $TEST_APP --scheduler-docker-local-global-init-process"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output ""
+
+  run /bin/bash -c "dokku scheduler-docker-local:report $TEST_APP --scheduler-docker-local-invalid-flag"
+  echo "output: $output"
+  echo "status: $status"
+  assert_failure
+  assert_output_contains "Invalid flag passed"
+
+  destroy_app
+}
+
+@test "(scheduler-docker-local:report) --format json" {
+  run create_app
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku scheduler-docker-local:report $TEST_APP --format json | jq -e ."
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku scheduler-docker-local:report $TEST_APP --format json | jq -r '.\"init-process\"'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_output ""
+
+  run /bin/bash -c "dokku scheduler-docker-local:report $TEST_APP --format json | jq -r '.\"computed-init-process\"'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_output "true"
+
+  run /bin/bash -c "dokku scheduler-docker-local:report $TEST_APP --format json | jq -r '.\"global-init-process\"'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_output ""
+
+  run /bin/bash -c "dokku scheduler-docker-local:report $TEST_APP --format json | jq -r '.\"parallel-schedule-count\"'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_output ""
+
+  run /bin/bash -c "dokku scheduler-docker-local:report $TEST_APP --format json | jq -r '.\"computed-parallel-schedule-count\"'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_output "1"
+
+  run /bin/bash -c "dokku scheduler-docker-local:report $TEST_APP --format json | jq -r '.\"global-parallel-schedule-count\"'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_output ""
+
+  run /bin/bash -c "dokku scheduler-docker-local:set $TEST_APP init-process false"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku scheduler-docker-local:report $TEST_APP --format json | jq -r '.\"init-process\"'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_output "false"
+
+  run /bin/bash -c "dokku scheduler-docker-local:report $TEST_APP --format json | jq -r '.\"computed-init-process\"'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_output "false"
+
+  destroy_app
+}
+
+@test "(scheduler-docker-local:set) --global" {
+  run /bin/bash -c "dokku scheduler-docker-local:set --global parallel-schedule-count 4"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku scheduler-docker-local:report --global --format json | jq -r '.\"global-parallel-schedule-count\"'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_output "4"
+
+  run create_app
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku scheduler-docker-local:report $TEST_APP --format json | jq -r '.\"parallel-schedule-count\"'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_output ""
+
+  run /bin/bash -c "dokku scheduler-docker-local:report $TEST_APP --format json | jq -r '.\"computed-parallel-schedule-count\"'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_output "4"
+
+  run /bin/bash -c "dokku scheduler-docker-local:report $TEST_APP --format json | jq -r '.\"global-parallel-schedule-count\"'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_output "4"
+
+  run /bin/bash -c "dokku scheduler-docker-local:set --global parallel-schedule-count"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  destroy_app
 }
 
 @test "(scheduler-docker-local) scheduler-docker-local:help" {
@@ -29,4 +206,601 @@ teardown() {
   echo "output: $output"
   echo "status: $status"
   assert_success
+}
+
+@test "(scheduler-docker-local) complex labels" {
+  run create_app
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  # the run command is equivalent to the following line, except with backslashes due to the enclosing doublequotes
+  # dokku docker-options:add test deploy '--label "some.key=Host(\`$TEST_APP.$DOKKU_DOMAIN\`)"'
+  run /bin/bash -c "dokku docker-options:add $TEST_APP deploy '--label \"some.key=Host(\\\`$TEST_APP.$DOKKU_DOMAIN\\\`)\"'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run deploy_app
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "docker inspect --format '{{ index .Config.Labels \"some.key\"}}' $TEST_APP.web.1"
+  echo "output: $output"
+  echo "status: $status"
+  assert_output "Host(\`$TEST_APP.$DOKKU_DOMAIN\`)"
+  assert_success
+}
+
+@test "(scheduler-docker-local) no-web" {
+  run create_app
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku ps:set $TEST_APP procfile-path worker.Procfile"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run deploy_app
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output_contains "Skipping web as it is missing from the current Procfile"
+}
+
+@test "(scheduler-docker-local) init-process" {
+  run create_app
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run deploy_app
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "docker inspect --format '{{.HostConfig.Init}}' $TEST_APP.web.1"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "true"
+
+  run /bin/bash -c "docker exec $TEST_APP.web.1 ps auxf"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output_contains "docker-init"
+
+  run /bin/bash -c "dokku scheduler-docker-local:set $TEST_APP init-process false"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku ps:rebuild $TEST_APP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "docker inspect --format '{{.HostConfig.Init}}' $TEST_APP.web.1"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "<nil>"
+
+  run /bin/bash -c "docker exec $TEST_APP.web.1 ps auxf"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output_contains "docker-init" 0
+}
+
+@test "(scheduler-docker-local) publish ports" {
+  run create_app
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run deploy_app
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output_contains "Deploys may fail when publishing ports and scaling to multiple containers" 0
+  assert_output_contains "Deploys may fail when publishing ports and enabling zero downtime" 0
+
+  run /bin/bash -c "dokku docker-options:add $TEST_APP deploy '--publish 5000:5000'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku ps:scale --skip-deploy $TEST_APP web=2"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  # the expected output will be seen twice due to how parallel re-outputs stderr in its own output...
+  run /bin/bash -c "dokku ps:rebuild $TEST_APP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_failure
+  assert_output_contains "Deploys may fail when publishing ports and scaling to multiple containers" 2
+  assert_output_contains "Deploys may fail when publishing ports and enabling zero downtime" 0
+
+  run /bin/bash -c "dokku ps:scale --skip-deploy $TEST_APP web=1"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku ps:rebuild $TEST_APP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_failure
+  assert_output_contains "Deploys may fail when publishing ports and scaling to multiple containers" 0
+  assert_output_contains "Deploys may fail when publishing ports and enabling zero downtime" 2
+
+  run /bin/bash -c "dokku checks:disable $TEST_APP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku ps:rebuild $TEST_APP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output_contains "Deploys may fail when publishing ports and scaling to multiple containers" 0
+  assert_output_contains "Deploys may fail when publishing ports and enabling zero downtime" 0
+}
+
+@test "(scheduler-docker-local) sends SIGTERM immediately on deploy" {
+  run create_app
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku checks:set $TEST_APP wait-to-retire 600"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run deploy_app
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  local old_cid
+  old_cid="$(docker ps --filter label=com.dokku.app-name=$TEST_APP --filter label=com.dokku.process-type=web --format '{{.ID}}')"
+  [[ -n "$old_cid" ]]
+
+  run /bin/bash -c "dokku ps:rebuild $TEST_APP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  sleep 5
+
+  run /bin/bash -c "docker inspect --format '{{.State.Status}}' $old_cid"
+  echo "output: $output"
+  echo "status: $status"
+  assert_output "exited"
+
+  run /bin/bash -c "docker ps --filter label=com.dokku.app-name=$TEST_APP --filter label=com.dokku.process-type=web --format '{{.Names}}'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_output "$TEST_APP.web.1"
+}
+
+@test "(scheduler-docker-local) scale down retires orphaned containers" {
+  run create_app
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku checks:set $TEST_APP wait-to-retire 1"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run deploy_app
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku ps:scale $TEST_APP web=2"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  sleep 2
+
+  run /bin/bash -c "dokku ps:retire"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "docker ps --filter label=com.dokku.app-name=$TEST_APP --filter label=com.dokku.process-type=web --format '{{.Names}}' | wc -l"
+  echo "output: $output"
+  echo "status: $status"
+  assert_output "2"
+
+  run /bin/bash -c "dokku ps:scale $TEST_APP web=1"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  sleep 2
+
+  run /bin/bash -c "dokku ps:retire"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "docker ps --filter label=com.dokku.app-name=$TEST_APP --filter label=com.dokku.process-type=web --format '{{.Names}}'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_output "$TEST_APP.web.1"
+}
+
+@test "(scheduler-docker-local) ps:rebuild with image-based deploy keeps running image" {
+  run create_app
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku checks:set $TEST_APP wait-to-retire 1"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku git:from-image $TEST_APP cockpithq/cockpit:core-latest"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  local running_image
+  running_image="$(docker container inspect "$TEST_APP.web.1" --format '{{.Image}}' | cut -d: -f2)"
+  [[ -n "$running_image" ]]
+
+  run /bin/bash -c "dokku ps:rebuild $TEST_APP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  sleep 3
+
+  run /bin/bash -c "dokku ps:retire"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output_contains "has running containers, skipping rm" 0
+
+  run /bin/bash -c "grep -F \"$running_image\" /var/lib/dokku/data/scheduler-docker-local/dead-images 2>/dev/null || true"
+  echo "output: $output"
+  echo "status: $status"
+  assert_output ""
+
+  run /bin/bash -c "docker container inspect $TEST_APP.web.1 --format '{{.State.Status}}'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_output "running"
+}
+
+@test "(scheduler-docker-local) ps:retire keeps an image that is another app's source image" {
+  local SECOND_APP="$TEST_APP-2" TMP_IMAGE_DIR
+  stop_retire_timer
+  TMP_IMAGE_DIR="$(mktemp -d "/tmp/${DOKKU_DOMAIN}.XXXXX")"
+  cp -r "${BATS_TEST_DIRNAME}/../../tests/apps/python/." "$TMP_IMAGE_DIR"
+  run /bin/bash -c "docker image build -t dokku-test/$TEST_APP:shared -f $TMP_IMAGE_DIR/alt.Dockerfile $TMP_IMAGE_DIR"
+  echo "output: $output"
+  echo "status: $status"
+  rm -rf "$TMP_IMAGE_DIR"
+  assert_success
+
+  run create_app
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run create_app "$SECOND_APP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku checks:set $TEST_APP wait-to-retire 1"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku git:from-image $TEST_APP dokku-test/$TEST_APP:shared"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku git:from-image $SECOND_APP dokku-test/$TEST_APP:shared"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "tar -C ${BATS_TEST_DIRNAME}/../../tests/apps -cf - python | dokku git:from-archive $TEST_APP --"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  sleep 3
+
+  run /bin/bash -c "dokku ps:retire"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output_contains "is the source image for $SECOND_APP"
+
+  run /bin/bash -c "docker image inspect dokku-test/$TEST_APP:shared --format '{{.Id}}'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+}
+
+@test "(scheduler-docker-local) procfile quoted arguments on deploy" {
+  run create_app
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run deploy_app python dokku@$DOKKU_DOMAIN:$TEST_APP quoted_procfile_callback
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "docker inspect --format '{{json .Config.Cmd}}' $TEST_APP.web.1"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output '["python3","-u","web.py","double quoted","single quoted","escaped \"quote\"","literal`tick`","5000"]'
+}
+
+@test "(scheduler-docker-local) procfile quoted arguments on run" {
+  run create_app
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run deploy_app python dokku@$DOKKU_DOMAIN:$TEST_APP quoted_procfile_callback
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku run $TEST_APP args"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output_contains "['double quoted', 'single quoted', 'escaped \"quote\"', 'literal\`tick\`', '5000']"
+}
+
+@test "(scheduler-docker-local) procfile with shell operators fails deploy" {
+  run create_app
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run deploy_app python dokku@$DOKKU_DOMAIN:$TEST_APP operator_procfile_callback
+  echo "output: $output"
+  echo "status: $status"
+  assert_failure
+  assert_output_contains "Unable to parse command"
+}
+
+@test "(scheduler-docker-local) deploy removes stale CHECKS files" {
+  local DATA_DIR="/var/lib/dokku/data/scheduler-docker-local/$TEST_APP"
+
+  run create_app
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  mkdir -p "$DATA_DIR"
+  echo "/ python/http.server" >"$DATA_DIR/CHECKS.99999999"
+  touch "$DATA_DIR/CHECKS.99999998.missing"
+  chown -R dokku:dokku "$DATA_DIR"
+
+  run deploy_app python dokku@$DOKKU_DOMAIN:$TEST_APP
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "find $DATA_DIR -maxdepth 1 -name 'CHECKS.*'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output_not_exists
+}
+
+@test "(scheduler-docker-local) failed deploy restores previous image" {
+  local CUSTOM_TMP=$(mktemp -d "/tmp/${DOKKU_DOMAIN}.XXXXX")
+  trap 'popd &>/dev/null || true; rm -rf "$CUSTOM_TMP"' INT TERM
+
+  run create_app
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku checks:set $TEST_APP wait-to-retire 1"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  CUSTOM_TMP="$CUSTOM_TMP" run deploy_app python "dokku@$DOKKU_DOMAIN:$TEST_APP" dockerfile_callback
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  local previous_image
+  previous_image="$(docker container inspect "$TEST_APP.web.1" --format '{{.Image}}')"
+  [[ -n "$previous_image" ]]
+
+  run failing_check_callback "$TEST_APP" "$CUSTOM_TMP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run git -C "$CUSTOM_TMP" add app.json
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run git -C "$CUSTOM_TMP" commit -m 'Add a failing healthcheck'
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run git -C "$CUSTOM_TMP" push target master:master
+  echo "output: $output"
+  echo "status: $status"
+  assert_failure
+  assert_output_contains "Retagging old image $previous_image as dokku/$TEST_APP:latest"
+
+  run /bin/bash -c "docker image inspect dokku/$TEST_APP:latest --format '{{.Id}}'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "$previous_image"
+
+  sleep 3
+
+  run /bin/bash -c "dokku ps:retire"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "docker image inspect dokku/$TEST_APP:latest --format '{{.Id}}'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "$previous_image"
+
+  run /bin/bash -c "dokku ps:restart $TEST_APP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "docker container inspect $TEST_APP.web.1 --format '{{.Image}}'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "$previous_image"
+
+  rm -rf "$CUSTOM_TMP"
+}
+
+@test "(scheduler-docker-local) retire keeps image tagged as the app latest" {
+  local CUSTOM_TMP=$(mktemp -d "/tmp/${DOKKU_DOMAIN}.XXXXX")
+  trap 'popd &>/dev/null || true; rm -rf "$CUSTOM_TMP"' INT TERM
+
+  run create_app
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku checks:set $TEST_APP wait-to-retire 1"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  rmdir "$CUSTOM_TMP"
+  cp -r "${BATS_TEST_DIRNAME}/../../tests/apps/python" "$CUSTOM_TMP"
+  dockerfile_callback "$TEST_APP" "$CUSTOM_TMP"
+  failing_check_callback "$TEST_APP" "$CUSTOM_TMP"
+
+  run git -C "$CUSTOM_TMP" init -b master
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run git -C "$CUSTOM_TMP" config user.email "robot@example.com"
+  assert_success
+  run git -C "$CUSTOM_TMP" config user.name "Test Robot"
+  assert_success
+  run git -C "$CUSTOM_TMP" remote add target "dokku@$DOKKU_DOMAIN:$TEST_APP"
+  assert_success
+
+  run git -C "$CUSTOM_TMP" add .
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run git -C "$CUSTOM_TMP" commit -m 'initial commit'
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run git -C "$CUSTOM_TMP" push target master:master
+  echo "output: $output"
+  echo "status: $status"
+  assert_failure
+
+  local failed_image
+  failed_image="$(docker image inspect "dokku/$TEST_APP:latest" --format '{{.Id}}')"
+  [[ -n "$failed_image" ]]
+
+  sleep 3
+
+  run /bin/bash -c "dokku ps:retire"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output_contains "is the current image for $TEST_APP, skipping rm"
+
+  run /bin/bash -c "docker image inspect dokku/$TEST_APP:latest --format '{{.Id}}'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "$failed_image"
+
+  rm -rf "$CUSTOM_TMP"
+}
+
+quoted_procfile_callback() {
+  local APP="$1"
+  local APP_REPO_DIR="$2"
+  mv "$APP_REPO_DIR/dockerfile.Dockerfile" "$APP_REPO_DIR/Dockerfile"
+  cat >"$APP_REPO_DIR/Procfile" <<'PROCFILE'
+web: python3 -u web.py "double quoted" 'single quoted' "escaped \"quote\"" literal\`tick\` "$PORT"
+args: python3 -c "import sys; print(sys.argv[1:])" "double quoted" 'single quoted' "escaped \"quote\"" literal\`tick\` "$PORT"
+PROCFILE
+}
+
+operator_procfile_callback() {
+  local APP="$1"
+  local APP_REPO_DIR="$2"
+  mv "$APP_REPO_DIR/dockerfile.Dockerfile" "$APP_REPO_DIR/Dockerfile"
+  cat >"$APP_REPO_DIR/Procfile" <<'PROCFILE'
+web: python3 -u web.py && echo done
+PROCFILE
+}
+
+stop_retire_timer() {
+  declare desc="stops the dokku-retire timer so only the test runs ps:retire"
+  if systemctl is-active --quiet dokku-retire.timer 2>/dev/null; then
+    systemctl stop dokku-retire.timer
+    RETIRE_TIMER_STOPPED=true
+  fi
+}
+
+start_retire_timer() {
+  declare desc="starts the dokku-retire timer if stop_retire_timer stopped it"
+  if [[ "$RETIRE_TIMER_STOPPED" == "true" ]]; then
+    systemctl start dokku-retire.timer
+  fi
+}
+
+dockerfile_callback() {
+  local APP="$1"
+  local APP_REPO_DIR="$2"
+  mv "$APP_REPO_DIR/dockerfile.Dockerfile" "$APP_REPO_DIR/Dockerfile"
+}
+
+failing_check_callback() {
+  local APP="$1"
+  local APP_REPO_DIR="$2"
+  mv "$APP_REPO_DIR/app-failing-check.json" "$APP_REPO_DIR/app.json"
 }

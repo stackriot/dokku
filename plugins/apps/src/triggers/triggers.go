@@ -32,8 +32,8 @@ func main() {
 		err = apps.TriggerAppMaybeCreate(appName)
 	case "deploy-source-set":
 		appName := flag.Arg(0)
-		sourceType := flag.Arg(0)
-		sourceMetadata := flag.Arg(0)
+		sourceType := flag.Arg(1)
+		sourceMetadata := flag.Arg(2)
 		err = apps.TriggerDeploySourceSet(appName, sourceType, sourceMetadata)
 	case "install":
 		err = apps.TriggerInstall()
@@ -41,10 +41,17 @@ func main() {
 		oldAppName := flag.Arg(0)
 		newAppName := flag.Arg(1)
 		err = apps.TriggerPostAppCloneSetup(oldAppName, newAppName)
+	case "post-app-rename":
+		oldAppName := flag.Arg(0)
+		newAppName := flag.Arg(1)
+		err = apps.TriggerPostAppRename(oldAppName, newAppName)
 	case "post-app-rename-setup":
 		oldAppName := flag.Arg(0)
 		newAppName := flag.Arg(1)
 		err = apps.TriggerPostAppRenameSetup(oldAppName, newAppName)
+	case "post-create":
+		appName := flag.Arg(0)
+		err = apps.TriggerPostCreate(appName)
 	case "post-delete":
 		appName := flag.Arg(0)
 		err = apps.TriggerPostDelete(appName)

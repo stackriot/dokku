@@ -1,23 +1,27 @@
 # Process Management
 
+> [!IMPORTANT]
 > New as of 0.3.14, Enhanced in 0.7.0
 
 ```
-ps:inspect <app>                                                  # Displays a sanitized version of docker inspect for an app
-ps:rebuild [--parallel count] [--all|<app>]                       # Rebuilds an app from source
-ps:report [<app>] [<flag>]                                        # Displays a process report for one or more apps
-ps:restart [--parallel count] [--all|<app>]  [<process-name>]     # Restart an app
-ps:restore [<app>]                                                # Start previously running apps e.g. after reboot
-ps:scale [--skip-deploy] <app> <proc>=<count> [<proc>=<count>...] # Get/Set how many instances of a given process to run
-ps:set <app> <key> <value>                                        # Set or clear a ps property for an app
-ps:start [--parallel count] [--all|<app>]                         # Start an app
-ps:stop [--parallel count] [--all|<app>]                          # Stop an app
+ps:inspect <app>                                                             # Displays a sanitized version of docker inspect for an app
+ps:rebuild [--parallel count] [--no-cache] [--all|<app>]                     # Rebuilds an app from source
+ps:report [<app>] [<flag>]                                                   # Displays a process report for one or more apps
+ps:restart [--parallel count] [--all|<app>]  [<process-name>]                # Restart an app
+ps:restore [<app>]                                                           # Start previously running apps e.g. after reboot
+ps:scale [--skip-deploy] [--format stdout|json] <app> [<proc>=<count>...]    # Get/Set how many instances of a given process to run
+ps:scale --replace [--skip-deploy] <app> <proc>=<count> [<proc>=<count>...]  # Replace the formation and scale unspecified process types to zero
+ps:scale --clear [--skip-deploy] <app>                                       # Reset the formation to the default scale
+ps:set <app> <key> <value>                                                   # Set or clear a ps property for an app
+ps:start [--parallel count] [--all|<app>]                                    # Start an app
+ps:stop [--parallel count] [--all|<app>]                                     # Stop an app
 ```
 
 ## Usage
 
 ### Inspecting app containers
 
+> [!IMPORTANT]
 > New as of 0.13.0
 
 A common administrative task to perform is calling `docker inspect` on the containers that are running for an app. This can be an error-prone task to perform, and may also reveal sensitive environment variables if not done correctly. Dokku provides a wrapper around this command via the `ps:inspect` command:
@@ -53,6 +57,29 @@ Finally, the number of parallel workers may be automatically set to the number o
 ```shell
 dokku ps:rebuild --all --parallel -1
 ```
+
+#### Rebuilding without the build cache
+
+> [!IMPORTANT]
+> New as of 0.38.34
+
+An app may be rebuilt without using the build cache by specifying the `--no-cache` flag. This applies only to the triggered rebuild, and no setting is persisted for later deploys.
+
+```shell
+dokku ps:rebuild --no-cache node-js-app
+```
+
+The `--no-cache` flag may also be combined with the `--all` and `--parallel` flags.
+
+```shell
+dokku ps:rebuild --all --no-cache
+```
+
+The effect of the flag depends on the builder in use:
+
+- `dockerfile`, `nixpacks`, and `railpack`: The build is run with `--no-cache`. For the `dockerfile` builder, [BuildKit directory caches](/docs/deployment/builders/dockerfiles.md#buildkit-directory-caching) are not cleared.
+- `pack`: The build is run with `--clear-cache`.
+- `herokuish`: The build cache is purged before the build, in the same way as `repo:purge-cache`.
 
 A missing linked container will result in failure to boot apps. Services should all be started for apps being rebuilt.
 
@@ -105,56 +132,85 @@ proctype: qty
 web:  1
 ```
 
-### Scaling apps
-
-#### Via CLI
-
-> This functionality is disabled if the formation is managed via the `formation` key of `app.json`.
-
-Dokku can also manage scaling itself via the `ps:scale` command. This command can be used to scale multiple process types at the same time.
+The formation can also be retrieved as JSON by using the `--format json` flag, which is useful for programmatic consumption. Each entry maps a process type to its desired quantity:
 
 ```shell
-dokku ps:scale node-js-app web=1
+dokku ps:scale node-js-app --format json
 ```
 
-Multiple process types can be scaled at once:
+```json
+[{"process_type":"web","quantity":1},{"process_type":"worker","quantity":4}]
+```
+
+When no scale has been set for the app, the JSON output is an empty array (`[]`).
+
+### Changing process management settings
+
+The `ps` plugin provides a number of settings that can be used to managed deployments on a per-app basis. The following table outlines ones not covered elsewhere:
+
+| Name                  | Description                                       | Global Default     |
+|-----------------------|---------------------------------------------------|--------------------|
+| `stop-timeout`        | Configurable grace period given to the `docker stop` command. If a container has not stopped by this time, a `kill -9` signal or equivalent is sent in order to force-terminate the container. Both the `ps:stop` and `apps:destroy` commands _also_ respect this value. If not specified, the Docker defaults for the [`docker stop` command](https://docs.docker.com/engine/reference/commandline/stop/) will be used. | `30`             |
+
+All settings can be set via the `ps:set` command. Using `stop-timeout` as an example:
 
 ```shell
-dokku ps:scale node-js-app web=1 worker=1
+dokku ps:set node-js-app stop-timeout 60
 ```
 
-If desired, the corresponding deploy will be skipped by using the `--skip-deploy` flag:
+The default value may be set by passing an empty value for the option in question:
 
 ```shell
-dokku ps:scale --skip-deploy node-js-app web=1
+dokku ps:set node-js-app stop-timeout
 ```
 
-#### Manually managing process scaling
+Properties can also be set globally. If not set for an app, the global value will apply.
 
-> Using a `formation` key in an `app.json` file with _any_ `quantity` specified disables the ability to use `ps:scale` for scaling.
+```shell
+dokku ps:set --global stop-timeout 60
+```
 
-An `app.json` file can be committed to the root of the pushed app repository, and must be within the built image artifact in the image's working directory as shown below.
+The global default value may be set by passing an empty value for the option.
 
-- Buildpacks: `/app/app.json`
-- Dockerfile: `WORKDIR/app.json` or `/app.json` (if no working directory specified)
-- Docker Image: `WORKDIR/app.json` or `/app.json` (if no working directory specified)
+```shell
+dokku ps:set --global stop-timeout
+```
 
-The `formation` key should be specified as follows in the `app.json` file:
+### Defining Processes
+
+#### Procfile
+
+> [!NOTE]
+> Dokku supports the Procfile format as defined in [this document](https://github.com/dokku/procfile-util/blob/master/PROCFILE_FORMAT.md) under "Strict Mode" parsing rules.
+
+Apps can define processes to run by using a `Procfile`. A `Procfile` is a simple text file that can be used to specify multiple commands, each of which is subject to process scaling. In the case where the built image sets a default command to run - either through usage of `CMD` for Dockerfile-based builds, a default process for buildpack-based builds, or any other method for the builder in use - the `Procfile` will take precedence.
+
+If the file exists, it should not be empty, as doing so may result in a failed deploy.
+
+The syntax for declaring a `Procfile` is as follows. Note that the format is one process type per line, with no duplicate process types.
 
 ```Procfile
-{
-  "formation": {
-    "web": {
-      "quantity": 1
-    },
-    "worker": {
-      "quantity": 4
-    }
-  }
-}
+<process type>: <command>
 ```
 
-Removing the file will result in Dokku respecting the `ps:scale` command for setting scale values. The values set via the `app.json` file from a previous deploy will be respected.
+If, for example, you have multiple queue workers and wish to scale them separately, the following would be a valid way to work around the requirement of not duplicating process types:
+
+```Procfile
+worker:           env QUEUE=* bundle exec rake resque:work
+importantworker:  env QUEUE=important bundle exec rake resque:work
+```
+
+If the app build declares an `ENTRYPOINT`, the command defined in the `Procfile` is passed as an argument to that entrypoint. This is the case for all Dockerfile-based, Docker Image, and Cloud Native Buildpack deployments.
+
+When deploying via the `docker-local` scheduler, for all builders other than Herokuish, the command is split into arguments using shell quoting rules, but is not otherwise interpreted by a shell. Environment variable references such as `$PORT` are substituted before the command is split. Single quotes, double quotes, and backslash escapes then group and escape arguments, and any other special characters are passed to the container verbatim. Shell operators such as `&&`, `|`, `;`, and redirections are not supported and will fail the deploy, and a trailing `#` comment is ignored. If shell features are required, invoke a shell explicitly:
+
+```Procfile
+web: sh -c "bin/migrate && exec bin/server --port $PORT"
+```
+
+The `web` process type holds some significance in that it is the only process type that is automatically scaled to `1` on the initial application deploy. See the [web process scaling documentation](/docs/processes/process-management.md#the-web-process) for more details around scaling individual processes.
+
+See the [Procfile location documentation](/docs/processes/process-management.md#changing-the-procfile-location) for more information on where to place your `Procfile` file.
 
 #### The `web` process
 
@@ -162,18 +218,28 @@ For initial app deploys, Dokku will default to starting a single `web` process f
 
 There are also a few other exceptions for the `web` process.
 
-- Custom checks defined by a `CHECKS` file only apply to the `web` process type.
 - By default, the built-in nginx proxy implementation only proxies the `web` process (others may be handled via a custom `nginx.conf.sigil`).
-  - See the [nginx request proxying documentation](/docs/configuration/nginx.md#request-proxying) for more information on how nginx handles proxied requests.
+    - See the [nginx request proxying documentation](/docs/networking/proxies/nginx.md#request-proxying) for more information on how nginx handles proxied requests.
 - Only the `web` process may be bound to an external port.
+
+#### The `release` process
+
+The `Procfile` also supports a special `release` command which acts in a similar way to the [Heroku Release Phase](https://devcenter.heroku.com/articles/release-phase). See the [Release deployment task documentation](/docs/advanced-usage/deployment-tasks.md#procfile-release-command) for more information on how Dokku handles this process type.
 
 #### Changing the `Procfile` location
 
-When deploying a monorepo, it may be desirable to specify the specific path of the `Procfile` file to use for a given app. This can be done via the `ps:set` command. If a value is specified and that file does not exist within the repository, Dokku will continue the build process as if the repository has no `Procfile`.
+The `Procfile` is expected to be found in a specific directory, depending on the deploy approach:
+
+- The `WORKDIR` of the Docker image for deploys resulting from `git:from-image` and `git:load-image` commands.
+- The root of the source code tree for all other deploys (git push, `git:from-archive`, `git:sync`).
+
+Sometimes it may be desirable to set a different path for a given app, e.g. when deploying from a monorepo. This can be done via the `procfile-path` property:
 
 ```shell
-dokku ps:set node-js-app procfile-path Procfile2
+dokku ps:set node-js-app procfile-path .dokku/Procfile
 ```
+
+The value is the path to the desired file _relative_ to the base search directory, and will never be treated as absolute paths in any context. If that file does not exist within the repository, Dokku will continue the build process as if the repository has no `Procfile`.
 
 The default value may be set by passing an empty value for the option:
 
@@ -192,6 +258,82 @@ The default value may be set by passing an empty value for the option.
 ```shell
 dokku ps:set --global procfile-path
 ```
+
+### Scaling apps
+
+#### Via CLI
+
+> This functionality is disabled if the formation is managed via the `formation` key of `app.json`.
+
+Dokku can also manage scaling itself via the `ps:scale` command. This command can be used to scale multiple process types at the same time.
+
+```shell
+dokku ps:scale node-js-app web=1
+```
+
+Multiple process types can be scaled at once:
+
+```shell
+dokku ps:scale node-js-app web=1 worker=1
+```
+
+> [!NOTE]
+> Each argument must name a process type, and process counts must be zero or greater. Scaling a process type to `0` stops all of its containers, while a negative count is rejected.
+
+If desired, the corresponding deploy will be skipped by using the `--skip-deploy` flag:
+
+```shell
+dokku ps:scale --skip-deploy node-js-app web=1
+```
+
+#### Replacing the formation
+
+By default, `ps:scale` merges the specified process types into the existing formation, leaving any unspecified process type at its current count. The `--replace` flag instead treats the specified process types as the entire formation, setting the process count for every unspecified process type to zero:
+
+```shell
+dokku ps:scale --replace node-js-app web=1
+```
+
+An app scaled to `web=2 worker=3` before the above command will be scaled to `web=1 worker=0` after it, with the `worker` containers stopped as part of the same command.
+
+> [!NOTE]
+> At least one process type must be specified when using the `--replace` flag. Use the `--clear` flag to reset the formation instead.
+
+#### Clearing the formation
+
+The `--clear` flag resets the formation to the scale a newly created app has, a single `web` process, with the process count for every other process type set to zero:
+
+```shell
+dokku ps:scale --clear node-js-app
+```
+
+Apps with a `Procfile` that does not specify a `web` process type will have the process count for every process type set to zero.
+
+> [!NOTE]
+> Process types cannot be specified when using the `--clear` flag, nor can it be combined with the `--replace` flag.
+
+#### Manually managing process scaling
+
+> Using a `formation` key in an `app.json` file with _any_ `quantity` specified disables the ability to use `ps:scale` for scaling. All processes not specified in the `app.json` will have their process count set to zero.
+
+Users can also configure scaling within the codebase itself to manage process scaling. The `formation` key should be specified as follows in the `app.json` file:
+
+```json
+{
+  "formation": {
+    "web": {
+      "quantity": 1
+    },
+    "worker": {
+      "quantity": 4
+    }
+  }
+}
+```
+
+Removing the `formation` key or removing the `app.json` file from your repository will result in Dokku respecting the `ps:scale` command for setting scale values. The values set via the `app.json` file from a previous deploy will be respected.
+
+See the [app.json location documentation](/docs/advanced-usage/deployment-tasks.md#changing-the-appjson-location) for more information on where to place your `app.json` file.
 
 ### Stopping apps
 
@@ -245,8 +387,31 @@ Finally, the number of parallel workers may be automatically set to the number o
 dokku ps:start --all --parallel -1
 ```
 
+### Customizing the start command
+
+The command used to start an app's containers can be customized via two `ps` properties, depending on which builder is in use.
+
+For buildpack-built apps (where the start command normally comes from the `Procfile`), set `start-cmd`:
+
+```shell
+dokku ps:set node-js-app start-cmd "node server.js"
+```
+
+For Dockerfile-built apps, set `dockerfile-start-cmd`. This value is passed as arguments to `docker run` and overrides or supplements the image's `CMD` / `ENTRYPOINT`. See the [Dockerfile builder documentation](/docs/deployment/builders/dockerfiles.md#customizing-the-run-command) for context.
+
+```shell
+dokku ps:set node-js-app dockerfile-start-cmd "--harmony server.js"
+```
+
+Either property can be cleared by passing an empty value:
+
+```shell
+dokku ps:set node-js-app start-cmd
+```
+
 ### Restart policies
 
+> [!IMPORTANT]
 > New as of 0.7.0, Command Changed in 0.22.0
 
 By default, Dokku will automatically restart containers that exit with a non-zero status up to 10 times via the [on-failure Docker restart policy](https://docs.docker.com/engine/reference/run/#restart-policies---restart).
@@ -274,6 +439,20 @@ dokku ps:set node-js-app restart-policy on-failure
 dokku ps:set node-js-app restart-policy on-failure:20
 ```
 
+The default policy (`on-failure:10`) may be restored by passing an empty value:
+
+```shell
+dokku ps:set node-js-app restart-policy
+```
+
+A global default may also be set, and is used by any app that does not have an app-specific restart policy:
+
+```shell
+dokku ps:set --global restart-policy always
+```
+
+The effective policy applied to an app's containers is resolved as the app-specific value, then the global value, then the built-in `on-failure:10` default. This computed value can be inspected via the `--ps-computed-restart-policy` report flag.
+
 Restart policies have no bearing on server reboot, and Dokku will always attempt to restart your apps at that point unless they were manually stopped.
 
 Dokku also runs `dokku-event-listener` in the background via the system's init service. This monitors container state, performing the following actions:
@@ -283,6 +462,7 @@ Dokku also runs `dokku-event-listener` in the background via the system's init s
 
 ### Displaying reports for an app
 
+> [!IMPORTANT]
 > New as of 0.12.0
 
 You can get a report about the deployed apps using the `ps:report` command:
@@ -297,8 +477,10 @@ dokku ps:report
        Processes:                     0
        Ps can scale:                  true
        Ps computed procfile path:     Procfile2
+       Ps computed restart policy:    on-failure:10
        Ps global procfile path:       Procfile
-       Ps restart policy:             on-failure:10
+       Ps global restart policy:
+       Ps restart policy:
        Ps procfile path:              Procfile2
        Restore:                       true
        Running:                       false
@@ -307,8 +489,10 @@ dokku ps:report
        Processes:                     0
        Ps can scale:                  true
        Ps computed procfile path:     Procfile
+       Ps computed restart policy:    on-failure:10
        Ps global procfile path:       Procfile
-       Ps restart policy:             on-failure:10
+       Ps global restart policy:
+       Ps restart policy:
        Ps procfile path:
        Restore:                       true
        Running:                       false
@@ -317,8 +501,10 @@ dokku ps:report
        Processes:                     0
        Ps can scale:                  true
        Ps computed procfile path:     Procfile
+       Ps computed restart policy:    on-failure:10
        Ps global procfile path:       Procfile
-       Ps restart policy:             on-failure:10
+       Ps global restart policy:
+       Ps restart policy:
        Ps procfile path:
        Restore:                       true
        Running:                       false
@@ -335,7 +521,9 @@ dokku ps:report node-js-app
        Deployed:                      false
        Processes:                     0
        Ps can scale:                  true
-       Ps restart policy:             on-failure:10
+       Ps computed restart policy:    on-failure:10
+       Ps global restart policy:
+       Ps restart policy:
        Restore:                       true
        Running:                       false
 ```
@@ -353,7 +541,48 @@ When a server reboots or Docker is restarted/upgraded, Docker may or may not sta
 - Start all linked services.
 - Clear generated proxy configuration files.
 - Start the app if it has not been manually stopped.
-  - If the app containers still exist, they will be started and the generated proxy configuration files will be rebuilt.
-  - If any of the app containers are missing, the entire app will be rebuilt.
+    - If the app containers still exist, they will be started and the generated proxy configuration files will be rebuilt.
+    - If any of the app containers are missing, the entire app will be rebuilt.
 
 During this time, requests may route to the incorrect app if the assigned IPs correspond to those for other apps. While dokku makes all efforts to avoid this, there may be a few minutes where urls may route to the wrong app. To avoid this, either use a custom proxy plugin or wait a few minutes until the restoration process is complete.
+
+Per-app restore behavior can be controlled via the `restore` property. When set to `false`, `ps:restore` will skip the app on reboot:
+
+```shell
+dokku ps:set node-js-app restore false
+```
+
+The default value (`true`) may be restored by passing an empty value:
+
+```shell
+dokku ps:set node-js-app restore
+```
+
+## Properties
+
+### Settable properties
+
+> [!NOTE]
+> The `Report flags` column lists the CLI argument names accepted by `ps:report`. The JSON keys emitted by `ps:report --format json` are the same names with the leading `--ps-` stripped (e.g. `procfile-path`, `global-procfile-path`, `computed-procfile-path`). Legacy keys with the `ps-` prefix (e.g. `ps-procfile-path`) are also emitted during the 0.38.x deprecation window and will be removed in a future major release.
+
+| Property | Scope | Default | Report flags | Description |
+| --- | --- | --- | --- | --- |
+| `dockerfile-start-cmd` | app only | none | `--ps-dockerfile-start-cmd`, `--ps-computed-dockerfile-start-cmd` | Override `CMD` for Dockerfile-based apps |
+| `procfile-path` | app + global | `Procfile` | `--ps-procfile-path`, `--ps-global-procfile-path`, `--ps-computed-procfile-path` | Path to the app's Procfile, relative to the build root |
+| `restart-policy` | app + global | `on-failure:10` | `--ps-restart-policy`, `--ps-global-restart-policy`, `--ps-computed-restart-policy` | Docker restart policy applied to deployed containers (`no`, `always`, `unless-stopped`, `on-failure[:max-retries]`) |
+| `restore` | app only | `true` | `--restore` | When `true`, the app is restarted automatically by `ps:restore` after a host reboot |
+| `skip-deploy` | app + global | `false` | `--ps-skip-deploy`, `--ps-global-skip-deploy`, `--ps-computed-skip-deploy` | When `true`, skips the deploy phase after a successful build |
+| `start-cmd` | app only | none | `--ps-start-cmd`, `--ps-computed-start-cmd` | Override start command for buildpack apps |
+| `stop-timeout-seconds` | app + global | `30` | `--ps-stop-timeout-seconds`, `--ps-global-stop-timeout-seconds`, `--ps-computed-stop-timeout-seconds` | Seconds Docker waits before SIGKILLing a container on stop |
+
+### Read-only flags
+
+The following flags surface in `ps:report` but are not managed by `ps:set` - they are derived from the running process state:
+
+| Flag | Description |
+| --- | --- |
+| `--ps-can-scale` | `false` when the app's procfile or builder forbids horizontal scaling |
+| `--deployed` | `true` after the first successful deploy |
+| `--running` | `true` while any container for the app is running |
+| `--processes` | Total scaled process count across all proctypes |
+| `--status-<proctype>` | Container status and ID for each running proctype (one entry per Procfile process type) |

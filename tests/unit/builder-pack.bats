@@ -7,11 +7,153 @@ setup_file() {
 }
 
 setup() {
+  global_setup
   create_app
 }
 
 teardown() {
   destroy_app
+  global_teardown
+}
+
+@test "(builder-pack:report) info-flag works before deploy" {
+  run /bin/bash -c "dokku builder-pack:report $TEST_APP --builder-pack-projecttoml-path"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku builder-pack:set $TEST_APP projecttoml-path project.alt.toml"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku builder-pack:report $TEST_APP --builder-pack-projecttoml-path"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "project.alt.toml"
+
+  run /bin/bash -c "dokku builder-pack:report $TEST_APP --builder-pack-invalid-flag"
+  echo "output: $output"
+  echo "status: $status"
+  assert_failure
+  assert_output_contains "Invalid flag passed"
+}
+
+@test "(builder-pack:report) --global --builder-pack-global-projecttoml-path" {
+  run /bin/bash -c "dokku builder-pack:set --global projecttoml-path project.alt.toml"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku builder-pack:report --global --builder-pack-global-projecttoml-path"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "project.alt.toml"
+
+  run /bin/bash -c "dokku builder-pack:set --global projecttoml-path"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+}
+
+@test "(builder-pack:report) projecttoml-path raw vs computed vs global" {
+  run /bin/bash -c "dokku builder-pack:set --global projecttoml-path"
+  assert_success
+
+  run /bin/bash -c "dokku builder-pack:report $TEST_APP --builder-pack-projecttoml-path"
+  assert_success
+  assert_output_not_exists
+
+  run /bin/bash -c "dokku builder-pack:report $TEST_APP --builder-pack-global-projecttoml-path"
+  assert_success
+  assert_output_not_exists
+
+  run /bin/bash -c "dokku builder-pack:report $TEST_APP --builder-pack-computed-projecttoml-path"
+  assert_success
+  assert_output "project.toml"
+
+  run /bin/bash -c "dokku builder-pack:set --global projecttoml-path project.global.toml"
+  assert_success
+
+  run /bin/bash -c "dokku builder-pack:report $TEST_APP --builder-pack-global-projecttoml-path"
+  assert_success
+  assert_output "project.global.toml"
+
+  run /bin/bash -c "dokku builder-pack:report $TEST_APP --builder-pack-computed-projecttoml-path"
+  assert_success
+  assert_output "project.global.toml"
+
+  run /bin/bash -c "dokku builder-pack:set $TEST_APP projecttoml-path project.app.toml"
+  assert_success
+
+  run /bin/bash -c "dokku builder-pack:report $TEST_APP --builder-pack-projecttoml-path"
+  assert_success
+  assert_output "project.app.toml"
+
+  run /bin/bash -c "dokku builder-pack:report $TEST_APP --builder-pack-global-projecttoml-path"
+  assert_success
+  assert_output "project.global.toml"
+
+  run /bin/bash -c "dokku builder-pack:report $TEST_APP --builder-pack-computed-projecttoml-path"
+  assert_success
+  assert_output "project.app.toml"
+
+  run /bin/bash -c "dokku builder-pack:set $TEST_APP projecttoml-path"
+  assert_success
+
+  run /bin/bash -c "dokku builder-pack:set --global projecttoml-path"
+  assert_success
+}
+
+@test "(builder-pack:report) stack raw vs computed vs global" {
+  run /bin/bash -c "dokku builder-pack:set --global stack"
+  assert_success
+
+  run /bin/bash -c "dokku builder-pack:report $TEST_APP --builder-pack-stack"
+  assert_success
+  assert_output_not_exists
+
+  run /bin/bash -c "dokku builder-pack:report $TEST_APP --builder-pack-global-stack"
+  assert_success
+  assert_output_not_exists
+
+  run /bin/bash -c "dokku builder-pack:report $TEST_APP --builder-pack-computed-stack"
+  assert_success
+  assert_output "heroku/builder:24"
+
+  run /bin/bash -c "dokku builder-pack:set --global stack paketobuildpacks/builder:global"
+  assert_success
+
+  run /bin/bash -c "dokku builder-pack:report $TEST_APP --builder-pack-global-stack"
+  assert_success
+  assert_output "paketobuildpacks/builder:global"
+
+  run /bin/bash -c "dokku builder-pack:report $TEST_APP --builder-pack-computed-stack"
+  assert_success
+  assert_output "paketobuildpacks/builder:global"
+
+  run /bin/bash -c "dokku builder-pack:set $TEST_APP stack paketobuildpacks/builder:app"
+  assert_success
+
+  run /bin/bash -c "dokku builder-pack:report $TEST_APP --builder-pack-stack"
+  assert_success
+  assert_output "paketobuildpacks/builder:app"
+
+  run /bin/bash -c "dokku builder-pack:report $TEST_APP --builder-pack-computed-stack"
+  assert_success
+  assert_output "paketobuildpacks/builder:app"
+
+  run /bin/bash -c "cat $DOKKU_LIB_ROOT/config/builder-pack/$TEST_APP/clear-cache"
+  assert_success
+  assert_output "true"
+
+  run /bin/bash -c "dokku builder-pack:set $TEST_APP stack"
+  assert_success
+
+  run /bin/bash -c "dokku builder-pack:set --global stack"
+  assert_success
 }
 
 @test "(builder-pack:set)" {
@@ -25,18 +167,28 @@ teardown() {
   echo "status: $status"
   assert_success
 
-  run /bin/bash -c "dokku buildpacks:set-property $TEST_APP stack heroku/buildpacks:20"
+  run /bin/bash -c "dokku builder-pack:set $TEST_APP stack heroku/builder:24"
   echo "output: $output"
   echo "status: $status"
   assert_success
 
-  run deploy_app python dokku@dokku.me:$TEST_APP inject_requirements_txt
+  run /bin/bash -c "cat $DOKKU_LIB_ROOT/config/builder-pack/$TEST_APP/clear-cache"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "true"
+
+  run deploy_app python dokku@$DOKKU_DOMAIN:$TEST_APP add_requirements_txt_cnb
   echo "output: $output"
   echo "status: $status"
   assert_success
   assert_output_contains 'Building with buildpack 1' 0
-  assert_output_contains 'Installing requirements with pip'
-  assert_output_contains "Build time env var SECRET_KEY=fjdkslafjdk"
+  assert_output_contains 'Installing dependencies using pip'
+
+  run /bin/bash -c "test -f $DOKKU_LIB_ROOT/config/builder-pack/$TEST_APP/clear-cache"
+  echo "output: $output"
+  echo "status: $status"
+  assert_failure
 
   run /bin/bash -c "dokku builder-pack:set $TEST_APP projecttoml-path nonexistent.toml"
   echo "output: $output"
@@ -48,7 +200,7 @@ teardown() {
   echo "status: $status"
   assert_success
   assert_output_contains 'Building with buildpack 1' 0
-  assert_output_contains 'Installing requirements with pip'
+  assert_output_contains 'Installing dependencies using pip'
 
   run /bin/bash -c "dokku builder-pack:set $TEST_APP projecttoml-path project2.toml"
   echo "output: $output"
@@ -60,7 +212,7 @@ teardown() {
   echo "status: $status"
   assert_success
   assert_output_contains 'Building with buildpack 1'
-  assert_output_contains 'Installing requirements with pip' 0
+  assert_output_contains 'Installing dependencies using pip' 0
 
   run /bin/bash -c "dokku builder-pack:set $TEST_APP projecttoml-path"
   echo "output: $output"
@@ -72,12 +224,212 @@ teardown() {
   echo "status: $status"
   assert_success
   assert_output_contains 'Building with buildpack 1' 0
-  assert_output_contains 'Installing requirements with pip'
+  assert_output_contains 'Installing dependencies using pip'
 }
 
-inject_requirements_txt() {
+@test "(builder-pack) run" {
+  run /bin/bash -c "dokku config:set $TEST_APP SECRET_KEY=fjdkslafjdk"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku builder:set $TEST_APP selected pack"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku docker-options:add $TEST_APP build '--label=com.dokku.build-test=safe'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run deploy_app python dokku@$DOKKU_DOMAIN:$TEST_APP add_requirements_txt_cnb
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output_contains 'from cnb stack'
+  assert_output_contains 'Building with buildpack 1' 0
+  assert_output_contains 'Installing dependencies using pip'
+
+  run /bin/bash -c "dokku run $TEST_APP python3 task.py test"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "['task.py', 'test']"
+
+  run /bin/bash -c "dokku --quiet run $TEST_APP task"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "['task.py', 'test']"
+
+  run /bin/bash -c "dokku run $TEST_APP env"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output_contains "SECRET_KEY=fjdkslafjdk"
+}
+
+@test "(builder-pack) git:from-image without a Procfile" {
+  run /bin/bash -c "dokku git:from-image $TEST_APP dokku/smoke-test-gradle-app:1"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+}
+
+@test "(ps) cnb env vars" {
+  run /bin/bash -c "dokku config:set $TEST_APP APP_RESPECTS_ENV_VARS=1"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku builder:set $TEST_APP selected pack"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run deploy_app python dokku@$DOKKU_DOMAIN:$TEST_APP add_requirements_txt_cnb
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "curl $(dokku url $TEST_APP)/env"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output_contains '"APP_RESPECTS_ENV_VARS": "1"'
+}
+
+@test "(builder-pack) cron:run" {
+  run /bin/bash -c "dokku config:set $TEST_APP SECRET_KEY=fjdkslafjdk"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku builder:set $TEST_APP selected pack"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run deploy_app python dokku@$DOKKU_DOMAIN:$TEST_APP cron_run_wrapper
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output_contains 'from cnb stack'
+  assert_output_contains 'Building with buildpack 1' 0
+  assert_output_contains 'Installing dependencies using pip'
+
+  cron_id="$(dokku cron:list $TEST_APP --format json | jq -r '.[0].id')"
+  run /bin/bash -c "echo $cron_id"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output_exists
+
+  run /bin/bash -c "dokku cron:run $TEST_APP $cron_id"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "['task.py', 'some', 'cron', 'task']"
+}
+
+@test "(builder-pack) cron:run with Procfile reference" {
+  run /bin/bash -c "dokku config:set $TEST_APP SECRET_KEY=fjdkslafjdk"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku builder:set $TEST_APP selected pack"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run deploy_app python dokku@$DOKKU_DOMAIN:$TEST_APP cron_run_procfile_wrapper
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output_contains 'from cnb stack'
+  assert_output_contains 'Building with buildpack 1' 0
+  assert_output_contains 'Installing dependencies using pip'
+
+  cron_id="$(dokku cron:list $TEST_APP --format json | jq -r '.[0].id')"
+  run /bin/bash -c "echo $cron_id"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output_exists
+
+  run /bin/bash -c "dokku --quiet cron:run $TEST_APP $cron_id"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "['task.py', 'test']"
+}
+
+@test "(builder-pack) core-post-extract renames the configured project.toml" {
+  echo "" >"$BATS_TEST_TMPDIR/project2.toml"
+
+  run /bin/bash -c "dokku builder-pack:set $TEST_APP projecttoml-path project2.toml"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run_plugin_script builder-pack core-post-extract "$TEST_APP" "$BATS_TEST_TMPDIR" HEAD
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "test -f $BATS_TEST_TMPDIR/project.toml"
+  assert_success
+
+  run /bin/bash -c "test ! -e $BATS_TEST_TMPDIR/project2.toml"
+  assert_success
+}
+
+@test "(builder-pack) ps:rebuild --no-cache" {
+  run /bin/bash -c "dokku builder:set $TEST_APP selected pack"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run deploy_app python dokku@$DOKKU_DOMAIN:$TEST_APP add_requirements_txt_cnb
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku ps:rebuild $TEST_APP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output_contains "Using cached pip download/wheel cache"
+  assert_output_contains "Skipping buildpack layer analysis" 0
+
+  run /bin/bash -c "dokku ps:rebuild --no-cache $TEST_APP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output_contains "Skipping buildpack layer analysis"
+  assert_output_contains "Using cached pip download/wheel cache" 0
+}
+
+cron_run_wrapper() {
   local APP="$1"
   local APP_REPO_DIR="$2"
   [[ -z "$APP" ]] && local APP="$TEST_APP"
-  echo "flask" >>"$APP_REPO_DIR/requirements.txt"
+  APP_REPO_DIR="$(realpath "$APP_REPO_DIR")"
+
+  add_requirements_txt "$APP" "$APP_REPO_DIR"
+  ls -lah "$APP_REPO_DIR"
+  mv -f "$APP_REPO_DIR/app-cnb-cron.json" "$APP_REPO_DIR/app.json"
+}
+
+cron_run_procfile_wrapper() {
+  local APP="$1"
+  local APP_REPO_DIR="$2"
+  [[ -z "$APP" ]] && local APP="$TEST_APP"
+  APP_REPO_DIR="$(realpath "$APP_REPO_DIR")"
+
+  add_requirements_txt "$APP" "$APP_REPO_DIR"
+  ls -lah "$APP_REPO_DIR"
+  mv -f "$APP_REPO_DIR/app-cnb-cron-procfile.json" "$APP_REPO_DIR/app.json"
 }

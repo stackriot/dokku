@@ -1,19 +1,16 @@
 package ps
 
 import (
+	"errors"
 	"fmt"
+	"io"
 	"os"
-	"path"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 
-	sh "github.com/codeskyblue/go-sh"
 	"github.com/dokku/dokku/plugins/common"
-	"github.com/dokku/dokku/plugins/config"
 	dockeroptions "github.com/dokku/dokku/plugins/docker-options"
-	"github.com/otiai10/copy"
 )
 
 // TriggerAppRestart restarts an app
@@ -24,39 +21,84 @@ func TriggerAppRestart(appName string) error {
 // TriggerCorePostDeploy sets a property to
 // allow the app to be restored on boot
 func TriggerCorePostDeploy(appName string) error {
-	entries := map[string]string{
-		"DOKKU_APP_RESTORE": "1",
+	err := common.CorePostDeploy(common.CorePostDeployInput{
+		AppName:     appName,
+		Destination: common.GetAppDataDirectory("ps", appName),
+		PluginName:  "ps",
+		ExtractedPaths: []common.CorePostDeployPath{
+			{Path: "Procfile", IsDirectory: false},
+		},
+	})
+	if err != nil {
+		return err
 	}
 
-	return common.SuppressOutput(func() error {
-		return config.SetMany(appName, entries, false)
-	})
+	if err := common.PropertyDelete("ps", appName, "scale.old"); err != nil {
+		return err
+	}
+
+	return common.PropertyWrite("ps", appName, "restore", "true")
+}
+
+// TriggerDockerArgsProcessDeploy injects the computed restart policy as a
+// `--restart=` docker option at deploy time. The value is no longer persisted
+// in the docker-options store; it is derived from the app/global restart-policy
+// property on every deploy.
+func TriggerDockerArgsProcessDeploy(appName string) error {
+	stdin, err := io.ReadAll(os.Stdin)
+	if err != nil {
+		return err
+	}
+
+	if _, err := os.Stdout.Write(stdin); err != nil {
+		return err
+	}
+
+	fmt.Printf(" --restart=%s", reportComputedRestartPolicy(appName))
+	return nil
 }
 
 // TriggerCorePostExtract ensures that the main Procfile is the one specified by procfile-path
 func TriggerCorePostExtract(appName string, sourceWorkDir string) error {
+	destination := common.GetAppDataDirectory("ps", appName)
 	procfilePath := strings.Trim(reportComputedProcfilePath(appName), "/")
-	if procfilePath == "" || procfilePath == "Procfile" {
-		return nil
+	if procfilePath == "" {
+		procfilePath = "Procfile"
 	}
 
-	defaultProcfilePath := path.Join(sourceWorkDir, "Procfile")
-	if common.FileExists(defaultProcfilePath) {
-		if err := os.Remove(defaultProcfilePath); err != nil {
-			return fmt.Errorf("Unable to remove existing Procfile: %v", err.Error())
+	validator := func(appName string, path string) error {
+		if !common.FileExists(path) {
+			return nil
 		}
-	}
 
-	fullProcfilePath := path.Join(sourceWorkDir, procfilePath)
-	if !common.FileExists(fullProcfilePath) {
+		result, err := common.CallExecCommand(common.ExecCommandInput{
+			Command: "procfile-util",
+			Args:    []string{"check", "-P", path},
+		})
+		if err != nil {
+			return err
+		}
+		if result.ExitCode != 0 {
+			return fmt.Errorf("Invalid Procfile: %s", result.StderrContents())
+		}
 		return nil
 	}
 
-	if err := copy.Copy(fullProcfilePath, path.Join(sourceWorkDir, "Procfile")); err != nil {
-		return fmt.Errorf("Unable to move specified Procfile into place: %v", err.Error())
-	}
-
-	return nil
+	return common.CorePostExtract(common.CorePostExtractInput{
+		AppName:       appName,
+		Destination:   destination,
+		PluginName:    "ps",
+		SourceWorkDir: sourceWorkDir,
+		ToExtract: []common.CorePostExtractToExtract{
+			{
+				Path:        procfilePath,
+				IsDirectory: false,
+				Name:        "Procfile",
+				Destination: "Procfile",
+				Validator:   validator,
+			},
+		},
+	})
 }
 
 // TriggerInstall initializes app restart policies
@@ -65,31 +107,38 @@ func TriggerInstall() error {
 		return fmt.Errorf("Unable to install the ps plugin: %s", err.Error())
 	}
 
-	directory := filepath.Join(common.MustGetEnv("DOKKU_LIB_ROOT"), "data", "ps")
-	if err := os.MkdirAll(directory, 0755); err != nil {
+	if err := common.SetupAppData("ps"); err != nil {
 		return err
 	}
 
-	if err := common.SetPermissions(directory, 0755); err != nil {
-		return err
-	}
-
-	apps, err := common.DokkuApps()
-	if err != nil {
+	apps, err := common.UnfilteredDokkuApps()
+	if err != nil && !errors.Is(err, common.NoAppsExist) {
 		return nil
 	}
 
 	for _, appName := range apps {
-		policies, err := getRestartPolicy(appName)
+		if err := common.CreateAppDataDirectory("ps", appName); err != nil {
+			return err
+		}
+	}
+
+	for _, appName := range apps {
+		policy, err := getRestartPolicy(appName)
 		if err != nil {
 			return err
 		}
 
-		if len(policies) != 0 {
+		if policy == "" {
 			continue
 		}
 
-		if err := dockeroptions.AddDockerOptionToPhases(appName, []string{"deploy"}, "--restart=on-failure:10"); err != nil {
+		if policy != DefaultProperties["restart-policy"] {
+			if err := common.PropertyWrite("ps", appName, "restart-policy", policy); err != nil {
+				common.LogWarn(err.Error())
+			}
+		}
+
+		if err := dockeroptions.RemoveDockerOptionFromPhases(appName, []string{"deploy"}, fmt.Sprintf("--restart=%s", policy)); err != nil {
 			common.LogWarn(err.Error())
 		}
 	}
@@ -97,25 +146,45 @@ func TriggerInstall() error {
 	for _, appName := range apps {
 		dokkuScaleFile := filepath.Join(common.AppRoot(appName), "DOKKU_SCALE")
 		if common.FileExists(dokkuScaleFile) {
-			processTuples, err := common.FileToSlice(dokkuScaleFile)
-			if err != nil {
-				return err
-			}
-
-			if err := scaleSet(appName, true, false, processTuples); err != nil {
-				return err
-			}
-
 			os.Remove(dokkuScaleFile)
 		}
 
 		dokkuScaleExtracted := filepath.Join(common.AppRoot(appName), "DOKKU_SCALE.extracted")
 		if common.FileExists(dokkuScaleExtracted) {
-			if err := common.PropertyWrite("ps", appName, "can-scale", strconv.FormatBool(false)); err != nil {
-				return err
-			}
 			os.Remove(dokkuScaleExtracted)
 		}
+	}
+
+	if err := common.MigrateConfigToProperties("ps", []common.MigrateConfigEntry{
+		{
+			ConfigVar: "DOKKU_DOCKER_STOP_TIMEOUT",
+			Property:  "stop-timeout-seconds",
+		},
+		{
+			ConfigVar: "DOKKU_APP_RESTORE",
+			Property:  "restore",
+			Transform: func(value string) string {
+				if value == "0" {
+					return "false"
+				}
+				return "true"
+			},
+		},
+		{
+			ConfigVar:       "DOKKU_SKIP_DEPLOY",
+			GlobalConfigVar: "DOKKU_SKIP_DEPLOY",
+			Property:        "skip-deploy",
+		},
+		{
+			ConfigVar: "DOKKU_START_CMD",
+			Property:  "start-cmd",
+		},
+		{
+			ConfigVar: "DOKKU_DOCKERFILE_START_CMD",
+			Property:  "dockerfile-start-cmd",
+		},
+	}); err != nil {
+		return err
 	}
 
 	return nil
@@ -137,11 +206,15 @@ func TriggerPostAppCloneSetup(oldAppName string, newAppName string) error {
 		return err
 	}
 
-	return nil
+	return common.CloneAppData("ps", oldAppName, newAppName)
 }
 
 // TriggerPostAppRename rebuilds the renamed app
 func TriggerPostAppRename(oldAppName string, newAppName string) error {
+	if err := common.MigrateAppDataDirectory("ps", oldAppName, newAppName); err != nil {
+		return err
+	}
+
 	if os.Getenv("SKIP_REBUILD") == "true" {
 		return nil
 	}
@@ -159,22 +232,12 @@ func TriggerPostAppRenameSetup(oldAppName string, newAppName string) error {
 		return err
 	}
 
-	return nil
+	return common.CloneAppData("ps", oldAppName, newAppName)
 }
 
-// TriggerPostCreate ensures apps have a default restart policy
-// and scale value for web
+// TriggerPostCreate ensures apps have a default scale value for web
 func TriggerPostCreate(appName string) error {
-	if err := dockeroptions.AddDockerOptionToPhases(appName, []string{"deploy"}, "--restart=on-failure:10"); err != nil {
-		return err
-	}
-
-	directory := filepath.Join(common.MustGetEnv("DOKKU_LIB_ROOT"), "data", "ps", appName)
-	if err := os.MkdirAll(directory, 0755); err != nil {
-		return err
-	}
-
-	if err := common.SetPermissions(directory, 0755); err != nil {
+	if err := common.CreateAppDataDirectory("ps", appName); err != nil {
 		return err
 	}
 
@@ -189,8 +252,7 @@ func TriggerPostCreate(appName string) error {
 
 // TriggerPostDelete destroys the ps properties for a given app container
 func TriggerPostDelete(appName string) error {
-	directory := filepath.Join(common.MustGetEnv("DOKKU_LIB_ROOT"), "data", "ps", appName)
-	dataErr := os.RemoveAll(directory)
+	dataErr := common.RemoveAppDataDirectory("ps", appName)
 	propertyErr := common.PropertyDestroy("ps", appName)
 
 	if dataErr != nil {
@@ -200,43 +262,13 @@ func TriggerPostDelete(appName string) error {
 	return propertyErr
 }
 
-// TriggerPostExtract validates a procfile
-func TriggerPostExtract(appName string, tempWorkDir string) error {
-	procfile := filepath.Join(tempWorkDir, "Procfile")
-	if !common.FileExists(procfile) {
-		return nil
-	}
-
-	b, err := sh.Command("procfile-util", "check", "-P", procfile).CombinedOutput()
-	if err != nil {
-		return fmt.Errorf(strings.TrimSpace(string(b[:])))
-	}
-	return nil
-}
-
 // TriggerPostStop sets the restore property to false
 func TriggerPostStop(appName string) error {
-	entries := map[string]string{
-		"DOKKU_APP_RESTORE": "0",
-	}
-
-	return common.SuppressOutput(func() error {
-		return config.SetMany(appName, entries, false)
-	})
+	return common.PropertyWrite("ps", appName, "restore", "false")
 }
 
-// TriggerPreDeploy ensures an app has an up to date scale parameters
-func TriggerPreDeploy(appName string, imageTag string) error {
-	image := common.GetAppImageName(appName, imageTag, "")
-
-	if err := removeProcfile(appName); err != nil {
-		return err
-	}
-
-	if err := extractProcfile(appName, image); err != nil {
-		return err
-	}
-
+// TriggerPostReleaseBuilder ensures an app has an up to date scale parameters
+func TriggerPostReleaseBuilder(builderType string, appName string, image string) error {
 	if err := updateScale(appName, false, FormationSlice{}); err != nil {
 		common.LogDebug(fmt.Sprintf("Error generating scale file: %s", err.Error()))
 		return err
@@ -245,42 +277,22 @@ func TriggerPreDeploy(appName string, imageTag string) error {
 	return nil
 }
 
-// TriggerProcfileExtract extracted the procfile
-func TriggerProcfileExtract(appName string, image string) error {
-	directory := filepath.Join(common.MustGetEnv("DOKKU_LIB_ROOT"), "data", "ps", appName)
-	if err := os.MkdirAll(directory, 0755); err != nil {
-		return err
+// TriggerProcfileExists checks if a procfile exists
+func TriggerProcfileExists(appName string) error {
+	if hasProcfile(appName) {
+		return nil
 	}
 
-	if err := common.SetPermissions(directory, 0755); err != nil {
-		return err
-	}
-
-	if err := removeProcfile(appName); err != nil {
-		return err
-	}
-
-	return extractProcfile(appName, image)
+	return errors.New("Procfile does not exist")
 }
 
 // TriggerProcfileGetCommand fetches a command from the procfile
 func TriggerProcfileGetCommand(appName string, processType string, port int) error {
-	procfilePath := getProcfilePath(appName)
-	if !common.FileExists(procfilePath) {
-		extract := func() error {
-			image, err := common.GetDeployingAppImageName(appName, "", "")
-			if err != nil {
-				return err
-			}
-
-			return extractProcfile(appName, image)
-		}
-
-		if err := common.SuppressOutput(extract); err != nil {
-			return err
-		}
+	if !hasProcfile(appName) {
+		return nil
 	}
-	command, err := getProcfileCommand(procfilePath, processType, port)
+
+	command, err := getProcfileCommand(appName, getProcessSpecificProcfilePath(appName), processType, port)
 	if err != nil {
 		return err
 	}
@@ -290,11 +302,6 @@ func TriggerProcfileGetCommand(appName string, processType string, port int) err
 	}
 
 	return nil
-}
-
-// TriggerProcfileRemove removes the procfile if it exists
-func TriggerProcfileRemove(appName string) error {
-	return removeProcfile(appName)
 }
 
 // TriggerPsCanScale sets whether or not a user can scale an app with ps:scale
@@ -309,7 +316,6 @@ func TriggerPsCurrentScale(appName string) error {
 		return err
 	}
 
-	sort.Sort(formations)
 	lines := []string{}
 	for _, formation := range formations {
 		lines = append(lines, fmt.Sprintf("%s=%d", formation.ProcessType, formation.Quantity))
@@ -322,5 +328,28 @@ func TriggerPsCurrentScale(appName string) error {
 
 // TriggerPsSetScale configures the scale parameters for a given app
 func TriggerPsSetScale(appName string, skipDeploy bool, clearExisting bool, processTuples []string) error {
-	return scaleSet(appName, skipDeploy, clearExisting, processTuples)
+	return scaleSet(scaleSetInput{
+		appName:           appName,
+		skipDeploy:        skipDeploy,
+		clearExisting:     clearExisting,
+		processTuples:     processTuples,
+		deployOnlyChanged: false,
+	})
+}
+
+func TriggerPsGetProperty(appName string, property string) error {
+	computedValueMap := map[string]common.ReportFunc{
+		"restart-policy":       reportComputedRestartPolicy,
+		"restore":              reportRestore,
+		"skip-deploy":          reportComputedSkipDeploy,
+		"stop-timeout-seconds": reportComputedStopTimeoutSeconds,
+	}
+
+	fn, ok := computedValueMap[property]
+	if !ok {
+		return fmt.Errorf("Invalid ps property specified: %v", property)
+	}
+
+	fmt.Println(fn(appName))
+	return nil
 }

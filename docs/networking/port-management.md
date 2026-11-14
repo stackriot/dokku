@@ -1,35 +1,54 @@
 # Port Management
 
-> New as of 0.5.0, Enhanced in 0.6.0
+> [!IMPORTANT]
+> New as of 0.31.0, replaces the previous `proxy:ports*` commands
 
 ```
-proxy:ports <app>                        # List proxy port mappings for an app
-proxy:ports-add <app> <scheme>:<host-port>:<container-port> [<scheme>:<host-port>:<container-port>...]           # Add proxy port mappings to an app
-proxy:ports-clear <app>                  # Clear all proxy port mappings for an app
-proxy:ports-remove <app> <host-port> [<host-port>|<scheme>:<host-port>:<container-port>...]                      # Remove specific proxy port mappings from an app
-proxy:ports-set <app> <scheme>:<host-port>:<container-port> [<scheme>:<host-port>:<container-port>...]           # Set proxy port mappings for an app
+ports:list <app>                        # List port mappings for an app
+ports:add <app> <scheme>:<host-port>:<container-port> [<scheme>:<host-port>:<container-port>...]           # Add port mappings to an app
+ports:clear <app>                       # Clear all port mappings for an app
+ports:remove <app> <host-port> [<host-port>|<scheme>:<host-port>:<container-port>...]                      # Remove specific port mappings from an app
+ports:set <app> <scheme>:<host-port>:<container-port> [<scheme>:<host-port>:<container-port>...]           # Set port mappings for an app
 ```
-
-In Dokku 0.5.0, port proxying was decoupled from the `nginx-vhosts` plugin into the proxy plugin. Dokku 0.6.0 introduced the ability to map host ports to specific container ports. In the future this will allow other proxy software - such as HAProxy or Caddy - to be used in place of nginx.
 
 ## Usage
 
-> Warning: Mapping alternative ports may conflict with the active firewall installed on your server or hosting provider. Such software includes - but is not limited to - AWS Security Groups, iptables, and UFW. Please consult the documentation for those softwares as applicable.
+> [!WARNING]
+> Mapping alternative ports may conflict with the active firewall installed on your server or hosting provider. Such software includes - but is not limited to - AWS Security Groups, iptables, and UFW. Please consult the documentation for those softwares as applicable.
+>
+> Users should also avoid setting the `PORT` environment variable. Dokku will use port mappings to set this value. Overriding this manually may cause issues in application routing.
 
-> New as of 0.6.0
-
-You can now configure `host -> container` port mappings with the `proxy:ports-*` commands. This mapping is currently supported by the built-in nginx-vhosts plugin.
+You can now configure `host -> container` port mappings with the `ports:*` commands. This mapping is currently supported by the built-in nginx-vhosts plugin.
 
 By default, buildpack apps and dockerfile apps **without** explicitly exposed ports (i.e. using the `EXPOSE` directive) will be configured with a listener on port `80` (and additionally a listener on 443 if ssl is enabled) that will proxy to the application container on port `5000`. Dockerfile apps **with** explicitly exposed ports will be configured with a listener on each exposed port and will proxy to that same port of the deployed application container.
 
-> Note: This default behavior **will not** be automatically changed on subsequent pushes and must be manipulated with the `proxy:ports-*` commands detailed below.
+> [!NOTE]
+> This default behavior **will not** be automatically changed on subsequent pushes and must be manipulated with the `ports:*` commands detailed below.
+
+### Port Scheme
+
+The proxy port scheme is as follows:
+
+- `SCHEME:HOST_PORT:CONTAINER_PORT`
+
+The scheme metadata can be used by proxy implementations in order to properly handle proxying of requests. For example, the built-in `nginx-vhosts` proxy implementation supports the `http`, `https`, `grpc` and `grpcs` schemes. For the `grpc` and `grpcs` see [nginx blog post on grpc](https://www.nginx.com/blog/nginx-1-13-10-grpc/).
+
+Developers of proxy implementations are encouraged to use whatever schemes make the most sense, and ignore configurations which they do not support. For instance, a `udp` proxy implementation can safely ignore `http` and `https` port mappings.
+
+To change the proxy implementation in use for an application, use the `proxy:set` command:
+
+```shell
+# no validation will be performed against
+# the specified proxy implementation
+dokku proxy:set node-js-app type nginx
+```
 
 ### Listing port mappings
 
-To inspect the port mapping for a given application, use the `proxy:ports` command:
+To inspect the port mapping for a given application, use the `ports:list` command:
 
 ```shell
-dokku proxy:ports node-js-app
+dokku ports:list node-js-app
 ```
 
 ```
@@ -60,15 +79,13 @@ curl http://node-js-app.dokku.me:8080
 curl: (7) Failed to connect to node-js-app.dokku.me port 8080: Connection refused
 ```
 
-However, we can use the `proxy:ports-add` command to add a second external port mapping - `8080` - to our application's port `5000`.
+However, we can use the `ports:add` command to add a second external port mapping - `8080` - to our application's port `5000`.
 
 ```shell
-dokku proxy:ports-add node-js-app http:8080:5000
+dokku ports:add node-js-app http:8080:5000
 ```
 
 ```
------> Setting config vars
-       DOKKU_PROXY_PORT_MAP: http:80:5000 http:8080:5000
 -----> Configuring node-js-app.dokku.me...(using built-in template)
 -----> Creating http nginx.conf
        Reloading nginx
@@ -96,15 +113,13 @@ Hello World!
 
 ### Setting all port mappings at once
 
-Port mappings can also be force set using the `proxy:ports-set` command.
+Port mappings can also be force set using the `ports:set` command.
 
 ```shell
-dokku proxy:ports-set node-js-app http:8080:5000
+dokku ports:set node-js-app http:8080:5000
 ```
 
 ```
------> Setting config vars
-       DOKKU_PROXY_PORT_MAP: http:80:5000 http:8080:5000
 -----> Configuring node-js-app.dokku.me...(using built-in template)
 -----> Creating http nginx.conf
        Reloading nginx
@@ -112,21 +127,22 @@ dokku proxy:ports-set node-js-app http:8080:5000
 
 ### Removing a port mapping
 
-A port mapping can be removed using the `proxy:ports-remove` command if it no longer necessary:
+A port mapping can be removed using the `ports:remove` command if it no longer necessary:
 
 ```shell
-dokku proxy:ports-remove node-js-app http:80:5000
+dokku ports:remove node-js-app http:80:5000
 ```
 
 Ports may also be removed by specifying only the `host-port` value. This effectively acts as a wildcard and removes all mappings for that particular host port.
 
 ```shell
-dokku proxy:ports-remove node-js-app http:80
+dokku ports:remove node-js-app http:80
 ```
 
 ## Port management by Deployment Method
 
-> Warning: If you set a proxy port map but _do not have a global domain set_, Dokku will reset that map upon first deployment.
+> [!WARNING]
+> If you set a port map but _do not have a global domain set_, Dokku will reset that map upon first deployment.
 
 ### Buildpacks
 
@@ -136,7 +152,7 @@ For buildpack deployments, your application _must_ respect the `PORT` environmen
 
 > Changed as of 0.5.0
 
-Dokku's default proxy implementation - nginx - supports HTTP and GRPC request proxying. At this time, we do not support proxying plain TCP or UDP ports. UDP ports can be exposed by disabling the nginx proxy with `dokku proxy:disable myapp`. If you would like to investigate alternative proxy methods, please refer to our [proxy management documentation](/docs/networking/proxy-management.md).
+Dokku's default proxy implementation - nginx - supports HTTP and GRPC request proxying. At this time, we do not support proxying plain TCP or UDP ports. UDP ports can be exposed by disabling the nginx proxy with `dokku proxy:disable myapp` and manually exposing the ports via the `docker-options` plugin. For example, `dokku docker-options:add myapp deploy "-p 2456:2456/udp"`. If you would like to investigate alternative proxy methods, please refer to our [proxy management documentation](/docs/networking/proxy-management.md).
 
 #### Applications using EXPOSE
 
@@ -145,19 +161,19 @@ Dokku will extract all tcp ports exposed using the `EXPOSE` directive (one port 
 For example, if the Dokku installation is configured with the domain `dokku.me` and an application named `node-js-app` is deployed with following Dockerfile:
 
 ```
-FROM ubuntu:18.04
+FROM ubuntu:24.04
 EXPOSE 1234
-RUN python -m SimpleHTTPServer 1234
+CMD python3 -m SimpleHTTPServer 1234
 ```
 
 The application would be exposed to the user at `node-js-app.dokku.me:1234`. If this is not desired, the following application configuration may be applied:
 
 ```shell
 # add a port mapping to port 80
-dokku proxy:ports-add node-js-app http:80:1234
+dokku ports:add node-js-app http:80:1234
 
 # remove the incorrect port mapping
-dokku proxy:ports-remove node-js-app http:1234:1234
+dokku ports:remove node-js-app http:1234:1234
 ```
 
 #### Applications not using EXPOSE
@@ -167,24 +183,104 @@ Any application that does not use an `EXPOSE` directive will result in Dokku def
 - modify your application to support the `PORT` environment variable.
 - switch to using an `EXPOSE` directive in your Dockerfile.
 
-#### Switching between `EXPOSE` usage modes
+### Displaying ports reports for an app
 
-When switching between `EXPOSE` usage modes, it is important to reset your port management. The following two commands can be used to reset your state and redeploy your application.
-
-```shell
-# assuming your application is called `node-js-app`
-dokku config:unset --no-restart node-js-app DOKKU_DOCKERFILE_PORTS PORT
-dokku proxy:ports-clear node-js-app
-```
-
-### Docker Image
-
-When deploying an image, we will use `docker inspect` to extract the `ExposedPorts` configuration and if defined, use that to populate port mapping. If this behavior is not desired, you can override that configuration variable with the following commands.
+You can get a report about the app's ports status using the `ports:report` command:
 
 ```shell
-# assuming your application is called `node-js-app`
-dokku config:set node-js-app DOKKU_DOCKERFILE_PORTS="1234/tcp 80/tcp"
-dokku proxy:ports-clear node-js-app
+dokku ports:report
 ```
 
-All other port-related behavior is the same as when deploying via Dockerfile.
+```
+=====> node-js-app ports information
+       Port map detected: http:80:5000
+       Port map:          http:80:5000 https:443:5000
+=====> python-sample ports information
+       Port map detected: http:80:5000
+       Port map:          http:80:5000
+=====> ruby-sample ports information
+       Port map detected: http:80:5000
+       Port map:          http:80:5000
+```
+
+You can run the command for a specific app also.
+
+```shell
+dokku ports:report node-js-app
+```
+
+```
+=====> node-js-app ports information
+       Port map detected: http:80:5000
+       Port map:          http:80:5000 https:443:5000
+```
+
+You can pass flags which will output only the value of the specific information you want. For example:
+
+```shell
+dokku ports:report node-js-app --ports-map
+```
+
+Use `--ports-map-json` or `--ports-map-detected-json` to get the same data as a JSON array of objects. Each object has the following fields:
+
+- `scheme`: the port scheme (e.g. `http`, `https`, `udp`)
+- `host_port`: the host/listener port
+- `container_port`: the container port
+
+```shell
+dokku ports:report node-js-app --ports-map-json
+```
+
+```json
+[
+  {
+    "scheme": "http",
+    "host_port": 80,
+    "container_port": 5000
+  },
+  {
+    "scheme": "https",
+    "host_port": 443,
+    "container_port": 5000
+  }
+]
+```
+
+The JSON output can be processed with tools such as `jq`:
+
+```shell
+dokku ports:report node-js-app --ports-map-json | jq '.[].host_port'
+```
+
+```
+80
+443
+```
+
+```shell
+dokku ports:report node-js-app --ports-map-detected-json | jq '.[0].container_port'
+```
+
+```
+5000
+```
+
+## Properties
+
+### Configured flags
+
+The following flags surface configured port mappings managed by `ports:set` / `ports:add` / `ports:remove` / `ports:clear`:
+
+| Flag | Description |
+| --- | --- |
+| `--ports-map` | Configured port mappings as space-separated `scheme:host-port:container-port` values |
+| `--ports-map-json` | Configured port mappings as a JSON array of `{scheme, host_port, container_port}` objects |
+
+### Read-only flags
+
+The following flags surface in `ports:report` but are not managed by `ports:set` - they are derived from the deploy:
+
+| Flag | Description |
+| --- | --- |
+| `--ports-map-detected` | Port mapping inferred from `EXPOSE` directives or the running container |
+| `--ports-map-detected-json` | Detected port mappings as a JSON array of `{scheme, host_port, container_port}` objects |

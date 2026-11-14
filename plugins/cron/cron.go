@@ -1,0 +1,237 @@
+package cron
+
+import (
+	"fmt"
+	"strconv"
+
+	appjson "github.com/dokku/dokku/plugins/app-json"
+	"github.com/dokku/dokku/plugins/common"
+
+	"github.com/multiformats/go-base36"
+	cronparser "github.com/robfig/cron/v3"
+	"mvdan.cc/sh/v3/shell"
+)
+
+// ValidateCronCommand returns an error if the command cannot be tokenised
+// as a sequence of shell words. cron:run dispatches with the same parser,
+// so a command that fails here will also fail to execute - validating at
+// deploy time surfaces the error before the schedule fires.
+func ValidateCronCommand(command string) error {
+	_, err := shell.Fields(command, func(name string) string {
+		return ""
+	})
+	return err
+}
+
+var (
+	// DefaultProperties is a map of all valid cron properties with corresponding default property values
+	DefaultProperties = map[string]string{
+		"mailfrom":    "",
+		"mailto":      "",
+		"maintenance": "false",
+	}
+
+	// GlobalProperties is a map of all valid global cron properties
+	GlobalProperties = map[string]bool{
+		"mailfrom":    true,
+		"mailto":      true,
+		"maintenance": true,
+	}
+)
+
+const MaintenancePropertyPrefix = "maintenance."
+
+// DefaultTTLSeconds is how long a cron task may run before it is reaped. The
+// docker-local scheduler stamps this onto the container as the
+// com.dokku.active-deadline-seconds label, while the k3s scheduler renders it
+// as the CronJob's activeDeadlineSeconds.
+const DefaultTTLSeconds int64 = 86400
+
+// validateTTLSeconds returns an error if the requested task lifetime is not a
+// positive number of seconds. A zero or negative deadline would either expire
+// the task the instant it starts or never expire it at all.
+func validateTTLSeconds(ttlSeconds int64) error {
+	if ttlSeconds <= 0 {
+		return fmt.Errorf("--ttl-seconds must be a positive integer")
+	}
+
+	return nil
+}
+
+// CronTask is a struct that represents a cron task
+type CronTask struct {
+	// ID is a unique identifier for the cron task
+	ID string `json:"id"`
+
+	// App is the app the cron task belongs to
+	App string `json:"app,omitempty"`
+
+	// Command is the command to run
+	Command string `json:"command"`
+
+	// Global is whether the cron task is global
+	Global bool `json:"global,omitempty"`
+
+	// Schedule is the cron schedule
+	Schedule string `json:"schedule"`
+
+	// ConcurrencyPolicy is the concurrency policy for the cron command
+	ConcurrencyPolicy string `json:"concurrency_policy"`
+
+	// AltCommand is an alternate command to run
+	AltCommand string `json:"-"`
+
+	// LogFile is the log file to write to
+	LogFile string `json:"-"`
+
+	// Mailto is the MAILTO value cron uses for this task instead of the global one
+	Mailto string `json:"mailto,omitempty"`
+
+	// AppInMaintenance is whether the app's cron is in maintenance mode
+	AppInMaintenance bool `json:"app-in-maintenance"`
+
+	// Maintenance is whether the cron task is in maintenance mode
+	TaskInMaintenance bool `json:"task-in-maintenance"`
+
+	// Maintenance is whether the cron task is in maintenance mode
+	Maintenance bool `json:"maintenance"`
+}
+
+// DokkuRunCommand returns the dokku run command to execute for a given cron task
+func (t CronTask) DokkuRunCommand() string {
+	if t.AltCommand != "" {
+		if t.LogFile != "" && t.Mailto != "" {
+			// keep the output on stdout so cron mails it to the task's MAILTO
+			return fmt.Sprintf("%s 2>&1 | tee -a %s", t.AltCommand, t.LogFile)
+		}
+		if t.LogFile != "" {
+			return fmt.Sprintf("%s &>> %s", t.AltCommand, t.LogFile)
+		}
+		return t.AltCommand
+	}
+
+	return fmt.Sprintf("dokku cron:run %s %s", t.App, t.ID)
+}
+
+// FetchCronTasksInput is the input for the FetchCronTasks function
+type FetchCronTasksInput struct {
+	AppName       string
+	AppJSON       *appjson.AppJSON
+	WarnToFailure bool
+}
+
+// FetchCronTasks returns a list of cron tasks for a given app
+func FetchCronTasks(input FetchCronTasksInput) ([]CronTask, error) {
+	appName := input.AppName
+	tasks := []CronTask{}
+	isAppCronInMaintenance := reportComputedMaintenance(appName) == "true"
+
+	if input.AppJSON == nil && input.AppName == "" {
+		return tasks, fmt.Errorf("Missing app name or app.json")
+	}
+
+	if input.AppJSON == nil {
+		appJSON, err := appjson.GetAppJSON(appName)
+		if err != nil {
+			return tasks, fmt.Errorf("Unable to fetch app.json for app %s: %s", appName, err.Error())
+		}
+
+		input.AppJSON = &appJSON
+	}
+
+	if input.AppJSON.Cron == nil {
+		return tasks, nil
+	}
+
+	properties, err := common.PropertyGetAllByPrefix("cron", appName, MaintenancePropertyPrefix)
+	if err != nil {
+		return tasks, fmt.Errorf("Error getting maintenance properties: %w", err)
+	}
+
+	for i, c := range input.AppJSON.Cron {
+		if c.Command == "" {
+			if input.WarnToFailure {
+				return tasks, fmt.Errorf("Missing cron task command for app %s (index %d)", appName, i)
+			}
+
+			common.LogWarn(fmt.Sprintf("Missing cron task command for app %s (index %d)", appName, i))
+			continue
+		}
+
+		if c.Schedule == "" {
+			if input.WarnToFailure {
+				return tasks, fmt.Errorf("Missing cron schedule for app %s (index %d)", appName, i)
+			}
+
+			common.LogWarn(fmt.Sprintf("Missing cron schedule for app %s (index %d)", appName, i))
+			continue
+		}
+
+		parser := cronparser.NewParser(cronparser.Minute | cronparser.Hour | cronparser.Dom | cronparser.Month | cronparser.Dow | cronparser.Descriptor)
+		_, err := parser.Parse(c.Schedule)
+		if err != nil {
+			return tasks, fmt.Errorf("Invalid cron schedule for app %s (schedule %s): %s", appName, c.Schedule, err.Error())
+		}
+
+		if err := ValidateCronCommand(c.Command); err != nil {
+			return tasks, fmt.Errorf("Invalid cron command for app %s (command %q): %s", appName, c.Command, err.Error())
+		}
+
+		cronID := GenerateCommandID(appName, c)
+		maintenance := c.Maintenance
+		if value, ok := properties[MaintenancePropertyPrefix+cronID]; ok {
+			boolValue, err := strconv.ParseBool(value)
+			if err != nil {
+				return tasks, fmt.Errorf("Invalid maintenance property for app %s (schedule %s): %s", appName, c.Schedule, err.Error())
+			}
+
+			// only override the maintenance value if the property is set to true
+			if boolValue {
+				maintenance = boolValue
+			}
+		}
+		if c.ConcurrencyPolicy == "" {
+			c.ConcurrencyPolicy = "allow"
+		}
+		if c.ConcurrencyPolicy != "allow" && c.ConcurrencyPolicy != "forbid" && c.ConcurrencyPolicy != "replace" {
+			return tasks, fmt.Errorf("Invalid cron concurrency policy for app %s (schedule %s): %s", appName, c.Schedule, c.ConcurrencyPolicy)
+		}
+
+		tasks = append(tasks, CronTask{
+			App:               appName,
+			Command:           c.Command,
+			Schedule:          c.Schedule,
+			ID:                cronID,
+			ConcurrencyPolicy: c.ConcurrencyPolicy,
+			Maintenance:       isAppCronInMaintenance || maintenance,
+			AppInMaintenance:  isAppCronInMaintenance,
+			TaskInMaintenance: maintenance,
+		})
+	}
+
+	return tasks, nil
+}
+
+// FetchGlobalCronTasks returns a list of global cron tasks
+// This function should only be used for the cron:list --global command
+// and not internally by the cron plugin
+func FetchGlobalCronTasks() ([]CronTask, error) {
+	response, _ := common.CallPlugnTrigger(common.PlugnTriggerInput{
+		Trigger: "cron-entries",
+		Args:    []string{"docker-local", CronEntryFormat},
+	})
+
+	tasks, invalid := parseInjectedCronEntries(response.StdoutContents())
+	for _, line := range invalid {
+		common.LogWarn(fmt.Sprintf("Invalid injected cron task: %v", line))
+	}
+	for i := range tasks {
+		tasks[i].Global = true
+	}
+	return tasks, nil
+}
+
+// GenerateCommandID creates a unique ID for a given app/command/schedule combination
+func GenerateCommandID(appName string, c appjson.CronTask) string {
+	return base36.EncodeToStringLc([]byte(appName + "===" + c.Command + "===" + c.Schedule))
+}

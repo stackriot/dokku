@@ -1,19 +1,10 @@
 #!/usr/bin/env bash
 source "$PLUGIN_CORE_AVAILABLE_PATH/common/functions"
 source "$PLUGIN_CORE_AVAILABLE_PATH/common/property-functions"
-source "$PLUGIN_AVAILABLE_PATH/apps/functions"
 source "$PLUGIN_AVAILABLE_PATH/config/functions"
 source "$PLUGIN_AVAILABLE_PATH/git/internal-functions"
 set -eo pipefail
 [[ $DOKKU_TRACE ]] && set -x
-
-use_git_worktree() {
-  declare desc="detects whether to use git worktree"
-  declare deprecated=true
-  dokku_log_warn "Deprecated: fn-git-use-worktree"
-
-  fn-git-use-worktree
-}
 
 git_build_app_repo() {
   declare desc="builds local git app repo for app"
@@ -24,26 +15,18 @@ git_build_app_repo() {
 
   # clean up after ourselves
   local GIT_BUILD_APP_REPO_TMP_WORK_DIR=$(mktemp -d "/tmp/dokku-${DOKKU_PID}-${FUNCNAME[0]}.XXXXXX")
-  trap "rm -rf '$GIT_BUILD_APP_REPO_TMP_WORK_DIR' >/dev/null" RETURN INT TERM EXIT
+  trap "popd &>/dev/null || true; rm -rf '$GIT_BUILD_APP_REPO_TMP_WORK_DIR' >/dev/null" RETURN INT TERM EXIT
 
   chmod 755 "$GIT_BUILD_APP_REPO_TMP_WORK_DIR"
   unset GIT_DIR GIT_QUARANTINE_PATH GIT_WORK_TREE
 
-  ! plugn trigger app-exists "$APP" >/dev/null 2>&1 && plugn trigger app-maybe-create "$APP"
+  ! plugn trigger app-exists "$APP" &>/dev/null && plugn trigger app-maybe-create "$APP"
 
   fn-git-setup-build-dir "$APP" "$GIT_BUILD_APP_REPO_TMP_WORK_DIR" "$REV"
   pushd "$GIT_BUILD_APP_REPO_TMP_WORK_DIR" >/dev/null
 
-  local DOKKU_APP_DISABLE_ANSI_PREFIX_REMOVAL DOKKU_GLOBAL_DISABLE_ANSI_PREFIX_REMOVAL DOKKU_DISABLE_ANSI_PREFIX_REMOVAL
-  DOKKU_APP_DISABLE_ANSI_PREFIX_REMOVAL=$(config_get "$APP" DOKKU_DISABLE_ANSI_PREFIX_REMOVAL || true)
-  DOKKU_GLOBAL_DISABLE_ANSI_PREFIX_REMOVAL=$(config_get --global DOKKU_DISABLE_ANSI_PREFIX_REMOVAL || true)
-  DOKKU_DISABLE_ANSI_PREFIX_REMOVAL=${DOKKU_APP_DISABLE_ANSI_PREFIX_REMOVAL:="$DOKKU_GLOBAL_DISABLE_ANSI_PREFIX_REMOVAL"}
-
-  if [[ "$DOKKU_DISABLE_ANSI_PREFIX_REMOVAL" == "true" ]]; then
-    git_trigger_build "$APP" "$GIT_BUILD_APP_REPO_TMP_WORK_DIR" "$REV"
-  else
-    git_trigger_build "$APP" "$GIT_BUILD_APP_REPO_TMP_WORK_DIR" "$REV" | sed -u "s/^/"$'\e[1G'"/"
-  fi
+  git_trigger_build "$APP" "$GIT_BUILD_APP_REPO_TMP_WORK_DIR" "$REV"
+  return $?
 }
 
 git_trigger_build() {
@@ -51,23 +34,37 @@ git_trigger_build() {
   declare APP="$1" TMP_WORK_DIR="$2" REV="$3"
   local BUILDER
 
-  plugn trigger core-post-extract "$APP" "$TMP_WORK_DIR" "$REV"
+  if ! plugn trigger core-post-extract "$APP" "$TMP_WORK_DIR" "$REV"; then
+    return 1
+  fi
   plugn trigger post-extract "$APP" "$TMP_WORK_DIR" "$REV"
 
   BUILDER="$(plugn trigger builder-detect "$APP" "$TMP_WORK_DIR" | head -n1 || true)"
-  [[ -z "$BUILDER" ]] && BUILDER="herokuish"
+  if [[ -z "$BUILDER" ]]; then
+    BUILDER="herokuish"
+    if ! plugn trigger builder-herokuish-allowed "$APP" >/dev/null; then
+      local ARCHITECTURE="$(dpkg --print-architecture 2>/dev/null || true)"
+      if [[ "$ARCHITECTURE" == "arm64" ]]; then
+        dokku_log_warn "Herokuish builder not supported on $ARCHITECTURE servers."
+        dokku_log_warn "Switching to pack builder."
+        BUILDER="pack"
+      fi
+    fi
+  fi
 
   plugn trigger pre-receive-app "$APP" "$BUILDER" "$TMP_WORK_DIR" "$REV"
   dokku_receive "$APP" "$BUILDER" "$TMP_WORK_DIR"
 }
 
-git_deploy_branch() {
-  declare desc="retrieve the deploy branch for a given application"
+fn-git-verify-app() {
+  declare desc="verifies an existing app, or validates the name of a new app"
   declare APP="$1"
-  declare deprecated=true
-  dokku_log_warn "Deprecated: plugn#git-deploy-branch"
 
-  fn-git-deploy-branch "$APP"
+  if [[ -d "$DOKKU_ROOT/$APP" ]]; then
+    verify_app_name "$APP"
+  else
+    is_valid_app_name "$APP"
+  fi
 }
 
 cmd-git-hook() {
@@ -77,11 +74,11 @@ cmd-git-hook() {
   declare APP="$1"
   local DOKKU_DEPLOY_BRANCH
 
-  plugn trigger app-exists "$APP" 2>/dev/null || is_valid_app_name "$APP"
+  fn-git-verify-app "$APP"
 
-  DOKKU_DEPLOY_BRANCH="$(fn-git-deploy-branch "$APP")"
-  if ! git check-ref-format --branch "$DOKKU_DEPLOY_BRANCH" >/dev/null 2>&1; then
-    echo $'\e[1G\e[K'"-----> WARNING: Invalid branch name '$DOKKU_DEPLOY_BRANCH' specified via DOKKU_DEPLOY_BRANCH."
+  DOKKU_DEPLOY_BRANCH="$(fn-git-computed-deploy-branch "$APP")"
+  if ! git check-ref-format --branch "$DOKKU_DEPLOY_BRANCH" &>/dev/null; then
+    echo $'\e[1G\e[K'"-----> WARNING: Invalid branch name '$DOKKU_DEPLOY_BRANCH' specified via deploy-branch setting."
     echo $'\e[1G\e[K'"-----> For more details, please see the man page for 'git-check-ref-format.'"
     return
   fi
@@ -90,19 +87,21 @@ cmd-git-hook() {
   while read -r oldrev newrev refname; do
     # Only run this script for the master branch. You can remove this
     # if block if you wish to run it for others as well.
-    if [[ $refname == "refs/heads/${DOKKU_DEPLOY_BRANCH}" ]]; then
-      # broken out into plugin so we might support other methods to receive an app
-      git_receive_app "$APP" "$newrev"
+    if [[ $refname == "refs/heads/${DOKKU_DEPLOY_BRANCH}" ]] || [[ $refname == "refs/tags/${DOKKU_DEPLOY_BRANCH}" ]]; then
+      DOKKU_GIT_SOURCE_IMAGE="" git_receive_app "$APP" "$newrev"
       plugn trigger deploy-source-set "$APP" "git-push" "$newrev"
     else
+      # broken out into plugin so we might support other methods to receive an app
       if [[ $(find "$PLUGIN_PATH"/enabled/*/receive-branch 2>/dev/null | wc -l) != 1 ]]; then
-        # shellcheck disable=SC2086
-        plugn trigger receive-branch $APP $newrev $refname
+        DOKKU_GIT_SOURCE_IMAGE="" plugn trigger receive-branch "$APP" "$newrev" "$refname"
         plugn trigger deploy-source-set "$APP" "git-push" "$newrev"
-      elif [[ -z "$(fn-git-deploy-branch "$APP" "")" ]]; then
-        echo $'\e[1G\e[K'"-----> Set ${refname/refs\/heads\//} to DOKKU_DEPLOY_BRANCH."
-        fn-plugin-property-write "git" "$app" "deploy-branch" "${refname/refs\/heads\//}"
-        git_receive_app "$APP" "$newrev"
+      elif [[ -z "$(fn-git-computed-deploy-branch "$APP" "")" ]]; then
+        local deploy_branch="${refname/refs\/heads\//}"
+        deploy_branch="${deploy_branch/refs\/tags\//}"
+
+        echo $'\e[1G\e[K'"-----> Set ${deploy_branch} as deploy-branch"
+        fn-plugin-property-write "git" "$APP" "deploy-branch" "${deploy_branch}"
+        DOKKU_GIT_SOURCE_IMAGE="" git_receive_app "$APP" "$newrev"
         plugn trigger deploy-source-set "$APP" "git-push" "$newrev"
       else
         echo $'\e[1G\e[K'"-----> WARNING: deploy did not complete, you must push to ${DOKKU_DEPLOY_BRANCH}."
@@ -116,7 +115,7 @@ git_build() {
   declare desc="setup and call git_build_app_repo"
   local APP="$1" REV="$2"
   local DOKKU_DEPLOY_BRANCH ENV_VAR_NAME REF
-  if [[ $# -ge 2 ]]; then
+  if [[ -n "$REV" ]]; then
     ENV_VAR_NAME="$(fn-plugin-property-get "git" "$APP" "rev-env-var")"
     if [[ -z "$ENV_VAR_NAME" ]] && ! fn-plugin-property-exists "git" "$APP" "rev-env-var"; then
       ENV_VAR_NAME="GIT_REV"
@@ -127,17 +126,20 @@ git_build() {
     fi
     local REF="$REV"
   else
-    DOKKU_DEPLOY_BRANCH="$(fn-git-deploy-branch "$APP")"
+    DOKKU_DEPLOY_BRANCH="$(fn-git-computed-deploy-branch "$APP")"
     if [[ -f "$DOKKU_ROOT/$APP/refs/heads/$DOKKU_DEPLOY_BRANCH" ]]; then
       REF=$(<"$DOKKU_ROOT/$APP/refs/heads/$DOKKU_DEPLOY_BRANCH")
+    else
+      echo $'\e[1G\e[K'"-----> WARNING: Cannot build from '$DOKKU_DEPLOY_BRANCH' as there are no commits stored at that branch."
     fi
   fi
 
   if [[ -z "$REF" ]]; then
-    return
+    return 1
   fi
-  # shellcheck disable=SC2086
-  git_build_app_repo $APP $REF
+
+  git_build_app_repo "$APP" "$REF"
+  return $?
 }
 
 git_receive_app() {
@@ -148,11 +150,45 @@ git_receive_app() {
   if [[ ! -d "$DOKKU_ROOT/$APP/refs" ]]; then
     true
   else
+    local exit_code=0
     acquire_app_deploy_lock "$APP" "exclusive"
-    # shellcheck disable=SC2086
-    git_build $APP $REV
-    release_app_deploy_lock "$APP"
+    fn-git-build-with-lock-held "$APP" "$REV" || exit_code="$?"
+    release_app_deploy_lock "$APP" "$exit_code"
+    return "$exit_code"
   fi
+}
+
+fn-git-build-with-lock-held() {
+  declare desc="builds an app at a revision, expecting the caller to hold the app deploy lock"
+  declare APP="$1" REV="$2"
+  local exit_code=0 has_source_image=false source_image previous_source_image
+
+  # DOKKU_GIT_SOURCE_IMAGE is only applied while the deploy lock is held. An
+  # empty value clears the property, while an unset variable leaves it as-is.
+  if [[ -n "${DOKKU_GIT_SOURCE_IMAGE+x}" ]]; then
+    has_source_image=true
+    source_image="$DOKKU_GIT_SOURCE_IMAGE"
+    unset DOKKU_GIT_SOURCE_IMAGE
+    previous_source_image="$(fn-git-source-image "$APP")"
+    fn-plugin-property-write "git" "$APP" "source-image" "$source_image"
+  fi
+
+  (git_build "$APP" "$REV") || exit_code="$?"
+  if [[ "$exit_code" -ne 0 ]] && [[ "$has_source_image" == "true" ]]; then
+    fn-plugin-property-lock "git" "$APP" fn-git-restore-source-image "$APP" "$source_image" "$previous_source_image"
+  fi
+  return "$exit_code"
+}
+
+fn-git-restore-source-image() {
+  declare desc="restores the previous source-image unless it was changed since the failed build set it, expecting the caller to hold the git property lock"
+  declare APP="$1" BUILD_SOURCE_IMAGE="$2" PREVIOUS_SOURCE_IMAGE="$3"
+
+  if [[ "$(fn-git-source-image "$APP")" != "$BUILD_SOURCE_IMAGE" ]]; then
+    return
+  fi
+
+  fn-plugin-property-write "git" "$APP" "source-image" "$PREVIOUS_SOURCE_IMAGE"
 }
 
 cmd-git-upload-pack() {
@@ -162,8 +198,8 @@ cmd-git-upload-pack() {
   declare APP="$1"
 
   APP="$(echo "$APP" | perl -pe 's/(?<!\\)'\''//g' | sed 's/\\'\''/'\''/g' | sed 's/^\///g')"
-  is_valid_app_name "$APP"
-  ! plugn trigger app-exists "$APP" >/dev/null 2>&1 && plugn trigger app-maybe-create "$APP"
+  fn-git-verify-app "$APP"
+  ! plugn trigger app-exists "$APP" &>/dev/null && plugn trigger app-maybe-create "$APP"
 
   plugn trigger git-pre-pull "$APP"
   cat | git-upload-pack "$DOKKU_ROOT/$APP"
@@ -176,9 +212,9 @@ cmd-git-glob() {
   local APP="$(echo "$2" | perl -pe 's/(?<!\\)'\''//g' | sed 's/\\'\''/'\''/g' | sed 's/^\///g')"
   local APP_PATH=$DOKKU_ROOT/$APP
 
-  plugn trigger app-exists "$APP" 2>/dev/null || is_valid_app_name "$APP"
+  fn-git-verify-app "$APP"
   if [[ $1 == "git-receive-pack" && ! -d "$APP_PATH/refs" ]]; then
-    ! plugn trigger app-exists "$APP" >/dev/null 2>&1 && plugn trigger app-maybe-create "$APP"
+    ! plugn trigger app-exists "$APP" &>/dev/null && plugn trigger app-maybe-create "$APP"
 
     fn-git-create-hook "$APP"
   fi

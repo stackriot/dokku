@@ -20,12 +20,13 @@ Additional commands:`
 	helpContent = `
     buildpacks:add [--index 1] <app> <buildpack>, Add new app buildpack while inserting into list of buildpacks if necessary
     buildpacks:clear <app>, Clear all buildpacks set on the app
+    buildpacks:detect <app> [--branch <branch-name>], Detect the buildpack for an app (if not specified, the branch flag defaults to the deploy branch)
     buildpacks:list <app>, List all buildpacks for an app
     buildpacks:remove <app> <buildpack>, Remove a buildpack set on the app
     buildpacks:report [<app>] [<flag>], Displays a buildpack report for one or more apps
     buildpacks:set [--index 1] <app> <buildpack>, Set new app buildpack at a given position defaulting to the first buildpack if no index is specified
-    buildpacks:set-property [--global|<app>] <key> <value>, Set or clear a buildpacks property for an app
-`
+    buildpacks:set --replace <app> <buildpack> [<buildpack> ...], Replace the entire ordered buildpack list with the specified buildpacks
+    buildpacks:set-property [--global|<app>] <key> <value>, Set or clear a buildpacks property for an app`
 )
 
 func main() {
@@ -37,11 +38,11 @@ func main() {
 	case "buildpacks", "buildpacks:help":
 		usage()
 	case "help":
-		command := common.NewShellCmd(fmt.Sprintf("ps -o command= %d", os.Getppid()))
-		command.ShowOutput = false
-		output, err := command.Output()
-
-		if err == nil && strings.Contains(string(output), "--all") {
+		result, err := common.CallExecCommand(common.ExecCommandInput{
+			Command: "ps",
+			Args:    []string{"-o", "command=", strconv.Itoa(os.Getppid())},
+		})
+		if err == nil && strings.Contains(result.StdoutContents(), "--all") {
 			fmt.Println(helpContent)
 		} else {
 			fmt.Print("\n    buildpacks, Manage buildpack settings for an app\n")

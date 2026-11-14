@@ -1,44 +1,78 @@
 # Docker Local Scheduler
 
+> [!IMPORTANT]
 > Subcommands new as of 0.12.12
 
 ```
 scheduler-docker-local:report [<app>] [<flag>]              # Displays a scheduler-docker-local report for one or more apps
-scheduler-docker-local:set <app> <key> (<value>)            # Set or clear a scheduler-docker-local property for an app
+scheduler-docker-local:set [<app>|--global] <key> (<value>) # Set or clear a scheduler-docker-local property for an app or globally
 ```
 
+> [!IMPORTANT]
 > New as of 0.12.0
 
 Dokku natively includes functionality to manage application lifecycles for a single server using the `scheduler-docker-local` plugin. It is the default scheduler, but as with all schedulers, it is set on a per-application basis. The scheduler can currently be overridden by running the following command:
 
 ```shell
-dokku config:set node-js-app DOCKER_SCHEDULER=docker-local
+dokku scheduler:set node-js-app selected docker-local
 ```
 
-As it is the default, unsetting the `DOCKER_SCHEDULER` config variable is also a valid way to reset the scheduler.
+As it is the default, unsetting the `selected` scheduler property is also a valid way to reset the scheduler.
 
 ```shell
-dokku config:unset node-js-app DOCKER_SCHEDULER
+dokku scheduler:set node-js-app selected
 ```
 
 ## Usage
 
-### Disabling chown of persistent storage
+### Deploying amd64 images on arm64
 
-The `scheduler-docker-local` plugin will ensure your storage mounts are owned by either `herokuishuser` or the overridden value you have set in `DOKKU_APP_USER`. You may disable this by running the following `scheduler-docker-local:set` command for your application:
+> [!IMPORTANT]
+> New as of 0.33.0
+
+Many builders only produce amd64-compatible images. The docker-local scheduler will automatically detect these and run them via the `--platform=linux/amd64` on arm64 deploy targets.
+
+### Disabling the init process
+
+The `scheduler-docker-local` injects an init process by default via the `--init`. For some apps - such as those where the built docker image uses S6 as the init - this may be undesirable and cause issues with process starts. You may disable this by running the following `scheduler-docker-local:set` command for your application:
 
 ```shell
-dokku scheduler-docker-local:set node-js-app disable-chown true
+dokku scheduler-docker-local:set node-js-app init-process false
 ```
 
-Once set, you may re-enable it by setting a blank value for `disable-chown`:
+Once set, you may re-enable it by setting a blank value for `init-process`:
 
 ```shell
-dokku scheduler-docker-local:set node-js-app disable-chown
+dokku scheduler-docker-local:set node-js-app init-process
 ```
+
+The default value may also be configured globally with the `--global` flag. Per-app values take precedence over the global value when set.
+
+```shell
+dokku scheduler-docker-local:set --global init-process false
+```
+
+The global value may also be unset by setting a blank value.
+
+```shell
+dokku scheduler-docker-local:set --global init-process
+```
+
+All image containers with the label `org.opencontainers.image.vendor=linuxserver.io` will have the automatic init process injection force-disabled without further intervention when neither an app-level nor a global value is set.
+
+### Failed deploys
+
+When a deploy fails - for example, because a new container does not pass its [zero downtime checks](/docs/deployment/zero-downtime-deploys.md) - the previously running containers are left in place. The app's `latest` image tag is restored to the image the previously running containers use, so commands such as `ps:restart`, `ps:start`, and `ps:restore` bring back the previous release instead of the failed one. The image of the failed release is then removed by `ps:retire`.
+
+To support this, the image an app is running is tagged as `dokku/<app>:dokku-previous` while a build and deploy are in progress. This tag is removed once the deploy completes.
+
+The image currently tagged as the app's `latest` image is never removed by `ps:retire`. This allows an app whose first deploy failed to be started once the cause of the failure has been corrected without requiring a rebuild.
+
+When the `registry` plugin's `push-on-release` property is enabled, the incremented image tag is kept after a failed deploy, and restarting the app will deploy that tag.
 
 ### Deploying Process Types in Parallel
 
+> [!IMPORTANT]
 > New as of 0.25.5
 
 By default, Dokku deploys an app's processes one-by-one in order, with the `web` process being deployed first. Deployment parallelism may be achieved by setting the `parallel-schedule-count` property, which defaults to `1`. Increasing this number increases the number of process types that may be deployed in parallel (with the web process being the exception).
@@ -54,6 +88,18 @@ Once set, you may reset it by setting a blank value for `parallel-schedule-count
 dokku scheduler-docker-local:set node-js-app parallel-schedule-count
 ```
 
+The default value may also be configured globally with the `--global` flag. Per-app values take precedence over the global value when set.
+
+```shell
+dokku scheduler-docker-local:set --global parallel-schedule-count 4
+```
+
+The global value may also be unset by setting a blank value.
+
+```shell
+dokku scheduler-docker-local:set --global parallel-schedule-count
+```
+
 If the value of `parallel-schedule-count` is increased and a given process type fails to schedule successfully, then any in-flight process types will continue to be processed, while all process types that have not been scheduled will be skipped before the deployment finally fails.
 
 Container scheduling output is shown in the order it is received, and thus may be out of order in case of output to stderr.
@@ -62,19 +108,14 @@ Note that increasing the value of `parallel-schedule-count` may significantly im
 
 #### Increasing parallelism within a process deploy
 
+> [!IMPORTANT]
 > New as of 0.26.0
 
 By default, Dokku will deploy one instance of a given process type at a time. This can be increased by customizing the `app.json` `formation` key to include a `max_parallel` key for the given process type.
 
-An `app.json` file can be committed to the root of the pushed app repository, and must be within the built image artifact in the image's working directory as shown below.
-
-- Buildpacks: `/app/app.json`
-- Dockerfile: `WORKDIR/app.json` or `/app.json` (if no working directory specified)
-- Docker Image: `WORKDIR/app.json` or `/app.json` (if no working directory specified)
-
 The `formation` key should be specified as follows in the `app.json` file:
 
-```Procfile
+```json
 {
   "formation": {
     "web": {
@@ -87,11 +128,68 @@ The `formation` key should be specified as follows in the `app.json` file:
 }
 ```
 
-Omitting or removing the entry will result in parallelism for that process type to return to 1 entry at a time. This can be combined with the  `parallel-schedule-count` property to speed up deployments.
+Omitting or removing the entry will result in parallelism for that process type to return to 1 entry at a time. This can be combined with the `parallel-schedule-count` property to speed up deployments.
 
 Note that increasing the value of `max_parallel` may significantly impact CPU utilization on your host as your app containers - and their respective processes - start up. Setting a value higher than the number of available CPUs is discouraged. It is recommended that users carefully set this value so as not to overburden their server.
 
-## Implemented Triggers
+See the [app.json location documentation](/docs/advanced-usage/deployment-tasks.md#changing-the-appjson-location) for more information on where to place your `app.json` file.
+
+### Displaying scheduler-docker-local reports for an app
+
+You can get a report about the app's scheduler-docker-local configuration using the `scheduler-docker-local:report` command:
+
+```shell
+dokku scheduler-docker-local:report
+```
+
+```
+=====> node-js-app scheduler-docker-local information
+       Scheduler docker local computed init process:          true
+       Scheduler docker local computed parallel schedule count:1
+       Scheduler docker local global init process:            true
+       Scheduler docker local global parallel schedule count: 1
+       Scheduler docker local init process:
+       Scheduler docker local parallel schedule count:
+```
+
+You can run the command for a specific app also.
+
+```shell
+dokku scheduler-docker-local:report node-js-app
+```
+
+You can pass flags which will output only the value of the specific information you want. For example:
+
+```shell
+dokku scheduler-docker-local:report node-js-app --scheduler-docker-local-computed-init-process
+```
+
+When run against `--global`, only the global keys are reported.
+
+```shell
+dokku scheduler-docker-local:report --global
+```
+
+The available keys are:
+
+- `--scheduler-docker-local-init-process`: the raw per-app init-process value (empty when unset).
+- `--scheduler-docker-local-computed-init-process`: the effective init-process value, computed as the per-app value if set, otherwise the global value, otherwise `true`.
+- `--scheduler-docker-local-global-init-process`: the global init-process value (defaults to `true`).
+- `--scheduler-docker-local-parallel-schedule-count`: the raw per-app parallel-schedule-count value (empty when unset).
+- `--scheduler-docker-local-computed-parallel-schedule-count`: the effective parallel-schedule-count value, computed as the per-app value if set, otherwise the global value, otherwise `1`.
+- `--scheduler-docker-local-global-parallel-schedule-count`: the global parallel-schedule-count value (defaults to `1`).
+
+The report may also be emitted as JSON using `--format json`, which is useful for external tooling that needs to distinguish a value set on the app from one that is defaulting.
+
+```shell
+dokku scheduler-docker-local:report node-js-app --format json
+```
+
+## Scheduler Interface
+
+The following sections describe implemented scheduler functionality for the `docker-local` scheduler.
+
+### Implemented Commands and Triggers
 
 This plugin implements various functionality through `plugn` triggers to integrate with Docker for running apps on a single server. The following functionality is supported by the `scheduler-docker-local` plugin.
 
@@ -105,22 +203,35 @@ This plugin implements various functionality through `plugn` triggers to integra
 - `ps:stop`
 - `run`
 
-## Supported Resource Management Properties
+### Logging support
+
+App logs for the `logs` command are fetched from running containers via the `docker` cli. To persist logs across deployments, consider using Dokku's [vector integration](/docs/deployment/logs.md#vector-logging-shipping) to ship logs to another service or a third-party platform.
+
+### Supported Resource Management Properties
 
 The `docker-local` scheduler supports a minimal list of resource _limits_ and _reservations_. The following properties are supported:
 
-### Resource Limits
+#### Resource Limits
 
 - cpu: (docker option: `--cpus`), is specified in number of CPUs a process can access.
-  - See the ["CPU" section](https://docs.docker.com/config/containers/resource_constraints/#cpu) of the Docker Runtime Options documentation for more information.
-- memory: (docker option: `--memory`) should be specified with a suffix of `b` (bytes), `k` (kilobytes), `m` (megabytes), `g` (gigabytes).
-  - See the ["Memory" section](https://docs.docker.com/config/containers/resource_constraints/#memory) of the Docker Runtime Options documentation for more information.
-- memory-swap: (docker option: `--memory-swap`) should be specified with a suffix of `b` (bytes), `k` (kilobytes), `m` (megabytes), `g` (gigabytes)
-  - See the ["Memory" section](https://docs.docker.com/config/containers/resource_constraints/#memory) of the Docker Runtime Options documentation for more information.
+    - See the ["CPU" section](https://docs.docker.com/config/containers/resource_constraints/#cpu) of the Docker Runtime Options documentation for more information.
+- memory: (docker option: `--memory`) should be specified with a suffix of `b` (bytes), `k` (kilobytes), `m` (megabytes), `g` (gigabytes), `t` (terabytes) or `p` (petabytes). Suffixes are case-insensitive and may be followed by `i` and/or `b`, such as `512M`, `1G`, or `1GiB`. Default unit is `m` (megabytes).
+    - See the ["Memory" section](https://docs.docker.com/config/containers/resource_constraints/#memory) of the Docker Runtime Options documentation for more information.
+- memory-swap: (docker option: `--memory-swap`) should be specified with the same suffixes as `memory`, or `-1` for unlimited swap. Values without a suffix are in bytes.
+    - See the ["Memory" section](https://docs.docker.com/config/containers/resource_constraints/#memory) of the Docker Runtime Options documentation for more information.
 - nvidia-gpus: (docker option: `--gpus`), is specified in number of Nvidia GPUs a process can access.
-  - See the ["GPU" section](https://docs.docker.com/config/containers/resource_constraints/#gpu) of the Docker Runtime Options documentation for more information.
+    - See the ["GPU" section](https://docs.docker.com/config/containers/resource_constraints/#gpu) of the Docker Runtime Options documentation for more information.
 
-### Resource Reservations
+#### Resource Reservations
 
-- memory: (docker option: `--memory-reservation`) should be specified with a suffix of `b` (bytes), `k` (kilobytes), `m` (megabytes), `g` (gigabytes)
-  - See the ["Memory" section](https://docs.docker.com/config/containers/resource_constraints/#memory) of the Docker Runtime Options documentation for more information.
+- memory: (docker option: `--memory-reservation`) should be specified with the same suffixes as the `memory` limit. Default unit is `m` (megabytes).
+    - See the ["Memory" section](https://docs.docker.com/config/containers/resource_constraints/#memory) of the Docker Runtime Options documentation for more information.
+
+## Properties
+
+### Settable properties
+
+| Property | Scope | Default | Report flags | Description |
+| --- | --- | --- | --- | --- |
+| `init-process` | app + global | `true` | `--scheduler-docker-local-init-process`, `--scheduler-docker-local-global-init-process`, `--scheduler-docker-local-computed-init-process` | When `true`, runs containers with Docker's `--init` flag (reaping zombie processes) |
+| `parallel-schedule-count` | app + global | `1` | `--scheduler-docker-local-parallel-schedule-count`, `--scheduler-docker-local-global-parallel-schedule-count`, `--scheduler-docker-local-computed-parallel-schedule-count` | Maximum number of containers scheduled in parallel during a deploy |

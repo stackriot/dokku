@@ -6,14 +6,29 @@ import (
 
 // ReportSingleApp is an internal function that displays the scheduler report for one or more apps
 func ReportSingleApp(appName string, format string, infoFlag string) error {
-	if err := common.VerifyAppName(appName); err != nil {
-		return err
+	if appName != "--global" {
+		if err := common.VerifyAppName(appName); err != nil {
+			return err
+		}
 	}
 
-	flags := map[string]common.ReportFunc{
-		"--scheduler-computed-selected": reportComputedSelected,
-		"--scheduler-global-selected":   reportGlobalSelected,
-		"--scheduler-selected":          reportSelected,
+	var flags map[string]common.ReportFunc
+	if appName == "--global" {
+		flags = map[string]common.ReportFunc{
+			"--scheduler-computed-selected": reportComputedSelected,
+			"--scheduler-global-selected":   reportGlobalSelected,
+			"--scheduler-computed-shell":    reportComputedShell,
+			"--scheduler-global-shell":      reportGlobalShell,
+		}
+	} else {
+		flags = map[string]common.ReportFunc{
+			"--scheduler-computed-selected": reportComputedSelected,
+			"--scheduler-global-selected":   reportGlobalSelected,
+			"--scheduler-selected":          reportSelected,
+			"--scheduler-computed-shell":    reportComputedShell,
+			"--scheduler-global-shell":      reportGlobalShell,
+			"--scheduler-shell":             reportShell,
+		}
 	}
 
 	flagKeys := []string{}
@@ -21,10 +36,18 @@ func ReportSingleApp(appName string, format string, infoFlag string) error {
 		flagKeys = append(flagKeys, flagKey)
 	}
 
-	trimPrefix := false
-	uppercaseFirstCharacter := true
 	infoFlags := common.CollectReport(appName, infoFlag, flags)
-	return common.ReportSingleApp("scheduler", appName, infoFlag, infoFlags, flagKeys, format, trimPrefix, uppercaseFirstCharacter)
+	return common.ReportSingleApp(common.ReportSingleAppInput{
+		ReportType:              "scheduler",
+		AppName:                 appName,
+		InfoFlag:                infoFlag,
+		InfoFlags:               infoFlags,
+		InfoFlagKeys:            flagKeys,
+		Format:                  format,
+		TrimPrefix:              true,
+		UppercaseFirstCharacter: true,
+		EmitLegacyPrefix:        true,
+	})
 }
 
 func reportComputedSelected(appName string) string {
@@ -32,14 +55,34 @@ func reportComputedSelected(appName string) string {
 	if value == "" {
 		value = reportGlobalSelected(appName)
 	}
+	if value == "" {
+		value = "docker-local"
+	}
 
 	return value
 }
 
 func reportGlobalSelected(appName string) string {
-	return common.PropertyGetDefault("scheduler", "--global", "selected", "docker-local")
+	return common.PropertyGet("scheduler", "--global", "selected")
 }
 
 func reportSelected(appName string) string {
 	return common.PropertyGet("scheduler", appName, "selected")
+}
+
+func reportComputedShell(appName string) string {
+	value := reportShell(appName)
+	if value == "" {
+		value = reportGlobalShell(appName)
+	}
+
+	return value
+}
+
+func reportGlobalShell(appName string) string {
+	return common.PropertyGet("scheduler", "--global", "shell")
+}
+
+func reportShell(appName string) string {
+	return common.PropertyGet("scheduler", appName, "shell")
 }

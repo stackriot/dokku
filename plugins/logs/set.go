@@ -3,16 +3,48 @@ package logs
 import (
 	"errors"
 	"fmt"
+	"regexp"
 	"strconv"
+	"strings"
+
+	"github.com/dokku/dokku/plugins/common"
 )
 
 func validateSetValue(appName string, key string, value string) error {
+	if key == "app-label-alias" {
+		return validateAppLabelAlias(appName, value)
+	}
+
 	if key == "max-size" {
 		return validateMaxSize(appName, value)
 	}
 
-	if key == "vector-sink" {
+	if key == "vector-image" {
+		return validateVectorImage(appName, value)
+	}
+
+	if key == "vector-networks" {
+		return validateVectorNetworks(appName, value)
+	}
+
+	if key == "vector-sink" || key == "vector-cron-sink" {
 		return validateVectorSink(appName, value)
+	}
+
+	return nil
+}
+
+// appLabelAliasPattern matches label keys that are safe to both use as a docker
+// label and quote into the generated vector remap program
+var appLabelAliasPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]*$`)
+
+func validateAppLabelAlias(appName string, value string) error {
+	if value == "" {
+		return nil
+	}
+
+	if !appLabelAliasPattern.MatchString(value) {
+		return errors.New("Invalid app-label-alias value, must start with a letter or number and contain only letters, numbers, and any of [_, ., -]")
 	}
 
 	return nil
@@ -49,9 +81,48 @@ func validateVectorSink(appName string, value string) error {
 		return nil
 	}
 
-	_, err := sinkValueToConfig(appName, value)
+	_, err := SinkValueToConfig(SinkValueToConfigInput{SinkValue: value})
 	if err != nil {
 		return err
+	}
+
+	return nil
+}
+
+func validateVectorImage(appName string, value string) error {
+	if appName != "--global" {
+		return errors.New("vector-image may only be set globally with --global")
+	}
+
+	return nil
+}
+
+func validateVectorNetworks(appName string, value string) error {
+	if appName != "--global" {
+		return errors.New("vector-networks may only be set globally with --global")
+	}
+
+	if value == "" {
+		return nil
+	}
+
+	for _, name := range strings.Split(value, ",") {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			return errors.New("Invalid vector-networks value, empty entry in comma-separated list")
+		}
+
+		if name == "bridge" {
+			return errors.New("Invalid vector-networks value, \"bridge\" is not a valid entry for vector-networks")
+		}
+
+		result, err := common.CallExecCommand(common.ExecCommandInput{
+			Command: common.DockerBin(),
+			Args:    []string{"network", "inspect", name},
+		})
+		if err != nil || result.ExitCode != 0 {
+			return fmt.Errorf("Network %q does not exist", name)
+		}
 	}
 
 	return nil

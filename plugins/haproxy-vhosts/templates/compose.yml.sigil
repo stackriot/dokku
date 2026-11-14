@@ -1,0 +1,31 @@
+---
+services:
+  haproxy:
+    image: "{{ $.HAPROXY_IMAGE }}"
+
+    environment:
+      - EASYHAPROXY_DISCOVER=docker
+      - EASYHAPROXY_LABEL_PREFIX=haproxy
+      - EASYHAPROXY_LOG_LEVEL={{ $.HAPROXY_LOG_LEVEL }}
+      - EASYHAPROXY_REFRESH_CONF={{ $.HAPROXY_REFRESH_CONF }}
+      - CERTBOT_LOG_LEVEL={{ $.HAPROXY_LOG_LEVEL }}
+      - HAPROXY_LOG_LEVEL={{ $.HAPROXY_LOG_LEVEL }}
+      {{ if $.HAPROXY_LETSENCRYPT_EMAIL }}
+      - EASYHAPROXY_CERTBOT_EMAIL={{ $.HAPROXY_LETSENCRYPT_EMAIL }}
+      - EASYHAPROXY_CERTBOT_SERVER={{ $.HAPROXY_LETSENCRYPT_SERVER }}
+      {{ end }}
+      - HAPROXY_STATS_ENABLE=false
+
+    network_mode: bridge
+
+    ports:
+      - "80:80"
+      {{ if $.HAPROXY_LETSENCRYPT_EMAIL }}
+      - "443:443"
+      {{ end }}
+
+    restart: unless-stopped
+
+    volumes:
+      - "/var/run/docker.sock:/var/run/docker.sock:ro"
+      - "{{ $.HAPROXY_DATA_DIR }}:/etc/easyhaproxy/certs/certbot"

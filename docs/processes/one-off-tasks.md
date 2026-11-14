@@ -1,9 +1,11 @@
 # One-off Tasks
 
 ```
-run [-e|--env KEY=VALUE] [--no-tty] <app> <cmd>         # Run a command in a new container using the current app image
-run:detached [-e|-env KEY=VALUE] [--no-tty] <app> <cmd> # Run a command in a new detached container using the current app image
-run:list [<app>]                                        # List all run containers for an app
+run [-e|--env KEY=VALUE] [--no-tty] [--ttl-seconds SECONDS] <app> <cmd>              # Run a command in a new container using the current app image
+run:detached [-e|-env KEY=VALUE] [--force-tty] [--ttl-seconds SECONDS] <app> <cmd>         # Run a command in a new detached container using the current app image
+run:list [--format json|stdout] [<app>]                      # List all run containers for an app
+run:logs <app|--container CONTAINER> [-h] [-t] [-n num] [-q] # Display recent log output for run containers
+run:stop <app|--container CONTAINER>                         # Stops all run containers for an app or a specified run container
 ```
 
 Sometimes it is necessary to run a one-off command under an app. Dokku makes it easy to run a fresh container via the `run` command.
@@ -14,6 +16,7 @@ Sometimes it is necessary to run a one-off command under an app. Dokku makes it 
 
 The `run` command can be used to run a one-off process for a specific command. This will start a new container and run the desired command within that container.  The container image will be the same container image as was used to start the currently deployed app.
 
+> [!IMPORTANT]
 > New as of 0.25.0, this container will be removed after the process exits.
 
 ```shell
@@ -25,6 +28,15 @@ dokku run --env "NODE_ENV=development" --env "PATH=/custom/path" node-js-app npm
 ```
 
 One off containers are removed at the end of process execution.
+
+In addition, one-off containers also run for a max of 24 hours (86400 seconds) by default, after which they are reaped. This can be changed by setting the `--ttl-seconds` argument:
+
+```shell
+# runs for 10 minutes
+dokku run --ttl-seconds 600 node-js-app npm run mytask
+```
+
+One-off containers that exceed their runtime are reaped every 5 minutes, so the ttl-seconds is an approximation and your app may end up running for up to 5 minutes longer than expected.
 
 #### Running Procfile commands
 
@@ -39,6 +51,8 @@ console: bundle exec racksh
 dokku run my-app console
 ```
 
+The Procfile command is split into arguments using the same shell quoting rules used when deploying the app. See the [Procfile documentation](/docs/processes/process-management.md#procfile) for more details.
+
 #### Specifying container labels
 
 Containers may have specific labels attached. In order to avoid issues with dokku internals, do not use any labels beginning with either `com.dokku` or `org.label-schema`.
@@ -49,6 +63,7 @@ dokku --label=com.example.test-label=value run node-js-app ls -lah
 
 #### Disabling TTY
 
+> [!IMPORTANT]
 > New as of 0.25.0
 
 One-off containers default to interactive mode where possible. To disable this behavior, specify the `--no-tty` flag:
@@ -59,17 +74,54 @@ dokku run --no-tty node-js-app ls -lah
 
 ### Running a detached container
 
+> [!IMPORTANT]
 > New as of 0.25.0
 
-Finally, a container can be run in "detached" mode via the `run:detached` Dokku command. Running a process in detached mode will immediately return a `CONTAINER_ID`. Detached containers are run without a tty and are also removed at the end of process execution.
+Finally, a container can be run in "detached" mode via the `run:detached` Dokku command. Running a process in detached mode will immediately return the container name (or pod name when using the k3s scheduler). Detached containers run without a tty by default and are also removed at the end of process execution.
 
 ```shell
 dokku run:detached node-js-app ls -lah
 # returns the ID of the new container
 ```
 
+To start a detached container with a tty, specify the `--force-tty` flag. Containers will still exit upon command termination, but can be attached to as long as they are running.
+
+```shell
+dokku run:detached --force-tty node-js-app bash
+```
+
+### Displaying one-off container logs
+
+You can easily get logs of all one-off containers for an app using the `logs` command:
+
+```shell
+dokku run:logs node-js-app
+```
+
+Logs are pulled via integration with the scheduler for the specified application via "live tailing". As such, logs from previously running deployments are usually not available. Users that desire to see logs from previous deployments for debugging purposes should persist those logs to external services. Please see Dokku's [vector integration](/docs/deployment/logs.md#vector-logging-shipping) for more information on how to persist logs across deployments to ship logs to another service or a third-party platform.
+
+#### Behavioral modifiers
+
+Dokku also supports certain command-line arguments that augment the `run:log` command's behavior.
+
+```
+--container NAME     # the name of a specific container to show logs for
+-n, --num NUM        # the number of lines to display
+-t, --tail           # continually stream logs
+-q, --quiet          # display raw logs without colors, time and names
+```
+
+You can use these modifiers as follows:
+
+```shell
+dokku run:logs -t --container node-js-app.run.1234
+```
+
+The above command will show logs continually from the `node-js-app.run.1234` one-off run process.
+
 ### Listing one-off containers
 
+> [!IMPORTANT]
 > New as of 0.25.0
 
 One-off containers for a given app can be listed via the `run:list` command:
@@ -85,3 +137,51 @@ node-js-app.run.28689   "/exec sleep 15"   2 seconds ago
 ```
 
 > The `COMMAND` displayed will be what Docker executes and may not exactly match the command specified by a `dokku run` command.
+
+The output can also be shown in json format:
+
+```shell
+dokku run:list node-js-app --format json
+```
+
+```
+[
+  {
+    "name": "node-js-app.run.28689",
+    "state": "running",
+    "command": "\"/exec 'sleep 15'\"",
+    "created_at": "2022-08-03 05:47:44 +0000 UTC"
+  }
+]
+```
+
+### Stopping a one-off container
+
+> [!IMPORTANT]
+> New as of 0.29.0
+
+Run containers for an app can be stopped via the `run:stop` command. The output will be the container id.
+
+```shell
+# start a container
+# the output will be something like: node-js-app.run.2313
+dokku run node-js-app sleep 300
+
+# stop the container
+dokku run:stop --container node-js-app.run.2313
+```
+
+```
+node-js-app.run.2313
+```
+
+All containers for a given app can be stopped by specifying the app name.
+
+```shell
+dokku run:stop node-js-app
+```
+
+```
+node-js-app.run.2313
+node-js-app.run.574
+```

@@ -14,10 +14,9 @@ trigger-events-install() {
 
   # This can be done unconditionally as mkdir -p
   # exits gracefully if the path already exists
-  # shellcheck disable=SC2174
   mkdir -m 775 -p "$DOKKU_LOGS_DIR"
   case "$DOKKU_DISTRO" in
-    arch | debian | centos | fedora | raspbian | rhel)
+    arch | debian | raspbian)
       chgrp dokku "$DOKKU_LOGS_DIR"
       ;;
     *)
@@ -28,7 +27,7 @@ trigger-events-install() {
   if [[ ! -f "$DOKKU_EVENTS_LOGFILE" ]]; then
     touch "$DOKKU_EVENTS_LOGFILE"
     case "$DOKKU_DISTRO" in
-      arch | debian | centos | fedora | raspbian | rhel)
+      arch | debian | raspbian)
         chgrp dokku "$DOKKU_EVENTS_LOGFILE"
         ;;
       *)
@@ -57,16 +56,12 @@ EOF
     cat >"$DOKKU_LOGROTATE_FILE" <<EOF
 $DOKKU_LOGS_DIR/*.log {
         daily
-        rotate 7
         missingok
-        notifempty
-        su syslog dokku
+        rotate 7
         compress
         delaycompress
-        postrotate
-                reload rsyslog >/dev/null 2>&1 || true
-        endscript
-        create 664 syslog dokku
+        notifempty
+        copytruncate
 }
 EOF
 
@@ -77,8 +72,39 @@ EOF
     flag_rsyslog_needs_restart=y
   fi
 
-  if [[ -f "$DOKKU_RSYSLOG_FILTER" && "$flag_rsyslog_needs_restart" == "y" ]]; then
-    service rsyslog restart
+  local systemctl_path=/bin/systemctl
+  if [[ -x /usr/bin/systemctl ]]; then
+    systemctl_path=/usr/bin/systemctl
+  fi
+
+  if [[ -f "$DOKKU_RSYSLOG_FILTER" ]] && [[ "$flag_rsyslog_needs_restart" == "y" ]]; then
+    case "$DOKKU_DISTRO" in
+      debian | raspbian)
+        if [[ -x "$systemctl_path" ]]; then
+          systemctl restart rsyslog
+        else
+          /usr/sbin/invoke-rc.d rsyslog restart
+        fi
+        ;;
+      ubuntu)
+        if [[ "$DOKKU_INIT_SYSTEM" == "sv" ]]; then
+          # avoid failing runit init calls on install
+          # the runit binaries are not yet available during dockerfile building
+          true
+        elif [[ -x "$systemctl_path" ]]; then
+          systemctl restart rsyslog
+        elif [[ -x /usr/bin/sv ]]; then
+          # avoid failing runit init calls on install
+          # the runit binaries are not yet available during dockerfile building
+          true
+        else
+          invoke-rc.d rsyslog restart
+        fi
+        ;;
+      arch)
+        systemctl restart rsyslog
+        ;;
+    esac
   fi
 
   [[ ! "$DOKKU_EVENTS" ]] || dokku_log_plugn_trigger_call "$(basename "$0")" "$@"

@@ -81,6 +81,19 @@ func main() {
 		for key, value := range values {
 			fmt.Println(fmt.Sprintf("%s %s", key, strings.TrimSuffix(value, "\n")))
 		}
+
+	case "get-all-by-prefix":
+		appName := flag.Arg(2)
+		prefix := flag.Arg(3)
+		values, err := common.PropertyGetAllByPrefix(pluginName, appName, prefix)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err.Error())
+			os.Exit(1)
+		}
+
+		for key, value := range values {
+			fmt.Println(fmt.Sprintf("%s %s", key, strings.TrimSuffix(value, "\n")))
+		}
 	case "get-with-default":
 		appName := flag.Arg(2)
 		property := flag.Arg(3)
@@ -179,6 +192,76 @@ func main() {
 			fmt.Fprintln(os.Stderr, err.Error())
 			os.Exit(1)
 		}
+	case "migrate-config-to-property":
+		property := flag.Arg(2)
+		configVar := flag.Arg(3)
+
+		globalConfigVar := ""
+		transformName := ""
+		listProperty := false
+		for i := 4; i < flag.NArg(); i++ {
+			arg := flag.Arg(i)
+			switch {
+			case arg == "--list":
+				listProperty = true
+			case arg == "--global-config-var" && i+1 < flag.NArg():
+				i++
+				globalConfigVar = flag.Arg(i)
+			case arg == "--transform" && i+1 < flag.NArg():
+				i++
+				transformName = flag.Arg(i)
+			}
+		}
+
+		var transform func(string) string
+		switch transformName {
+		case "restore-bool":
+			transform = func(value string) string {
+				if value == "0" {
+					return "false"
+				}
+				return "true"
+			}
+		case "non-empty-to-true":
+			transform = func(value string) string {
+				if value != "" {
+					return "true"
+				}
+				return value
+			}
+		case "skip-all-checks-to-disabled":
+			transform = func(value string) string {
+				if value == "true" {
+					return "_all_"
+				}
+				return ""
+			}
+		case "checks-enabled-to-skipped":
+			transform = func(value string) string {
+				if value == "0" {
+					return "_all_"
+				}
+				return ""
+			}
+		case "":
+			// no transform
+		default:
+			fmt.Fprintf(os.Stderr, "Unknown transform: %s\n", transformName)
+			os.Exit(1)
+		}
+
+		entry := common.MigrateConfigEntry{
+			ConfigVar:       configVar,
+			GlobalConfigVar: globalConfigVar,
+			Property:        property,
+			Transform:       transform,
+			ListProperty:    listProperty,
+		}
+
+		if err := common.MigrateConfigToProperties(pluginName, []common.MigrateConfigEntry{entry}); err != nil {
+			fmt.Fprintln(os.Stderr, err.Error())
+			os.Exit(1)
+		}
 	case "set":
 		appName := flag.Arg(2)
 		property := flag.Arg(3)
@@ -190,6 +273,13 @@ func main() {
 		}
 	case "setup":
 		err := common.PropertySetup(pluginName)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err.Error())
+			os.Exit(1)
+		}
+	case "setup-app":
+		appName := flag.Arg(2)
+		err := common.PropertySetupApp(pluginName, appName)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err.Error())
 			os.Exit(1)

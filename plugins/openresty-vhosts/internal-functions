@@ -1,0 +1,833 @@
+#!/usr/bin/env bash
+source "$PLUGIN_CORE_AVAILABLE_PATH/common/functions"
+source "$PLUGIN_CORE_AVAILABLE_PATH/common/property-functions"
+set -eo pipefail
+[[ $DOKKU_TRACE ]] && set -x
+
+fn-get-pagesize() {
+  declare desc="return the underlying system's memory page size"
+  declare todo="port to common functions"
+
+  "$PLUGIN_CORE_AVAILABLE_PATH/nginx-vhosts/pagesize"
+}
+
+fn-openresty-route-labels() {
+  declare desc="emits per-route openresty labels for a non-web container"
+  declare APP="$1" PROC_TYPE="$2" STDIN="$3"
+  local output route_proc route_port route_path route_strip route_index=0
+
+  output=""
+  while IFS='|' read -r route_proc route_port route_path route_strip; do
+    [[ -z "$route_proc" ]] && continue
+    [[ "$route_proc" != "$PROC_TYPE" ]] && continue
+
+    output="$output --label 'openresty.route.${route_index}.path-prefix=${route_path}'"
+    output="$output --label 'openresty.route.${route_index}.port=${route_port}'"
+    if [[ "$route_strip" == "1" ]]; then
+      output="$output --label 'openresty.route.${route_index}.strip-prefix=true'"
+    fi
+    route_index=$((route_index + 1))
+  done < <(plugn trigger proxy-routes-list "$APP")
+
+  local proxy_labels_file_path=$(fn-proxy-get-labels-file-path "openresty" "$APP")
+  if [[ -f "$proxy_labels_file_path" ]]; then
+    while read -r line; do
+      [[ -z "$line" ]] && continue
+      output="$output --label '$line'"
+    done <"$proxy_labels_file_path"
+  fi
+
+  echo -n "$STDIN $output"
+}
+
+fn-openresty-access-log-format() {
+  declare desc="get the raw per-app access log format"
+  declare APP="$1"
+
+  fn-plugin-property-get "openresty" "$APP" "access-log-format" ""
+}
+
+fn-openresty-global-access-log-format() {
+  declare desc="get the raw global access log format"
+
+  fn-plugin-property-get "openresty" "--global" "access-log-format" ""
+}
+
+fn-openresty-computed-access-log-format() {
+  declare desc="get the effective access log format"
+  declare APP="$1"
+  local value="$(fn-openresty-access-log-format "$APP")"
+
+  if [[ -z "$value" ]]; then
+    value="$(fn-plugin-property-get "openresty" "--global" "access-log-format" "")"
+  fi
+  echo "$value"
+}
+
+fn-openresty-access-log-path() {
+  declare desc="get the raw per-app access log path"
+  declare APP="$1"
+
+  fn-plugin-property-get "openresty" "$APP" "access-log-path" ""
+}
+
+fn-openresty-global-access-log-path() {
+  declare desc="get the raw global access log path"
+
+  fn-plugin-property-get "openresty" "--global" "access-log-path" ""
+}
+
+fn-openresty-computed-access-log-path() {
+  declare desc="get the effective access log path"
+  declare APP="$1"
+  local OPENRESTY_LOG_ROOT="$(fn-openresty-log-root)"
+  local value="$(fn-openresty-access-log-path "$APP")"
+
+  if [[ -z "$value" ]]; then
+    value="$(fn-plugin-property-get "openresty" "--global" "access-log-path" "${OPENRESTY_LOG_ROOT}/${APP}-access.log")"
+  fi
+  echo "$value"
+}
+
+fn-openresty-global-allowed-letsencrypt-domains-func-base64() {
+  declare desc="get the raw configured allowed domains func base64"
+
+  fn-plugin-property-get-default "openresty" "--global" "allowed-letsencrypt-domains-func-base64" ""
+}
+
+fn-openresty-computed-allowed-letsencrypt-domains-func-base64() {
+  declare desc="get the effective allowed domains func base64, falling back to the default stub"
+
+  fn-plugin-property-get-default "openresty" "--global" "allowed-letsencrypt-domains-func-base64" "return true" | base64 -w 0
+}
+
+fn-openresty-bind-address-ipv4() {
+  declare desc="get the raw per-app ipv4 bind address"
+  declare APP="$1"
+
+  fn-plugin-property-get "openresty" "$APP" "bind-address-ipv4" ""
+}
+
+fn-openresty-global-bind-address-ipv4() {
+  declare desc="get the raw global ipv4 bind address"
+
+  fn-plugin-property-get "openresty" "--global" "bind-address-ipv4" ""
+}
+
+fn-openresty-computed-bind-address-ipv4() {
+  declare desc="get the effective ipv4 bind address"
+  declare APP="$1"
+  local value="$(fn-openresty-bind-address-ipv4 "$APP")"
+
+  if [[ -z "$value" ]]; then
+    value="$(fn-plugin-property-get "openresty" "--global" "bind-address-ipv4" "")"
+  fi
+  echo "$value"
+}
+
+fn-openresty-bind-address-ipv6() {
+  declare desc="get the raw per-app ipv6 bind address"
+  declare APP="$1"
+
+  fn-plugin-property-get "openresty" "$APP" "bind-address-ipv6" ""
+}
+
+fn-openresty-global-bind-address-ipv6() {
+  declare desc="get the raw global ipv6 bind address"
+
+  fn-plugin-property-get "openresty" "--global" "bind-address-ipv6" ""
+}
+
+fn-openresty-computed-bind-address-ipv6() {
+  declare desc="get the effective ipv6 bind address"
+  declare APP="$1"
+  local value="$(fn-openresty-bind-address-ipv6 "$APP")"
+
+  if [[ -z "$value" ]]; then
+    value="$(fn-plugin-property-get "openresty" "--global" "bind-address-ipv6" "::")"
+  fi
+  echo "$value"
+}
+
+fn-openresty-client-body-timeout() {
+  declare desc="get the raw per-app client body timeout"
+  declare APP="$1"
+
+  fn-plugin-property-get "openresty" "$APP" "client-body-timeout" ""
+}
+
+fn-openresty-global-client-body-timeout() {
+  declare desc="get the raw global client body timeout"
+
+  fn-plugin-property-get "openresty" "--global" "client-body-timeout" ""
+}
+
+fn-openresty-computed-client-body-timeout() {
+  declare desc="get the effective client body timeout"
+  declare APP="$1"
+  local value="$(fn-openresty-client-body-timeout "$APP")"
+
+  if [[ -z "$value" ]]; then
+    value="$(fn-plugin-property-get "openresty" "--global" "client-body-timeout" "60s")"
+  fi
+  echo "$value"
+}
+
+fn-openresty-client-header-timeout() {
+  declare desc="get the raw per-app client header timeout"
+  declare APP="$1"
+
+  fn-plugin-property-get "openresty" "$APP" "client-header-timeout" ""
+}
+
+fn-openresty-global-client-header-timeout() {
+  declare desc="get the raw global client header timeout"
+
+  fn-plugin-property-get "openresty" "--global" "client-header-timeout" ""
+}
+
+fn-openresty-computed-client-header-timeout() {
+  declare desc="get the effective client header timeout"
+  declare APP="$1"
+  local value="$(fn-openresty-client-header-timeout "$APP")"
+
+  if [[ -z "$value" ]]; then
+    value="$(fn-plugin-property-get "openresty" "--global" "client-header-timeout" "60s")"
+  fi
+  echo "$value"
+}
+
+fn-openresty-client-max-body-size() {
+  declare desc="get the raw per-app client max body size"
+  declare APP="$1"
+
+  fn-plugin-property-get "openresty" "$APP" "client-max-body-size" ""
+}
+
+fn-openresty-global-client-max-body-size() {
+  declare desc="get the raw global client max body size"
+
+  fn-plugin-property-get "openresty" "--global" "client-max-body-size" ""
+}
+
+fn-openresty-computed-client-max-body-size() {
+  declare desc="get the effective client max body size"
+  declare APP="$1"
+  local value="$(fn-openresty-client-max-body-size "$APP")"
+
+  if [[ -z "$value" ]]; then
+    value="$(fn-plugin-property-get "openresty" "--global" "client-max-body-size" "1m")"
+  fi
+  echo "$value"
+}
+
+fn-openresty-error-log-path() {
+  declare desc="get the raw per-app error log path"
+  declare APP="$1"
+
+  fn-plugin-property-get "openresty" "$APP" "error-log-path" ""
+}
+
+fn-openresty-global-error-log-path() {
+  declare desc="get the raw global error log path"
+
+  fn-plugin-property-get "openresty" "--global" "error-log-path" ""
+}
+
+fn-openresty-computed-error-log-path() {
+  declare desc="get the effective error log path"
+  declare APP="$1"
+  local OPENRESTY_LOG_ROOT="$(fn-openresty-log-root)"
+  local value="$(fn-openresty-error-log-path "$APP")"
+
+  if [[ -z "$value" ]]; then
+    value="$(fn-plugin-property-get "openresty" "--global" "error-log-path" "${OPENRESTY_LOG_ROOT}/${APP}-error.log")"
+  fi
+  echo "$value"
+}
+
+fn-openresty-get-http-includes-dir() {
+  declare desc="get any include dir if available"
+  declare APP="$1"
+
+  if [[ -f "${DOKKU_LIB_ROOT}/data/openresty-vhosts/app-$APP/openresty-http-includes.$DOKKU_PID.missing" ]]; then
+    return
+  fi
+
+  if [[ -d "${DOKKU_LIB_ROOT}/data/openresty-vhosts/app-$APP/openresty-http-includes.$DOKKU_PID" ]]; then
+    echo "${DOKKU_LIB_ROOT}/data/openresty-vhosts/app-$APP/openresty-http-includes.$DOKKU_PID"
+  elif [[ -d "${DOKKU_LIB_ROOT}/data/openresty-vhosts/app-$APP/openresty-http-includes" ]]; then
+    echo "${DOKKU_LIB_ROOT}/data/openresty-vhosts/app-$APP/openresty-http-includes"
+  fi
+}
+
+fn-openresty-get-location-includes-dir() {
+  declare desc="get any include dir if available"
+  declare APP="$1"
+
+  if [[ -f "${DOKKU_LIB_ROOT}/data/openresty-vhosts/app-$APP/openresty-location-includes.$DOKKU_PID.missing" ]]; then
+    return
+  fi
+
+  if [[ -d "${DOKKU_LIB_ROOT}/data/openresty-vhosts/app-$APP/openresty-location-includes.$DOKKU_PID" ]]; then
+    echo "${DOKKU_LIB_ROOT}/data/openresty-vhosts/app-$APP/openresty-location-includes.$DOKKU_PID"
+  elif [[ -d "${DOKKU_LIB_ROOT}/data/openresty-vhosts/app-$APP/openresty-location-includes" ]]; then
+    echo "${DOKKU_LIB_ROOT}/data/openresty-vhosts/app-$APP/openresty-location-includes"
+  fi
+}
+
+fn-openresty-hsts-include-subdomains() {
+  declare desc="get the raw per-app hsts include subdomains value"
+  declare APP="$1"
+
+  fn-plugin-property-get "openresty" "$APP" "hsts-include-subdomains" ""
+}
+
+fn-openresty-global-hsts-include-subdomains() {
+  declare desc="get the raw global hsts include subdomains value"
+
+  fn-plugin-property-get "openresty" "--global" "hsts-include-subdomains" ""
+}
+
+fn-openresty-computed-hsts-include-subdomains() {
+  declare desc="get the effective hsts include subdomains value"
+  declare APP="$1"
+  local value="$(fn-openresty-hsts-include-subdomains "$APP")"
+
+  if [[ -z "$value" ]]; then
+    value="$(fn-plugin-property-get "openresty" "--global" "hsts-include-subdomains" "true")"
+  fi
+  echo "$value"
+}
+
+fn-openresty-hsts-max-age() {
+  declare desc="get the raw per-app hsts max age"
+  declare APP="$1"
+
+  fn-plugin-property-get "openresty" "$APP" "hsts-max-age" ""
+}
+
+fn-openresty-global-hsts-max-age() {
+  declare desc="get the raw global hsts max age"
+
+  fn-plugin-property-get "openresty" "--global" "hsts-max-age" ""
+}
+
+fn-openresty-computed-hsts-max-age() {
+  declare desc="get the effective hsts max age"
+  declare APP="$1"
+  local value="$(fn-openresty-hsts-max-age "$APP")"
+
+  if [[ -z "$value" ]]; then
+    value="$(fn-plugin-property-get "openresty" "--global" "hsts-max-age" "15724800")"
+  fi
+  echo "$value"
+}
+
+fn-openresty-hsts-preload() {
+  declare desc="get the raw per-app hsts preload value"
+  declare APP="$1"
+
+  fn-plugin-property-get "openresty" "$APP" "hsts-preload" ""
+}
+
+fn-openresty-global-hsts-preload() {
+  declare desc="get the raw global hsts preload value"
+
+  fn-plugin-property-get "openresty" "--global" "hsts-preload" ""
+}
+
+fn-openresty-computed-hsts-preload() {
+  declare desc="get the effective hsts preload value"
+  declare APP="$1"
+  local value="$(fn-openresty-hsts-preload "$APP")"
+
+  if [[ -z "$value" ]]; then
+    value="$(fn-plugin-property-get "openresty" "--global" "hsts-preload" "false")"
+  fi
+  echo "$value"
+}
+
+fn-openresty-hsts-is-enabled() {
+  declare APP="$1"
+  local hsts_is_enabled="$(fn-plugin-property-get-default "openresty" "$APP" "hsts" "")"
+
+  if [[ "$hsts_is_enabled" == "" ]]; then
+    hsts_is_enabled="$(fn-plugin-property-get-default "openresty" "--global" "hsts" "true")"
+  fi
+
+  echo "$hsts_is_enabled"
+}
+
+fn-openresty-global-image() {
+  declare desc="get the raw configured image"
+
+  fn-plugin-property-get-default "openresty" "--global" "image" ""
+}
+
+fn-openresty-computed-image() {
+  declare desc="get the effective image, falling back to the Dockerfile FROM line"
+  local value
+
+  value="$(fn-openresty-global-image)"
+  if [[ -z "$value" ]]; then
+    value="$(grep "FROM" "$PLUGIN_AVAILABLE_PATH/openresty-vhosts/Dockerfile" | awk '{print $2}')"
+  fi
+  echo "$value"
+}
+
+fn-openresty-keepalive-timeout() {
+  declare desc="get the raw per-app keepalive timeout"
+  declare APP="$1"
+
+  fn-plugin-property-get "openresty" "$APP" "keepalive-timeout" ""
+}
+
+fn-openresty-global-keepalive-timeout() {
+  declare desc="get the raw global keepalive timeout"
+
+  fn-plugin-property-get "openresty" "--global" "keepalive-timeout" ""
+}
+
+fn-openresty-computed-keepalive-timeout() {
+  declare desc="get the effective keepalive timeout"
+  declare APP="$1"
+  local value="$(fn-openresty-keepalive-timeout "$APP")"
+
+  if [[ -z "$value" ]]; then
+    value="$(fn-plugin-property-get "openresty" "--global" "keepalive-timeout" "75s")"
+  fi
+  echo "$value"
+}
+
+fn-openresty-global-letsencrypt-email() {
+  declare desc="get the raw configured letsencrypt email"
+
+  fn-plugin-property-get-default "openresty" "--global" "letsencrypt-email" ""
+}
+
+fn-openresty-computed-letsencrypt-email() {
+  declare desc="get the effective letsencrypt email"
+
+  fn-openresty-global-letsencrypt-email
+}
+
+fn-openresty-global-letsencrypt-server() {
+  declare desc="get the raw configured letsencrypt server"
+
+  fn-plugin-property-get-default "openresty" "--global" "letsencrypt-server" ""
+}
+
+fn-openresty-computed-letsencrypt-server() {
+  declare desc="get the effective letsencrypt server, falling back to the production directory"
+  local value
+
+  value="$(fn-openresty-global-letsencrypt-server)"
+  if [[ -z "$value" ]]; then
+    value="https://acme-v02.api.letsencrypt.org/directory"
+  fi
+  echo "$value"
+}
+
+fn-openresty-global-log-level() {
+  declare desc="get the raw configured log level"
+
+  fn-plugin-property-get-default "openresty" "--global" "log-level" ""
+}
+
+fn-openresty-computed-log-level() {
+  declare desc="get the effective log level, falling back to ERROR"
+  local value
+
+  value="$(fn-openresty-global-log-level)"
+  if [[ -z "$value" ]]; then
+    value="ERROR"
+  fi
+  echo "$value"
+}
+
+fn-openresty-log-root() {
+  declare desc="get the openresty log root"
+  local OPENRESTY_LOG_ROOT="/var/log/nginx"
+  echo "$OPENRESTY_LOG_ROOT"
+}
+
+fn-openresty-logs() {
+  declare desc="shows the logs for the openresty container"
+  declare TAIL="$1" NUM="$2"
+  local dokku_logs_args=("--tail" "$NUM")
+
+  if [[ "$TAIL" == "true" ]]; then
+    dokku_logs_args+=("--follow")
+  fi
+
+  "$DOCKER_BIN" logs openresty-openresty-1 "${dokku_logs_args[@]}"
+}
+
+fn-openresty-logs-usage() {
+  declare desc="logs specific usage"
+  echo "Usage: dokku openresty:logs"
+  echo " display recent openresty log output"
+  echo ""
+  echo " -n, --num NUM        # the number of lines to display"
+  echo " -t, --tail           # continually stream logs"
+}
+
+fn-openresty-lingering-timeout() {
+  declare desc="get the raw per-app lingering timeout"
+  declare APP="$1"
+
+  fn-plugin-property-get "openresty" "$APP" "lingering-timeout" ""
+}
+
+fn-openresty-global-lingering-timeout() {
+  declare desc="get the raw global lingering timeout"
+
+  fn-plugin-property-get "openresty" "--global" "lingering-timeout" ""
+}
+
+fn-openresty-computed-lingering-timeout() {
+  declare desc="get the effective lingering timeout"
+  declare APP="$1"
+  local value="$(fn-openresty-lingering-timeout "$APP")"
+
+  if [[ -z "$value" ]]; then
+    value="$(fn-plugin-property-get "openresty" "--global" "lingering-timeout" "5s")"
+  fi
+  echo "$value"
+}
+
+fn-openresty-proxy-buffer-size() {
+  declare desc="get the raw per-app proxy buffer size"
+  declare APP="$1"
+
+  fn-plugin-property-get "openresty" "$APP" "proxy-buffer-size" ""
+}
+
+fn-openresty-global-proxy-buffer-size() {
+  declare desc="get the raw global proxy buffer size"
+
+  fn-plugin-property-get "openresty" "--global" "proxy-buffer-size" ""
+}
+
+fn-openresty-computed-proxy-buffer-size() {
+  declare desc="get the effective proxy buffer size"
+  declare APP="$1"
+  local value="$(fn-openresty-proxy-buffer-size "$APP")"
+
+  if [[ -z "$value" ]]; then
+    value="$(fn-plugin-property-get "openresty" "--global" "proxy-buffer-size" "$(fn-get-pagesize)k")"
+  fi
+  echo "$value"
+}
+
+fn-openresty-proxy-buffering() {
+  declare desc="get the raw per-app proxy buffering"
+  declare APP="$1"
+
+  fn-plugin-property-get "openresty" "$APP" "proxy-buffering" ""
+}
+
+fn-openresty-global-proxy-buffering() {
+  declare desc="get the raw global proxy buffering"
+
+  fn-plugin-property-get "openresty" "--global" "proxy-buffering" ""
+}
+
+fn-openresty-computed-proxy-buffering() {
+  declare desc="get the effective proxy buffering"
+  declare APP="$1"
+  local value="$(fn-openresty-proxy-buffering "$APP")"
+
+  if [[ -z "$value" ]]; then
+    value="$(fn-plugin-property-get "openresty" "--global" "proxy-buffering" "on")"
+  fi
+  echo "$value"
+}
+
+fn-openresty-proxy-buffers() {
+  declare desc="get the raw per-app proxy buffers"
+  declare APP="$1"
+
+  fn-plugin-property-get "openresty" "$APP" "proxy-buffers" ""
+}
+
+fn-openresty-global-proxy-buffers() {
+  declare desc="get the raw global proxy buffers"
+
+  fn-plugin-property-get "openresty" "--global" "proxy-buffers" ""
+}
+
+fn-openresty-computed-proxy-buffers() {
+  declare desc="get the effective proxy buffers"
+  declare APP="$1"
+  local value="$(fn-openresty-proxy-buffers "$APP")"
+
+  if [[ -z "$value" ]]; then
+    value="$(fn-plugin-property-get "openresty" "--global" "proxy-buffers" "8 $(fn-get-pagesize)k")"
+  fi
+  echo "$value"
+}
+
+fn-openresty-proxy-busy-buffers-size() {
+  declare desc="get the raw per-app proxy busy buffers size"
+  declare APP="$1"
+
+  fn-plugin-property-get "openresty" "$APP" "proxy-busy-buffers-size" ""
+}
+
+fn-openresty-global-proxy-busy-buffers-size() {
+  declare desc="get the raw global proxy busy buffers size"
+
+  fn-plugin-property-get "openresty" "--global" "proxy-busy-buffers-size" ""
+}
+
+fn-openresty-computed-proxy-busy-buffers-size() {
+  declare desc="get the effective proxy busy buffers size"
+  declare APP="$1"
+  local value="$(fn-openresty-proxy-busy-buffers-size "$APP")"
+
+  if [[ -z "$value" ]]; then
+    value="$(fn-plugin-property-get "openresty" "--global" "proxy-busy-buffers-size" "$(($(fn-get-pagesize) * 2))k")"
+  fi
+  echo "$value"
+}
+
+fn-openresty-proxy-connect-timeout() {
+  declare desc="get the raw per-app proxy connect timeout"
+  declare APP="$1"
+
+  fn-plugin-property-get "openresty" "$APP" "proxy-connect-timeout" ""
+}
+
+fn-openresty-global-proxy-connect-timeout() {
+  declare desc="get the raw global proxy connect timeout"
+
+  fn-plugin-property-get "openresty" "--global" "proxy-connect-timeout" ""
+}
+
+fn-openresty-computed-proxy-connect-timeout() {
+  declare desc="get the effective proxy connect timeout"
+  declare APP="$1"
+  local value="$(fn-openresty-proxy-connect-timeout "$APP")"
+
+  if [[ -z "$value" ]]; then
+    value="$(fn-plugin-property-get "openresty" "--global" "proxy-connect-timeout" "60s")"
+  fi
+  echo "$value"
+}
+
+fn-openresty-proxy-read-timeout() {
+  declare desc="get the raw per-app proxy read timeout"
+  declare APP="$1"
+
+  fn-plugin-property-get "openresty" "$APP" "proxy-read-timeout" ""
+}
+
+fn-openresty-global-proxy-read-timeout() {
+  declare desc="get the raw global proxy read timeout"
+
+  fn-plugin-property-get "openresty" "--global" "proxy-read-timeout" ""
+}
+
+fn-openresty-computed-proxy-read-timeout() {
+  declare desc="get the effective proxy read timeout"
+  declare APP="$1"
+  local value="$(fn-openresty-proxy-read-timeout "$APP")"
+
+  if [[ -z "$value" ]]; then
+    value="$(fn-plugin-property-get "openresty" "--global" "proxy-read-timeout" "60s")"
+  fi
+  echo "$value"
+}
+
+fn-openresty-proxy-send-timeout() {
+  declare desc="get the raw per-app proxy send timeout"
+  declare APP="$1"
+
+  fn-plugin-property-get "openresty" "$APP" "proxy-send-timeout" ""
+}
+
+fn-openresty-global-proxy-send-timeout() {
+  declare desc="get the raw global proxy send timeout"
+
+  fn-plugin-property-get "openresty" "--global" "proxy-send-timeout" ""
+}
+
+fn-openresty-computed-proxy-send-timeout() {
+  declare desc="get the effective proxy send timeout"
+  declare APP="$1"
+  local value="$(fn-openresty-proxy-send-timeout "$APP")"
+
+  if [[ -z "$value" ]]; then
+    value="$(fn-plugin-property-get "openresty" "--global" "proxy-send-timeout" "60s")"
+  fi
+  echo "$value"
+}
+
+fn-openresty-send-timeout() {
+  declare desc="get the raw per-app send timeout"
+  declare APP="$1"
+
+  fn-plugin-property-get "openresty" "$APP" "send-timeout" ""
+}
+
+fn-openresty-global-send-timeout() {
+  declare desc="get the raw global send timeout"
+
+  fn-plugin-property-get "openresty" "--global" "send-timeout" ""
+}
+
+fn-openresty-computed-send-timeout() {
+  declare desc="get the effective send timeout"
+  declare APP="$1"
+  local value="$(fn-openresty-send-timeout "$APP")"
+
+  if [[ -z "$value" ]]; then
+    value="$(fn-plugin-property-get "openresty" "--global" "send-timeout" "60s")"
+  fi
+  echo "$value"
+}
+
+fn-openresty-template-compose-file() {
+  declare desc="templates out the compose file"
+  declare OUTPUT_PATH="$1"
+  local COMPOSE_TEMPLATE="$PLUGIN_AVAILABLE_PATH/openresty-vhosts/templates/compose.yml.sigil"
+
+  CUSTOM_COMPOSE_TEMPLATE="$(plugn trigger openresty-template-source "$APP")"
+  if [[ -n "$CUSTOM_COMPOSE_TEMPLATE" ]]; then
+    COMPOSE_TEMPLATE="$CUSTOM_COMPOSE_TEMPLATE"
+  fi
+
+  local SIGIL_PARAMS=(OPENRESTY_DATA_DIR="${DOKKU_LIB_ROOT}/data/openresty-vhosts/.docker-letsencrypt"
+    OPENRESTY_IMAGE="$(fn-openresty-computed-image)"
+    OPENRESTY_LETSENCRYPT_EMAIL="$(fn-openresty-computed-letsencrypt-email)"
+    OPENRESTY_LETSENCRYPT_SERVER="$(fn-openresty-computed-letsencrypt-server)")
+
+  local ALLOWED_DOMAINS_FUNC_BASE64="$(fn-openresty-computed-allowed-letsencrypt-domains-func-base64)"
+  if [[ -n "$ALLOWED_DOMAINS_FUNC_BASE64" ]]; then
+    SIGIL_PARAMS+=(ALLOWED_DOMAINS_FUNC_BASE64="$ALLOWED_DOMAINS_FUNC_BASE64")
+  fi
+
+  sigil -f "$COMPOSE_TEMPLATE" "${SIGIL_PARAMS[@]}" | cat -s >"$OUTPUT_PATH"
+}
+
+fn-openresty-underscore-in-headers() {
+  declare desc="get the raw per-app underscore in headers value"
+  declare APP="$1"
+
+  fn-plugin-property-get "openresty" "$APP" "underscore-in-headers" ""
+}
+
+fn-openresty-global-underscore-in-headers() {
+  declare desc="get the raw global underscore in headers value"
+
+  fn-plugin-property-get "openresty" "--global" "underscore-in-headers" ""
+}
+
+fn-openresty-computed-underscore-in-headers() {
+  declare desc="get the effective underscore in headers value"
+  declare APP="$1"
+  local value="$(fn-openresty-underscore-in-headers "$APP")"
+
+  if [[ -z "$value" ]]; then
+    value="$(fn-plugin-property-get "openresty" "--global" "underscore-in-headers" "off")"
+  fi
+  echo "$value"
+}
+
+fn-openresty-x-forwarded-for-value() {
+  declare desc="get the raw per-app x-forwarded-for value"
+  declare APP="$1"
+
+  fn-plugin-property-get "openresty" "$APP" "x-forwarded-for-value" ""
+}
+
+fn-openresty-global-x-forwarded-for-value() {
+  declare desc="get the raw global x-forwarded-for value"
+
+  fn-plugin-property-get "openresty" "--global" "x-forwarded-for-value" ""
+}
+
+fn-openresty-computed-x-forwarded-for-value() {
+  declare desc="get the effective x-forwarded-for value"
+  declare APP="$1"
+  local value="$(fn-openresty-x-forwarded-for-value "$APP")"
+
+  if [[ -z "$value" ]]; then
+    value="$(fn-plugin-property-get "openresty" "--global" "x-forwarded-for-value" "\$remote_addr")"
+  fi
+  echo "$value"
+}
+
+fn-openresty-x-forwarded-port-value() {
+  declare desc="get the raw per-app x-forwarded-port value"
+  declare APP="$1"
+
+  fn-plugin-property-get "openresty" "$APP" "x-forwarded-port-value" ""
+}
+
+fn-openresty-global-x-forwarded-port-value() {
+  declare desc="get the raw global x-forwarded-port value"
+
+  fn-plugin-property-get "openresty" "--global" "x-forwarded-port-value" ""
+}
+
+fn-openresty-computed-x-forwarded-port-value() {
+  declare desc="get the effective x-forwarded-port value"
+  declare APP="$1"
+  local value="$(fn-openresty-x-forwarded-port-value "$APP")"
+
+  if [[ -z "$value" ]]; then
+    value="$(fn-plugin-property-get "openresty" "--global" "x-forwarded-port-value" "\$server_port")"
+  fi
+  echo "$value"
+}
+
+fn-openresty-x-forwarded-proto-value() {
+  declare desc="get the raw per-app x-forwarded-proto value"
+  declare APP="$1"
+
+  fn-plugin-property-get "openresty" "$APP" "x-forwarded-proto-value" ""
+}
+
+fn-openresty-global-x-forwarded-proto-value() {
+  declare desc="get the raw global x-forwarded-proto value"
+
+  fn-plugin-property-get "openresty" "--global" "x-forwarded-proto-value" ""
+}
+
+fn-openresty-computed-x-forwarded-proto-value() {
+  declare desc="get the effective x-forwarded-proto value"
+  declare APP="$1"
+  local value="$(fn-openresty-x-forwarded-proto-value "$APP")"
+
+  if [[ -z "$value" ]]; then
+    value="$(fn-plugin-property-get "openresty" "--global" "x-forwarded-proto-value" "\$scheme")"
+  fi
+  echo "$value"
+}
+
+fn-openresty-x-forwarded-ssl() {
+  declare desc="get the raw per-app x-forwarded-ssl value"
+  declare APP="$1"
+
+  fn-plugin-property-get "openresty" "$APP" "x-forwarded-ssl" ""
+}
+
+fn-openresty-global-x-forwarded-ssl() {
+  declare desc="get the raw global x-forwarded-ssl value"
+
+  fn-plugin-property-get "openresty" "--global" "x-forwarded-ssl" ""
+}
+
+fn-openresty-computed-x-forwarded-ssl() {
+  declare desc="get the effective x-forwarded-ssl value"
+  declare APP="$1"
+  local value="$(fn-openresty-x-forwarded-ssl "$APP")"
+
+  if [[ -z "$value" ]]; then
+    value="$(fn-plugin-property-get "openresty" "--global" "x-forwarded-ssl" "")"
+  fi
+  echo "$value"
+}

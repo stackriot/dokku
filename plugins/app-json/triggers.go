@@ -1,16 +1,17 @@
 package appjson
 
 import (
+	"encoding/json"
+	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
+	"strings"
 
 	"github.com/dokku/dokku/plugins/common"
 )
 
 // TriggerAppJSONProcessDeployParallelism returns the max number of processes to deploy in parallel
 func TriggerAppJSONProcessDeployParallelism(appName string, processType string) error {
-	appJSON, err := getAppJSON(appName)
+	appJSON, err := GetAppJSON(appName)
 	if err != nil {
 		return err
 	}
@@ -34,18 +35,123 @@ func TriggerAppJSONProcessDeployParallelism(appName string, processType string) 
 	return nil
 }
 
-// TriggerInstall initializes app restart policies
+// TriggerAppJSONIsValid validates the healthchecks in an extracted app.json file
+func TriggerAppJSONIsValid(appName string, appJSONPath string) error {
+	if !common.FileExists(appJSONPath) {
+		return nil
+	}
+
+	appJSON, err := ReadAppJSON(appJSONPath)
+	if err != nil {
+		return err
+	}
+
+	return validateHealthchecks(appJSON)
+}
+
+// TriggerAppJSONGetContent outputs the contents of the app-json file, if any
+func TriggerAppJSONGetContent(appName string) error {
+	if !hasAppJSON(appName) {
+		fmt.Print("{}")
+		return nil
+	}
+
+	appJSON, err := ReadAppJSON(getProcessSpecificAppJSONPath(appName))
+	if err != nil {
+		return err
+	}
+
+	content, err := json.Marshal(appJSON)
+	if err != nil {
+		return err
+	}
+
+	fmt.Print(string(content))
+	return nil
+}
+
+// TriggerCorePostDeploy moves the extracted app.json to the app data directory
+// allowing the app to be restored on boot
+func TriggerCorePostDeploy(appName string) error {
+	return common.CorePostDeploy(common.CorePostDeployInput{
+		AppName:     appName,
+		Destination: common.GetAppDataDirectory("app-json", appName),
+		PluginName:  "app-json",
+		ExtractedPaths: []common.CorePostDeployPath{
+			{Path: "app.json", IsDirectory: false},
+		},
+	})
+}
+
+// TriggerCorePostExtract ensures that the main app.json is the one specified by app-json-path
+func TriggerCorePostExtract(appName string, sourceWorkDir string) error {
+	// Clear the env-processed property on new source extraction to allow re-processing
+	if err := common.PropertyDelete("app-json", appName, "appjson-env-processed"); err != nil {
+		return err
+	}
+
+	destination := common.GetAppDataDirectory("app-json", appName)
+	appJSONPath := strings.Trim(reportComputedAppjsonpath(appName), "/")
+	if appJSONPath == "" {
+		appJSONPath = "app.json"
+	}
+
+	validator := func(appName string, path string) error {
+		if !common.FileExists(path) {
+			return nil
+		}
+
+		result, err := common.CallPlugnTrigger(common.PlugnTriggerInput{
+			Trigger:      "app-json-is-valid",
+			Args:         []string{appName, path},
+			StreamStdout: true,
+			StreamStderr: true,
+		})
+
+		if err != nil {
+			if result.StderrContents() != "" {
+				return errors.New(result.StderrContents())
+			}
+
+			return err
+		}
+		return nil
+	}
+
+	results, _ := common.CallPlugnTrigger(common.PlugnTriggerInput{
+		Trigger: "builder-get-property",
+		Args:    []string{appName, "build-dir"},
+	})
+	buildDir := results.StdoutContents()
+	return common.CorePostExtract(common.CorePostExtractInput{
+		AppName:       appName,
+		BuildDir:      buildDir,
+		Destination:   destination,
+		PluginName:    "app-json",
+		SourceWorkDir: sourceWorkDir,
+		ToExtract: []common.CorePostExtractToExtract{
+			{
+				Path:        appJSONPath,
+				IsDirectory: false,
+				Name:        "app.json",
+				Destination: "app.json",
+				Validator:   validator,
+			},
+		},
+	})
+}
+
+// TriggerInstall initializes app-json directory structures
 func TriggerInstall() error {
 	if err := common.PropertySetup("app-json"); err != nil {
 		return fmt.Errorf("Unable to install the app-json plugin: %s", err.Error())
 	}
 
-	directory := filepath.Join(common.MustGetEnv("DOKKU_LIB_ROOT"), "data", "app-json")
-	if err := os.MkdirAll(directory, 0755); err != nil {
+	if err := common.SetupAppData("app-json"); err != nil {
 		return err
 	}
 
-	return common.SetPermissions(directory, 0755)
+	return nil
 }
 
 // TriggerPostAppCloneSetup creates new app-json files
@@ -55,7 +161,12 @@ func TriggerPostAppCloneSetup(oldAppName string, newAppName string) error {
 		return err
 	}
 
-	return nil
+	return common.CloneAppData("app-json", oldAppName, newAppName)
+}
+
+// TriggerPostAppRename removes the old app data
+func TriggerPostAppRename(oldAppName string, newAppName string) error {
+	return common.MigrateAppDataDirectory("app-json", oldAppName, newAppName)
 }
 
 // TriggerPostAppRenameSetup renames app-json files
@@ -68,13 +179,17 @@ func TriggerPostAppRenameSetup(oldAppName string, newAppName string) error {
 		return err
 	}
 
-	return nil
+	return common.CloneAppData("app-json", oldAppName, newAppName)
+}
+
+// TriggerPostCreate ensures apps have the correct data directory structure
+func TriggerPostCreate(appName string) error {
+	return common.CreateAppDataDirectory("app-json", appName)
 }
 
 // TriggerPostDelete destroys the app-json data for a given app container
 func TriggerPostDelete(appName string) error {
-	directory := filepath.Join(common.MustGetEnv("DOKKU_LIB_ROOT"), "data", "app-json", appName)
-	dataErr := os.RemoveAll(directory)
+	dataErr := common.RemoveAppDataDirectory("app-json", appName)
 	propertyErr := common.PropertyDestroy("app-json", appName)
 
 	if dataErr != nil {
@@ -85,7 +200,20 @@ func TriggerPostDelete(appName string) error {
 }
 
 // TriggerPostDeploy is a trigger to execute the postdeploy deployment task
+//
+// The task is looked up before the image name is resolved because resolving it
+// asserts the image exists on the local docker daemon. That assertion does not
+// hold for schedulers running workloads off this host, which are free to reap
+// the local copy while the app keeps running in a cluster. An app with no
+// postdeploy task needs no image at all, so it should not be made to fail here.
 func TriggerPostDeploy(appName string, imageTag string) error {
+	command, err := getPhaseScript(appName, "postdeploy")
+	if err == nil && command == "" {
+		common.LogInfo1("Checking for postdeploy task")
+		common.LogVerbose("No postdeploy task found, skipping")
+		return nil
+	}
+
 	image, err := common.GetDeployingAppImageName(appName, imageTag, "")
 	if err != nil {
 		return err
@@ -94,22 +222,27 @@ func TriggerPostDeploy(appName string, imageTag string) error {
 	return executeScript(appName, image, imageTag, "postdeploy")
 }
 
-// TriggerPreDeploy is a trigger to execute predeploy and release deployment tasks
-func TriggerPreDeploy(appName string, imageTag string) error {
-	image := common.GetAppImageName(appName, imageTag, "")
-	if err := refreshAppJSON(appName, image); err != nil {
+// TriggerPreReleaseBuilder processes app.json env vars and executes the predeploy task
+func TriggerPreReleaseBuilder(builderType string, appName string, image string) error {
+	// Process app.json env vars before predeploy script
+	if err := processAppJSONEnv(appName); err != nil {
 		return err
 	}
 
-	if err := executeScript(appName, image, imageTag, "predeploy"); err != nil {
-		return err
-	}
+	parts := strings.Split(image, ":")
+	imageTag := parts[len(parts)-1]
+	return executeScript(appName, image, imageTag, "predeploy")
+}
 
+// TriggerPostReleaseBuilder is a trigger to execute predeploy and release deployment tasks
+func TriggerPostReleaseBuilder(builderType string, appName string, image string) error {
+	parts := strings.Split(image, ":")
+	imageTag := parts[len(parts)-1]
 	if err := executeScript(appName, image, imageTag, "release"); err != nil {
 		return err
 	}
 
-	if err := setScale(appName, image); err != nil {
+	if err := setScale(appName); err != nil {
 		return err
 	}
 

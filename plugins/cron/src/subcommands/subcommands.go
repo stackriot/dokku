@@ -20,18 +20,59 @@ func main() {
 	switch subcommand {
 	case "list":
 		args := flag.NewFlagSet("cron:list", flag.ExitOnError)
+		global := args.Bool("global", false, "--global: set a global property")
+		format := args.String("format", "stdout", "format: [ stdout | json ]")
 		args.Parse(os.Args[2:])
 		appName := args.Arg(0)
-		err = cron.CommandList(appName)
+		if *global {
+			appName = "--global"
+		}
+		err = cron.CommandList(appName, *format)
 	case "report":
 		args := flag.NewFlagSet("cron:report", flag.ExitOnError)
 		format := args.String("format", "stdout", "format: [ stdout | json ]")
-		osArgs, infoFlag, flagErr := common.ParseReportArgs("cron", os.Args[2:])
+		reportArgs, flagErr := common.ParseReportArgs("cron", os.Args[2:])
 		if flagErr == nil {
-			args.Parse(osArgs)
+			args.Parse(reportArgs.OSArgs)
 			appName := args.Arg(0)
-			err = cron.CommandReport(appName, *format, infoFlag)
+			if reportArgs.IsGlobal {
+				appName = "--global"
+			}
+			err = cron.CommandReport(appName, *format, reportArgs.InfoFlag)
 		}
+	case "resume":
+		args := flag.NewFlagSet("cron:resume", flag.ExitOnError)
+		args.Parse(os.Args[2:])
+		appName := args.Arg(0)
+		cronID := args.Arg(1)
+		err = cron.CommandResume(appName, cronID)
+	case "run":
+		args := flag.NewFlagSet("cron:run", flag.ExitOnError)
+		detached := args.Bool("detach", false, "--detach: run the container in a detached mode")
+		ttlSeconds := args.Int64("ttl-seconds", cron.DefaultTTLSeconds, "--ttl-seconds: number of seconds the task may run before it is reaped")
+		args.Parse(os.Args[2:])
+		appName := args.Arg(0)
+		cronID := args.Arg(1)
+		err = cron.CommandRun(appName, cronID, *detached, *ttlSeconds)
+	case "set":
+		args := flag.NewFlagSet("cron:set", flag.ExitOnError)
+		global := args.Bool("global", false, "--global: set a global property")
+		args.Parse(os.Args[2:])
+		appName := args.Arg(0)
+		property := args.Arg(1)
+		value := args.Arg(2)
+		if *global {
+			appName = "--global"
+			property = args.Arg(0)
+			value = args.Arg(1)
+		}
+		err = cron.CommandSet(appName, property, value)
+	case "suspend":
+		args := flag.NewFlagSet("cron:suspend", flag.ExitOnError)
+		args.Parse(os.Args[2:])
+		appName := args.Arg(0)
+		cronID := args.Arg(1)
+		err = cron.CommandSuspend(appName, cronID)
 	default:
 		err = fmt.Errorf("Invalid plugin subcommand call: %s", subcommand)
 	}

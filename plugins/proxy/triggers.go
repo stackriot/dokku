@@ -3,8 +3,47 @@ package proxy
 import (
 	"fmt"
 
-	"github.com/dokku/dokku/plugins/config"
+	"github.com/dokku/dokku/plugins/common"
 )
+
+// TriggerInstall runs the install step for the proxy plugin
+func TriggerInstall() error {
+	if err := common.PropertySetup("proxy"); err != nil {
+		return fmt.Errorf("Unable to install the proxy plugin: %s", err.Error())
+	}
+
+	if err := common.MigrateConfigToProperties("proxy", []common.MigrateConfigEntry{
+		{
+			ConfigVar:       "DOKKU_APP_PROXY_TYPE",
+			GlobalConfigVar: "DOKKU_PROXY_TYPE",
+			Property:        "type",
+		},
+		{
+			ConfigVar: "DOKKU_DISABLE_PROXY",
+			Property:  "disabled",
+			Transform: func(value string) string {
+				if value != "" {
+					return "true"
+				}
+				return value
+			},
+		},
+		{
+			ConfigVar:       "DOKKU_PROXY_PORT",
+			GlobalConfigVar: "DOKKU_PROXY_PORT",
+			Property:        "proxy-port",
+		},
+		{
+			ConfigVar:       "DOKKU_PROXY_SSL_PORT",
+			GlobalConfigVar: "DOKKU_PROXY_SSL_PORT",
+			Property:        "proxy-ssl-port",
+		},
+	}); err != nil {
+		return err
+	}
+
+	return nil
+}
 
 // TriggerProxyIsEnabled prints true or false depending on whether the proxy is enabled
 func TriggerProxyIsEnabled(appName string) error {
@@ -19,74 +58,45 @@ func TriggerProxyIsEnabled(appName string) error {
 
 // TriggerProxyType prints out the current proxy type, defaulting to nginx
 func TriggerProxyType(appName string) error {
-	proxyType := getAppProxyType(appName)
+	proxyType := getComputedProxyType(appName)
 	fmt.Println(proxyType)
 
 	return nil
 }
 
-// TriggerPostCertsRemove unsets port config vars after SSL cert is added
-func TriggerPostCertsRemove(appName string) error {
-	keys := []string{"DOKKU_PROXY_SSL_PORT"}
-	if err := config.UnsetMany(appName, keys, false); err != nil {
+// TriggerProxyRoutesList prints one "process|port|path|strip" line per route,
+// sorted by descending path length. Backends use this to render path-based
+// routes in their config or labels.
+func TriggerProxyRoutesList(appName string) error {
+	routes, err := GetRoutes(appName)
+	if err != nil {
+		return err
+	}
+	for _, r := range routes {
+		strip := "0"
+		if r.StripPrefix {
+			strip = "1"
+		}
+		fmt.Printf("%s|%d|%s|%s\n", r.Process, r.Port, r.Path, strip)
+	}
+	return nil
+}
+
+// TriggerPostAppCloneSetup creates new proxy files
+func TriggerPostAppCloneSetup(oldAppName string, newAppName string) error {
+	return common.PropertyClone("proxy", oldAppName, newAppName)
+}
+
+// TriggerPostAppRenameSetup renames proxy files
+func TriggerPostAppRenameSetup(oldAppName string, newAppName string) error {
+	if err := common.PropertyClone("proxy", oldAppName, newAppName); err != nil {
 		return err
 	}
 
-	return removeProxyPorts(appName, filterAppProxyPorts(appName, "https", 443))
+	return common.PropertyDestroy("proxy", oldAppName)
 }
 
-// TriggerPostCertsUpdate sets port config vars after SSL cert is added
-func TriggerPostCertsUpdate(appName string) error {
-	port := config.GetWithDefault(appName, "DOKKU_PROXY_PORT", "")
-	sslPort := config.GetWithDefault(appName, "DOKKU_PROXY_SSL_PORT", "")
-	proxyPortMap := getProxyPortMap(appName)
-
-	toUnset := []string{}
-	if port == "80" {
-		toUnset = append(toUnset, "DOKKU_PROXY_PORT")
-	}
-	if sslPort == "443" {
-		toUnset = append(toUnset, "DOKKU_PROXY_SSL_PORT")
-	}
-
-	if len(toUnset) > 0 {
-		if err := config.UnsetMany(appName, toUnset, false); err != nil {
-			return err
-		}
-	}
-
-	var http80Ports []PortMap
-	for _, portMap := range proxyPortMap {
-		if portMap.Scheme == "http" && portMap.HostPort == 80 {
-			http80Ports = append(http80Ports, portMap)
-		}
-	}
-
-	if len(http80Ports) > 0 {
-		var https443Ports []PortMap
-		for _, portMap := range proxyPortMap {
-			if portMap.Scheme == "https" && portMap.HostPort == 443 {
-				https443Ports = append(https443Ports, portMap)
-			}
-		}
-
-		if err := removeProxyPorts(appName, https443Ports); err != nil {
-			return err
-		}
-
-		var toAdd []PortMap
-		for _, portMap := range http80Ports {
-			toAdd = append(toAdd, PortMap{
-				Scheme:        "https",
-				HostPort:      443,
-				ContainerPort: portMap.ContainerPort,
-			})
-		}
-
-		if err := addProxyPorts(appName, toAdd); err != nil {
-			return err
-		}
-	}
-
-	return nil
+// TriggerPostDelete destroys the proxy property for a given app container
+func TriggerPostDelete(appName string) error {
+	return common.PropertyDestroy("proxy", appName)
 }

@@ -24,11 +24,11 @@ Additional commands:`
     config:clear [--no-restart] (<app>|--global), Clears environment variables
     config:export [--format=FORMAT] [--merged] (<app>|--global), Export a global or app environment
     config:get [--quoted] (<app>|--global) KEY, Display a global or app-specific config value
+    config:import [--no-restart] [--replace] (<app>|--global) [FILE|-], Import environment from file
     config:keys [--merged] (<app>|--global), Show keys set in environment
     config:show [--merged] (<app>|--global), Show keys set in environment
     config:set [--encoded] [--no-restart] (<app>|--global) KEY1=VALUE1 [KEY2=VALUE2 ...], Set one or more config vars
-    config:unset [--no-restart] (<app>|--global) KEY1 [KEY2 ...], Unset one or more config vars
-`
+    config:unset [--no-restart] (<app>|--global) KEY1 [KEY2 ...], Unset one or more config vars`
 )
 
 func main() {
@@ -38,26 +38,26 @@ func main() {
 	cmd := flag.Arg(0)
 	switch cmd {
 	case "config":
-		common.LogWarn("Deprecated: Use the 'config:show' command instead")
-		args := flag.NewFlagSet("config:show", flag.ExitOnError)
+		args := flag.NewFlagSet("config", flag.ExitOnError)
+		args.Usage = usage
 		global := args.Bool("global", false, "--global: use the global environment")
 		shell := args.Bool("shell", false, "--shell: in a single-line for usage in command-line utilities [deprecated]")
 		export := args.Bool("export", false, "--export: print the env as eval-compatible exports [deprecated]")
 		merged := args.Bool("merged", false, "--merged: display the app's environment merged with the global environment")
 		args.Parse(os.Args[2:])
 		appName := args.Arg(0)
-		err := config.CommandShow(appName, *global, *merged, *shell, *export)
-		if err != nil {
+
+		if err := config.CommandShow(appName, *global, *merged, *shell, *export); err != nil {
 			common.LogFailWithError(err)
 		}
 	case "config:help":
 		usage()
 	case "help":
-		command := common.NewShellCmd(fmt.Sprintf("ps -o command= %d", os.Getppid()))
-		command.ShowOutput = false
-		output, err := command.Output()
-
-		if err == nil && strings.Contains(string(output), "--all") {
+		result, err := common.CallExecCommand(common.ExecCommandInput{
+			Command: "ps",
+			Args:    []string{"-o", "command=", strconv.Itoa(os.Getppid())},
+		})
+		if err == nil && strings.Contains(result.StdoutContents(), "--all") {
 			fmt.Println(helpContent)
 		} else {
 			fmt.Print("\n    config, Manage global and app-specific config vars\n")

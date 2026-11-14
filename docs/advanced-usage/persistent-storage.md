@@ -1,38 +1,101 @@
 # Persistent Storage
 
-> New as of 0.5.0
+> [!IMPORTANT]
+> New as of 0.5.0. Named storage entries new as of 0.38.0.
 
-The preferred method to mount external containers to a Dokku managed container, is to use the Dokku storage plugin.
+The preferred method to attach persistent storage to a Dokku-managed container is the Dokku storage plugin.
 
 ```
-storage:ensure-directory [--chown option] <directory>  # Creates a persistent storage directory in the recommended storage path
-storage:list <app>                                     # List bind mounts for app's container(s) (host:container)
-storage:mount <app> <host-dir:container-dir>           # Create a new bind mount
-storage:report [<app>] [<flag>]                        # Displays a checks report for one or more apps
-storage:unmount <app> <host-dir:container-dir>         # Remove an existing bind mount
+storage:annotations:report [<name>] [<flag>]                         # Displays annotations for one or more storage entries
+storage:annotations:set <name> <key> [<value>]                       # Set or clear a single annotation on a storage entry
+storage:create <name> [<path>] [flags]                               # Register a named storage entry
+storage:destroy <name> [--force] [--destroy-host-dir]                # Remove a named storage entry (must be unmounted from every app first)
+storage:ensure-directory [--chown option] <directory>                # [DEPRECATED] use storage:create instead
+storage:exec <name> [-- <cmd>...]                                    # Run a command (or shell) in a temporary container that mounts the entry
+storage:info <name> [--format text|json]                             # Show details for one storage entry
+storage:labels:report [<name>] [<flag>]                              # Displays labels for one or more storage entries
+storage:labels:set <name> <key> [<value>]                            # Set or clear a single label on a storage entry
+storage:list <app> [--format text|json]                              # List bind mounts for an app's container(s) (legacy host:container view)
+storage:list-entries [--scheduler s] [--format text|json]            # List registered storage entries
+storage:migrate [<app>|--all]                                        # Re-run the legacy -v to attachment migration for an app
+storage:mount [--replace] <app> <host-dir:container-dir>... [flags]  # Create or replace bind mounts
+storage:report [<app>|--global] [<flag>]                             # Displays a storage report for one or more apps
+storage:set <name> <property> [<value>]                              # Update a storage entry in place
+storage:unmount [--all] <app> [<host-dir:container-dir>...] [flags]  # Remove one or all bind mounts
+storage:wait <name>                                                  # Wait for a storage entry's PVC to be bound (k3s)
 ```
 
-> The storage plugin is compatible with storage mounts created with the docker-options. The storage plugin will only list mounts from the deploy/run phase.
+A storage entry is the source of truth for the underlying volume - a host directory on docker-local, or a PersistentVolumeClaim on k3s. Multiple apps can mount the same entry, and an attachment carries the per-app details (container path, phases, subpath, readonly, process type). Names are globally unique across the install and must be DNS-1123 labels (lowercase letters, digits, dashes) of 45 characters or less so they can be used verbatim as Helm release and PVC names.
+
+The legacy `storage:mount <app> <host>:<container>` form continues to work on docker-local. On a k3s app it is rejected; create a named entry with `storage:create --scheduler k3s` and mount it instead. Existing colon-form mounts are migrated automatically the first time the new code runs - they show up as `legacy-<hash>` entries in `storage:list-entries`.
 
 The storage plugin supports the following mount points:
 
-- explicit paths that exist on the host
-- docker volumes
+- explicit paths that exist on the host (docker-local)
+- docker volumes (docker-local)
+- PersistentVolumeClaims provisioned via a StorageClass (k3s)
+- hostPath-backed PVs (k3s)
 
 ## Usage
 
+### Listing persistent storage
+
+Persistent storage bind mounts are specified on a per-app basis, and can be listed with the `storage:list` command:
+
+```shell
+dokku storage:list node-js-app
+```
+
+```
+-----> node-js-app volume bind-mounts:
+       /var/lib/dokku/data/storage/node-js-app:/app/storage
+```
+
+The output format can also be set to `json` for programmatic access:
+
+```shell
+dokku storage:list node-js-app --format json
+```
+
+```
+[
+  {
+    "entry_name": "node-js-app",
+    "host_path": "/var/lib/dokku/data/storage/node-js-app",
+    "container_path": "/app/storage"
+  }
+]
+```
+
+Each entry mirrors the underlying attachment. `readonly` (boolean) and `volume_options` (string) reflect `Attachment.Readonly` and `Attachment.VolumeOptions` directly and are only present when set, so external tooling can drift-detect attachments against the raw attachment fields. For example, a mount created with `--volume-options noexec,nosuid --volume-readonly` renders as:
+
+```
+[
+  {
+    "entry_name": "node-js-data",
+    "host_path": "/var/lib/dokku/data/storage/node-js-data",
+    "container_path": "/app/storage",
+    "readonly": true,
+    "volume_options": "noexec,nosuid"
+  }
+]
+```
+
 ### Creating storage directories
 
+> [!IMPORTANT]
 > New as of 0.25.5
 
 A storage directory can be created with the `storage:ensure-directory` command. This command will create a subdirectory in the recommended `/var/lib/dokku/data/storage` path - created during Dokku installation - and prepare it for use with an app.
 
+When Dokku itself runs in a container with a shared Docker socket, default named storage is still created under `DOKKU_LIB_ROOT` (typically `/var/lib/dokku`) inside the Dokku container. Docker `-v` mounts for `storage:exec` and app deploys rewrite that path to `DOKKU_LIB_HOST_ROOT` so the host Docker daemon binds the directory from the host-visible data volume. See the [Docker installation notes](/docs/getting-started/install/docker.md) for setting `DOKKU_LIB_HOST_ROOT`.
+
 ```shell
-dokku storage:ensure-directory lollipop
+dokku storage:ensure-directory node-js-app
 ```
 
 ```
------> Ensuring /var/lib/dokku/data/storage/lollipop exists
+-----> Ensuring /var/lib/dokku/data/storage/node-js-app exists
        Setting directory ownership to 32767:32767
        Directory ready for mounting
 ```
@@ -40,16 +103,137 @@ dokku storage:ensure-directory lollipop
 By default, permissions are set for usage with Herokuish buildpacks. These permissions can be changed via the `--chown` option according to the following table:
 
 - `--chown herokuish` (default): Use `32767:32767` as the folder permissions.
-  - This is used for apps deployed with Buildpacks via Herokuish.
+    - This is used for apps deployed with Buildpacks via Herokuish.
 - `--chown heroku`: Use `1000:1000` as the folder permissions.
-  - This is used for apps deployed with Cloud Native Buildpacks using the `heroku/buildpacks` builder.
-- `--chown packeto`: Use `2000:2000` as the folder permissions.
-  - This is used for apps deployed with Cloud Native Buildpacks using the `cloudfoundry/cnb` or `packeto` builders.
+    - This is used for apps deployed with Cloud Native Buildpacks using the `heroku/builder` builder.
+- `--chown paketo`: Use `2000:2000` as the folder permissions.
+    - This is used for apps deployed with Cloud Native Buildpacks using the `cloudfoundry/cnb` or `paketo` builders.
+- `--chown root`: Use `0:0` as the folder permissions.
+    - This is used for containers that run their processes as root, as is typical for most Dockerfile or Docker image deploys.
 - `--chown false`: Skips the `chown` call.
+- `--chown <uid>`: Use `<uid>:<uid>` as the folder permissions, where `<uid>` is a custom numeric user/group id.
+    - This is used for containers that run their processes as a uid/gid that doesn't correspond to any of the above named options.
 
 Users deploying via Dockerfile will want to specify `--chown false` and manually `chown` the created directory if the user and/or group id  of the runnning process in the deployed container do not correspond to any of the above options.
 
-> Warning: Failing to set the correct directory ownership may result in issues in persisting files written to the mounted storage directory.
+The `--chown` flag - whether on `storage:create` or `storage:ensure-directory` - only manages the default `/var/lib/dokku/data/storage/<name>` location. If a custom `<path>` is passed to `storage:create`, the chown call is refused and the operator must chown the path themselves.
+
+> [!WARNING]
+> Failing to set the correct directory ownership may result in issues in persisting files written to the mounted storage directory.
+
+### Setting directory permissions
+
+> [!IMPORTANT]
+> New as of 0.38.27
+
+Where `--chown` states who owns the host directory, `--mode` states its permission bits. It takes a 3 or 4 digit octal mode, and is a `--mode` flag on `storage:create` and a `mode` property on `storage:set`:
+
+```shell
+dokku storage:create node-js-data --mode 0777
+```
+
+```shell
+dokku storage:set node-js-data mode 0770
+```
+
+Omitting the value clears the mode, leaving the directory's permissions alone on subsequent runs:
+
+```shell
+dokku storage:set node-js-data mode
+```
+
+Without a mode, a newly created directory keeps the `0755` default and a pre-existing directory keeps whatever permissions it already had. The value is stored on the entry and re-applied every time `storage:create` or `storage:set` runs against it, so a declarative caller converges the directory by re-running the same command rather than reaching for `chmod` over SSH. The mode is shown by `storage:info`:
+
+```shell
+dokku storage:info node-js-data
+```
+
+```
+-----> Storage entry node-js-data
+       Scheduler:        docker-local
+       Host path:        /var/lib/dokku/data/storage/node-js-data
+       Mode:             0777
+```
+
+The mode is applied to the directory itself and does not recurse into its contents. Like `--chown`, it is docker-local only and only manages the default `/var/lib/dokku/data/storage/<name>` location - it is refused for k3s entries and for entries created with a custom `<path>`. That refusal also covers migrated `legacy-*` entries, whose host paths come from the original colon-form mount rather than the default location.
+
+### Updating a storage entry
+
+> [!IMPORTANT]
+> The property form is new as of 0.38.27. Prior versions used flags, which still work but emit a deprecation warning.
+
+An existing entry is edited with `storage:set`, which takes a property and a value. Omitting the value unsets the property, restoring whatever the entry defaults to:
+
+```shell
+dokku storage:set node-js-data chown herokuish
+dokku storage:set node-js-data chown
+```
+
+The following properties can be set:
+
+| Property | Description | Unsetting it means |
+| --- | --- | --- |
+| `chown` | Ownership preset or numeric uid for the host directory | no chown is performed |
+| `mode` | Octal permissions for the host directory | permissions are left alone |
+| `namespace` | Namespace holding the PVC (k3s) | the `default` namespace |
+| `reclaim-policy` | Whether the underlying volume survives `storage:destroy` | `Retain` |
+| `size` | PVC size (k3s) | rejected, since k3s entries require a size |
+| `access-mode` | PVC access mode (k3s) | rejected, see below |
+| `storage-class-name` | PVC storage class (k3s) | rejected, see below |
+
+`access-mode` and `storage-class-name` cannot be changed on an entry that already exists, because Kubernetes cannot apply either to a bound PVC. Both a different value and an empty one are refused, since clearing is equally a change:
+
+```shell
+dokku storage:set node-js-data access-mode ReadWriteMany
+```
+
+```
+ !     storage:set cannot change access-mode in place; recreate the entry
+```
+
+Setting `chown` or `mode` on a docker-local entry applies the change to the host directory immediately. Every other property is a metadata write, and k3s entries re-apply their helm release so the cluster picks the change up.
+
+The older flag form - `dokku storage:set node-js-data --mode 0770` - continues to work and warns. It gained unset semantics too, so `--mode ""` clears the mode the same way omitting the positional value does.
+
+### Annotations and labels
+
+> [!IMPORTANT]
+> New as of 0.38.27
+
+Annotations and labels are attached to a storage entry one key at a time, matching the [scheduler-k3s equivalents](/docs/deployment/schedulers/k3s.md#setting-annotations). On k3s they propagate to both the PersistentVolumeClaim and the PersistentVolume, so backup tools like Velero and Longhorn can find the volume.
+
+```shell
+dokku storage:annotations:set node-js-data backup.velero.io/backup-volumes node-js-data
+dokku storage:labels:set node-js-data app.kubernetes.io/part-of billing
+```
+
+Keys may contain `/`, as the Kubernetes-style keys above do, and are stored verbatim. To clear a single key, omit the value. Other keys are left untouched, so a declarative caller does not need to re-send the whole set on every call:
+
+```shell
+dokku storage:annotations:set node-js-data backup.velero.io/backup-volumes
+```
+
+Configured annotations and labels can be inspected with the matching report commands. Without an entry name they cover every registered entry:
+
+```shell
+dokku storage:annotations:report
+dokku storage:annotations:report node-js-data
+dokku storage:labels:report node-js-data
+```
+
+```
+=====> node-js-data annotations information
+       Annotation backup.velero.io/backup-volumes: node-js-data
+```
+
+JSON output emits the keys flat, and a single value can be read directly with a flag of the form `--storage-annotations.<key>` (or `--storage-labels.<key>`), which requires an entry name:
+
+```shell
+dokku storage:annotations:report node-js-data --format json
+dokku storage:annotations:report node-js-data --storage-annotations.backup.velero.io/backup-volumes
+```
+
+`storage:create` still accepts repeatable `--annotation key=value` and `--label key=value` flags for setting the initial set at creation time. The same flags on `storage:set` are deprecated in favor of these commands, because they replace the entire map rather than a single key.
 
 ### Mounting storage into apps
 
@@ -65,9 +249,20 @@ dokku storage:mount node-js-app /var/lib/dokku/data/storage/node-js-app:/app/sto
 dokku storage:mount node-js-app some-docker-volume:/app/storage
 ```
 
-In the first example, Dokku will then mount the shared contents of `/var/lib/dokku/data/storage/node-js-app` to `/app/storage` inside the container.  The mount point is *not* relative to your app's working directory, and is instead relative to the root (`/`) of the container. Mounts are only available for containers created via `run` and by the deploy process, and not during the build process. In addition, the host path is never auto-created by either Dokku or Docker, and should be an explicit path, not one relative to the current working directory.
+In the first example, Dokku will then mount the shared contents of `/var/lib/dokku/data/storage/node-js-app` to `/app/storage` inside the container.  The mount point is *not* relative to your app's working directory, and is instead relative to the root (`/`) of the container. Mounts are only available for containers created via `run` and by the deploy process, and not during the build process. A mount is bound into every process type unless `--process-type` narrows it - see [scoping a mount to a process type](#scoping-a-mount-to-a-process-type). In addition, the host path is never auto-created by either Dokku or Docker, and should be an explicit path, not one relative to the current working directory.
 
 > If the `/storage` path within the container had pre-existing content, the container files will be over-written. This may be an issue for users that create assets at build time but then mount a directory at the same place during runtime. Files are not merged.
+
+For named storage entries, additional Docker mount options can be passed via `--volume-options`. The value is a comma-separated mount-options string stored verbatim on the attachment and rendered into the `-v` flag at deploy time. This is useful for SELinux labels (`Z`, `z`) or hardening flags (`noexec,nosuid`):
+
+```shell
+dokku storage:create node-js-data
+dokku storage:mount node-js-app node-js-data --container-dir /app/storage --volume-options Z
+```
+
+When combined with `--volume-readonly`, the rendered options become `ro,<volume-options>` - for example, `--volume-options noexec,nosuid --volume-readonly` renders as `:ro,noexec,nosuid`.
+
+Re-running `storage:mount` against a named entry with the same `--container-dir` and `--process-type` updates the existing attachment's mount-time attributes (`--phase`, `--volume-subpath`, `--volume-readonly`, `--volume-chown`, `--volume-options`) in place rather than appending a duplicate. This is the idempotent equivalent of `storage:set` for entries, and lets declarative tooling change a mount-time attribute without an unmount-then-remount dance that would briefly drop the volume from `storage:report`. Mount-time fields are rewritten wholesale, not merged - omitting a flag on a re-mount clears any previously-set value. The legacy `host:container[:opts]` form still rejects duplicates with `Mount path already exists.`.
 
 Once persistent storage is mounted, the app requires a restart. See the [process scaling documentation](/docs/processes/process-management.md) for more information.
 
@@ -75,9 +270,101 @@ Once persistent storage is mounted, the app requires a restart. See the [process
 dokku ps:restart app-name
 ```
 
+#### Scoping a mount to a process type
+
+> [!IMPORTANT]
+> New as of 0.38.29
+
+By default a mount is bound into every one of an app's containers. `--process-type` narrows it to a single Procfile process type, which is how a worker gets a scratch volume the web process has no business seeing:
+
+```shell
+dokku storage:create node-js-scratch
+dokku storage:mount node-js-app node-js-scratch --container-dir /scratch --process-type worker
+```
+
+The magic `_default_` process type is the unscoped case, and it is what a mount gets when `--process-type` is omitted. Default-scoped mounts are bound into every process; a mount scoped to a named process type is bound only into that one.
+
+Some containers belong to no process type at all - a `dokku run` one-off, the ephemeral containers that run `app.json` deploy tasks, and k3s cron jobs. Those receive default-scoped mounts only, since there is no process type for a named scope to match. On k3s this applies to the deploy phase; `--phase run` attachments are not mounted there at all.
+
+A container path can be claimed by only one mount per process type, so `storage:mount` rejects a container path that an overlapping scope already holds. The default scope overlaps every named one:
+
+```shell
+dokku storage:create node-js-data
+dokku storage:create node-js-cache
+
+dokku storage:mount node-js-app node-js-data --container-dir /app/storage
+# fails: the default-scoped mount above also applies to web
+dokku storage:mount node-js-app node-js-cache --container-dir /app/storage --process-type web
+```
+
+Two *named* scopes never apply to the same container, so they may each bind a different entry at the same container path:
+
+```shell
+dokku storage:mount node-js-app node-js-data --container-dir /app/storage --process-type web
+dokku storage:mount node-js-app node-js-cache --container-dir /app/storage --process-type worker
+```
+
+#### Replacing the entire mount set
+
+> [!IMPORTANT]
+> New as of 0.38.29. Per-mount attributes in the option list new as of 0.38.30.
+
+The form above mounts one entry at a time, so matching an app's mounts to a declared set means reading `storage:list`, computing the difference in both directions and issuing one `storage:mount` or `storage:unmount` per addition and removal - with a failure partway through leaving the app holding a mixture of the two sets. The `--replace` flag writes the whole set in a single call, taking `name:container-dir` pairs instead of a single entry and a `--container-dir` flag.
+
+```shell
+dokku storage:mount --replace node-js-app node-js-data:/app/storage node-js-cache:/cache
+```
+
+Anything previously mounted and not named in the call is unmounted. Each pair takes the same optional third field as the legacy colon form, a comma-separated list, and that list carries every mount-time attribute the mount needs, so two mounts declared in one call can differ in all of them:
+
+```shell
+dokku storage:mount --replace node-js-app \
+  node-js-data:/app/storage:ro,Z,volume-subpath=uploads,volume-chown=herokuish \
+  node-js-cache:/cache:phase=deploy,phase=run,noexec
+```
+
+| Token | Meaning |
+| --- | --- |
+| `ro` | Mount the volume read-only |
+| `rw` | Mount it read-write, the explicit opposite of `ro` and the default |
+| `volume-subpath=<path>` | Subpath within the entry |
+| `volume-chown=<option>` | Chown option applied at mount time |
+| `phase=<deploy\|run>` | Phase to mount in, repeated once per phase; both phases when omitted |
+| anything else | A Docker mount option, passed through verbatim in the order given |
+
+Order within the list does not matter, and the keys mirror the flags the single-entry form uses so each attribute has exactly one spelling. Phases are stored in `deploy,run` order however they were written, so re-issuing an equivalent call converges rather than registering a change. A token value cannot contain a comma, since the comma is what separates tokens; a subpath needing one is set with the single-entry form. Note that `storage:list` renders the Docker `-v` view and omits the subpath, chown and phases, so its output does not round-trip into `--replace` - `storage:report` shows every field.
+
+A pair whose first field starts with `/` is a legacy host path rather than an entry name, and registers its `legacy-<hash>` entry the same way the colon form does. Any other first field must name a registered entry, so a mistyped name is rejected rather than taken for a docker volume. A docker volume already mounted through the colon form is named here by the `legacy-<hash>` entry that `storage:list-entries` shows. Only the first field decides which entry a host path resolves to, so adding tokens to a pair never moves it onto a different one.
+
+Because each attribute has exactly one spelling in this form, `--phase`, `--volume-subpath`, `--volume-readonly`, `--volume-chown` and `--volume-options` are rejected with `--replace` rather than acting as call-level defaults a token overrides:
+
+```shell
+dokku storage:mount --replace node-js-app node-js-data:/app/storage --volume-subpath uploads
+```
+
+```
+ !     The --volume-subpath flag cannot be used with --replace; set volume-subpath=<path> in the mount spec instead
+```
+
+The single-entry form keeps all five flags.
+
+`--process-type` is the exception and scopes the replacement the same way it scopes a single mount, since it selects which mounts the call is authoritative over rather than describing any one of them. Omitting it replaces the `_default_` process type, leaving mounts scoped to a named process type in place:
+
+```shell
+dokku storage:mount --replace node-js-app node-js-data:/app/storage
+dokku storage:mount --replace node-js-app node-js-cache:/cache --process-type web
+```
+
+Every pair is parsed and validated before anything is written, so a rejected pair leaves the stored mounts untouched. A pair without a container directory, a container directory that is not absolute, an entry that is not registered, an entry whose scheduler does not match the app's, and a container directory named more than once in one call are all rejected. So are the option list's own mistakes: an unknown key, a key given more than once, an empty value, an empty option, `ro` and `rw` together, a phase that is neither `deploy` nor `run`, and a chown value the plugin does not understand. Rejecting an unknown key is what catches a typo like `volume-subpth=uploads`, which would otherwise be stored as a Docker mount option and surface only when the next deploy failed.
+
+> [!NOTE]
+> An empty pair list is rejected rather than treated as a request to unmount everything, so a generated list that expands to nothing cannot silently drop an app's storage. Use `storage:unmount --all` for that.
+
+As with a single mount, the app requires a restart afterward.
+
 ### Unmounting storage
 
-If an app no longer requires a mounted volume or directory, the `storage:unmount` command can be called. This takes the same arguments as the `storage:mount` command, an app name and a `host-path:container-path` or `docker-volume:container-path` combination.
+If an app no longer requires a mounted volume or directory, the `storage:unmount` command can be called. This takes the same arguments as the `storage:mount` command, an app name and a `host-path:container-path` or `docker-volume:container-path` combination, or a registered entry name.
 
 ```shell
 # unmount the directory from your container's /app/storage directory, relative to the container root (/)
@@ -87,14 +374,107 @@ dokku storage:unmount node-js-app /var/lib/dokku/data/storage/node-js-app:/app/s
 dokku storage:unmount node-js-app some-docker-volume:/app/storage
 ```
 
+> [!IMPORTANT]
+> Removing more than one attachment at a time is new as of 0.38.29
+
+More than one attachment can be removed in a single call, naming each by entry name or by the colon form. Every argument is resolved against the app's attachments before any of them is removed, so an argument naming an attachment the app does not have removes none of them:
+
+```shell
+dokku storage:unmount node-js-app node-js-data node-js-cache
+```
+
+An entry mounted at several container directories is disambiguated with `--container-dir`, which therefore applies only when a single entry is named. Naming the container directory in the argument itself works with any number of attachments:
+
+```shell
+dokku storage:unmount node-js-app node-js-data --container-dir /app/storage
+dokku storage:unmount node-js-app node-js-data:/app/storage node-js-data:/app/uploads
+```
+
+#### Removing every mount
+
+> [!IMPORTANT]
+> New as of 0.38.29
+
+The `--all` flag removes every attachment on an app. This is the empty case `storage:mount --replace` refuses to handle, and it takes no entry arguments:
+
+```shell
+dokku storage:unmount --all node-js-app
+```
+
+`--process-type` narrows what is removed to a single scope, filtering the same way it scopes a replacement. Omitting it removes every scope, and a scope that matches nothing is a no-op rather than an error, so the command is safe to re-run:
+
+```shell
+dokku storage:unmount --all node-js-app --process-type web
+```
+
 Once persistent storage is unmounted, the app requires a restart. See the [process scaling documentation](/docs/processes/process-management.md) for more information.
 
 ```shell
 dokku ps:restart app-name
 ```
 
+### Destroying storage entries
+
+A named storage entry can be removed with the `storage:destroy` command. The entry must first be unmounted from every app that mounts it.
+
+```shell
+dokku storage:destroy rdmtest-entry
+```
+
+As the command is destructive - removing the registry entry and, depending on the scheduler and reclaim policy, the underlying volume - it will default to asking for confirmation before executing the removal.
+
+```
+ !     WARNING: Potentially Destructive Action
+ !     This command will destroy storage entry rdmtest-entry.
+ !     To proceed, type "rdmtest-entry"
+> rdmtest-entry
+-----> Storage entry rdmtest-entry destroyed
+```
+
+The confirmation may be avoided by providing the `--force` flag, which is useful for non-interactive or automated callers:
+
+```shell
+dokku storage:destroy rdmtest-entry --force
+```
+
+The global `--force` flag is also supported:
+
+```shell
+dokku --force storage:destroy rdmtest-entry
+```
+
+#### Removing the host directory
+
+> [!IMPORTANT]
+> New as of 0.38.27
+
+By default a docker-local entry's host directory survives `storage:destroy` - the entry is deregistered but the data stays on disk. The `--destroy-host-dir` flag removes the directory and everything in it:
+
+```shell
+dokku storage:destroy node-js-data --destroy-host-dir
+```
+
+```
+ !     Storage entry node-js-data is backed by /var/lib/dokku/data/storage/node-js-data, which will be removed along with its contents.
+ !     WARNING: Potentially Destructive Action
+ !     This command will destroy storage entry node-js-data.
+ !     To proceed, type "node-js-data"
+```
+
+The removal is recursive, so it succeeds whether or not the directory is empty. It is only permitted for entries at the default `/var/lib/dokku/data/storage/<name>` location; an entry created with a custom `<path>` is refused, and the operator removes the path themselves.
+
+The same removal can be declared ahead of time with `--reclaim-policy`, which behaves for a docker-local host directory the way it behaves for a k3s PersistentVolume. An entry created with `Delete` has its host directory removed on `storage:destroy` without any extra flag, while `Retain` - the default when unset - keeps it:
+
+```shell
+dokku storage:create node-js-data --reclaim-policy Delete
+dokku storage:destroy node-js-data --force
+```
+
+`--destroy-host-dir` is docker-local only. On a k3s entry the underlying volume is already governed by the reclaim policy recorded on the entry, so passing the flag is an error.
+
 ### Displaying storage reports for an app
 
+> [!IMPORTANT]
 > New as of 0.8.1
 
 You can get a report about the app's storage status using the `storage:report` command:
@@ -137,6 +517,62 @@ You can pass flags which will output only the value of the specific information 
 dokku storage:report node-js-app --storage-deploy-mounts
 ```
 
+In addition to the aggregated `Storage build/deploy/run mounts:` lines, the report emits one flat dotted key per attachment field, indexed from `1`. The key shape is `--storage-attachment.<index>.<field>` for each of `entry-name`, `host-path`, `container-path`, `phases`, `process-type`, `subpath`, `readonly`, `volume-options`, and `volume-chown`. Fields render as empty strings when unset, and attachments are ordered by lex-sort of the index (so `10` sorts before `2`):
+
+```shell
+dokku storage:create node-js-data
+dokku storage:mount node-js-app node-js-data --container-dir /app/storage --volume-options Z --volume-chown herokuish --volume-subpath uploads
+dokku storage:report node-js-app
+```
+
+```
+=====> node-js-app storage information
+       Storage attachment 1 container path:  /app/storage
+       Storage attachment 1 entry name:      node-js-data
+       Storage attachment 1 host path:       /var/lib/dokku/data/storage/node-js-data
+       Storage attachment 1 phases:          deploy,run
+       Storage attachment 1 process type:    _default_
+       Storage attachment 1 readonly:        false
+       Storage attachment 1 subpath:         uploads
+       Storage attachment 1 volume chown:    herokuish
+       Storage attachment 1 volume options:  Z
+       Storage build mounts:
+       Storage deploy mounts: -v /var/lib/dokku/data/storage/node-js-data:/app/storage:Z
+       Storage run mounts:  -v /var/lib/dokku/data/storage/node-js-data:/app/storage:Z
+```
+
+The same keys are exposed in JSON output, both in the stripped (`attachment.1.volume-options`) and legacy (`storage-attachment.1.volume-options`) forms:
+
+```shell
+dokku storage:report node-js-app --format json | jq '. | with_entries(select(.key | startswith("attachment.")))'
+```
+
+```json
+{
+  "attachment.1.container-path": "/app/storage",
+  "attachment.1.entry-name": "node-js-data",
+  "attachment.1.host-path": "/var/lib/dokku/data/storage/node-js-data",
+  "attachment.1.phases": "deploy,run",
+  "attachment.1.process-type": "_default_",
+  "attachment.1.readonly": "false",
+  "attachment.1.subpath": "uploads",
+  "attachment.1.volume-chown": "herokuish",
+  "attachment.1.volume-options": "Z"
+}
+```
+
+Indices are assigned in stored order, so `storage:mount --replace` renumbers them: the attachments it leaves in place keep their relative order and the declared ones follow.
+
+A single attachment field can be fetched directly via the info-flag form:
+
+```shell
+dokku storage:report node-js-app --storage-attachment.1.volume-options
+```
+
+```
+Z
+```
+
 ## Use Cases
 
 ### Sharing storage across deploys
@@ -165,14 +601,27 @@ dokku docker-options:add node-js-app build "-v /tmp/python-test:/opt/test"
 
 You cannot use mounted volumes during the build phase of a Dockerfile deploy. This is because Docker does not support volumes when executing `docker build`.
 
-> Note: **This can cause data loss** if you bind a mount under `/app` in buildpack apps as herokuish will attempt to remove the original app path during the build phase.
+> [!WARNING]
+> **This can cause data loss** if you bind a mount under `/app` in buildpack apps as herokuish will attempt to remove the original app path during the build phase.
 
 ## App User and Persistent Storage file ownership (buildpack apps only)
 
+> [!IMPORTANT]
 > New as of 0.7.1
 
 By default, Dokku will execute your buildpack app processes as the `herokuishuser` user. You may override this by setting the `DOKKU_APP_USER` config variable.
 
-> NOTE: this user must exist in your herokuish image.
+> [!NOTE]
+> this user must exist in your herokuish image.
 
-Additionally, the default `docker-local` scheduler that comes with Dokku will ensure your storage mounts are owned by either `herokuishuser` or the overridden value you have set in `DOKKU_APP_USER`. See the [docker-local scheduler documentation](/docs/advanced-usage/schedulers/docker-local.md#disabling-chown-of-persistent-storage) docs for more information.
+Additionally, the default `docker-local` scheduler that comes with Dokku will ensure your storage mounts are owned by either `herokuishuser` or the overridden value you have set in `DOKKU_APP_USER`. See the [docker-local scheduler documentation](/docs/deployment/schedulers/docker-local.md#disabling-chown-of-persistent-storage) docs for more information.
+
+## Properties
+
+### Internal properties
+
+The following property is recorded internally by the storage plugin and is not exposed via `storage:report`:
+
+| Property | Scope | Description | Source |
+|---|---|---|---|
+| `legacy-mounts-migrated` | per-app | Per-app marker recording that the app's legacy `-v` docker-options entries were drained into named storage entries plus attachments. Only set when at least one `-v` line was actually migrated; apps that have never had legacy mounts never receive this marker | `plugins/storage/migrate.go` writes `"true"` after a successful drain |

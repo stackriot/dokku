@@ -3,12 +3,10 @@ set -eo pipefail
 [[ $TRACE ]] && set -x
 
 if [[ -e /usr/share/debconf/confmodule ]]; then
-  # shellcheck disable=SC1091
   . /usr/share/debconf/confmodule
 fi
 
 if [[ -r /etc/default/dokku ]]; then
-  # shellcheck disable=SC1091
   source /etc/default/dokku
 fi
 
@@ -23,6 +21,40 @@ call-sshcommand() {
   else
     echo "Unable to find sshcommand binary" 1>&2
     exit 1
+  fi
+}
+
+setup-docker-live-restore() {
+  # skip if running in docker-based installation
+  if [[ "$DOKKU_INIT_SYSTEM" == "sv" ]]; then
+    return
+  fi
+
+  # allow disabling via /etc/default/dokku
+  if [[ "$DOKKU_LIVE_RESTORE" == "false" ]]; then
+    return
+  fi
+
+  live_restore="$(docker info --format '{{ .LiveRestoreEnabled }}' || true)"
+  if [ "$live_restore" = "true" ]; then
+    echo "Docker live-restore is already enabled"
+    return
+  fi
+
+  echo "Enabling docker live-restore"
+  if [[ ! -f /etc/docker/daemon.json ]]; then
+    mkdir -p /etc/docker
+    echo "{}" >/etc/docker/daemon.json
+  fi
+
+  config="$(jq '. + {"live-restore": true}' /etc/docker/daemon.json)"
+  echo "$config" >/etc/docker/daemon.json
+  if command -v systemctl &>/dev/null; then
+    if ! systemctl reload docker; then
+      echo "Unable to reload docker, please reload manually" 1>&2
+    fi
+  else
+    echo "Unable to reload docker, please reload manually" 1>&2
   fi
 }
 
@@ -77,16 +109,21 @@ setup-plugins() {
   db_get "dokku/nginx_enable"
   echo "Enabling all core plugins"
   find "${DOKKU_LIB_ROOT}/core-plugins/available" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | while read -r plugin; do
+    if [ -d "${DOKKU_LIB_ROOT}/plugins/available/$plugin" ]; then
+      continue
+    fi
+
+    ln -s "${DOKKU_LIB_ROOT}/core-plugins/available/$plugin" "${DOKKU_LIB_ROOT}/plugins/available/$plugin"
     if [ "$plugin" = "nginx-vhosts" ] && [ "$RET" = "false" ]; then
       echo "Skipping enable of nginx-vhosts plugin"
       continue
-    elif [ ! -d "${DOKKU_LIB_ROOT}/plugins/available/$plugin" ]; then
-      ln -s "${DOKKU_LIB_ROOT}/core-plugins/available/$plugin" "${DOKKU_LIB_ROOT}/plugins/available/$plugin"
-      PLUGIN_PATH="${DOKKU_LIB_ROOT}/core-plugins" plugn enable "$plugin"
-      PLUGIN_PATH="${DOKKU_LIB_ROOT}/plugins" plugn enable "$plugin"
     fi
+
+    PLUGIN_PATH="${DOKKU_LIB_ROOT}/core-plugins" plugn enable "$plugin"
+    PLUGIN_PATH="${DOKKU_LIB_ROOT}/plugins" plugn enable "$plugin"
   done
-  find -L "${DOKKU_LIB_ROOT}" -type l -delete
+  find -L "${DOKKU_LIB_ROOT}/core-plugins" -type l -delete
+  find -L "${DOKKU_LIB_ROOT}/plugins" -type l -delete
   chown dokku:dokku -R "${DOKKU_LIB_ROOT}/plugins" "${DOKKU_LIB_ROOT}/core-plugins"
 
   echo "Install all core plugins"
@@ -102,6 +139,85 @@ setup-sshcommand() {
   fi
 }
 
+disable-default-vhost-path() {
+  local path="$1"
+  local backup_path="${path}.dokku-disabled"
+
+  if [ ! -e "$path" ] && [ ! -L "$path" ]; then
+    return
+  fi
+
+  if [ -e "$backup_path" ] || [ -L "$backup_path" ]; then
+    return
+  fi
+
+  case "$path" in
+    /etc/nginx/sites-enabled/*)
+      rm -f "$path"
+      echo "Removed conflicting nginx default at $path" 1>&2
+      return
+      ;;
+  esac
+
+  if [ -L "$path" ]; then
+    rm -f "$path"
+    echo "Removed conflicting nginx default symlink at $path" 1>&2
+    return
+  fi
+
+  mv -n "$path" "$backup_path"
+  echo "Disabled $path (renamed to $backup_path)" 1>&2
+}
+
+setup-default-site() {
+  db_get "dokku/install_default_site"
+  if [ "$RET" != "true" ]; then
+    return
+  fi
+
+  local nginx_bin nginx_version major minor patch
+  nginx_bin="$(command -v nginx || true)"
+  if [ -z "$nginx_bin" ]; then
+    return
+  fi
+
+  nginx_version="$("$nginx_bin" -v 2>&1 | cut -d'/' -f 2 | awk '{print $1}')"
+  major="$(echo "$nginx_version" | awk -F. '{print $1}')"
+  minor="$(echo "$nginx_version" | awk -F. '{print $2}')"
+  patch="$(echo "$nginx_version" | awk -F. '{print $3}')"
+
+  # ssl_reject_handshake requires nginx >= 1.19.4; older nginx gets the
+  # HTTP-only catch-all so the SSL listen lines do not require a cert.
+  local default_vhost_basename="default-site.conf"
+  if [ "${major:-0}" -lt 2 ]; then
+    if [ "${major:-0}" -lt 1 ] || [ "${minor:-0}" -lt 19 ] || { [ "${minor:-0}" -eq 19 ] && [ "${patch:-0}" -lt 4 ]; }; then
+      default_vhost_basename="default-site-legacy.conf"
+    fi
+  fi
+
+  local default_vhost_target="/etc/nginx/conf.d/00-default-vhost.conf"
+  local default_vhost_source="${DOKKU_LIB_ROOT}/core-plugins/available/nginx-vhosts/templates/${default_vhost_basename}"
+
+  if [ -e "$default_vhost_target" ]; then
+    return
+  fi
+
+  if [ ! -f "$default_vhost_source" ]; then
+    return
+  fi
+
+  for path in /etc/nginx/sites-enabled/default /etc/nginx/sites-available/default /etc/nginx/conf.d/default.conf; do
+    disable-default-vhost-path "$path"
+  done
+
+  echo "Installing nginx default catch-all site at $default_vhost_target"
+  install -m 0644 -o root -g root "$default_vhost_source" "$default_vhost_target"
+
+  if command -v dokku &>/dev/null; then
+    dokku nginx:reload || true
+  fi
+}
+
 dpkg-handling() {
   if [ -f "${DOKKU_ROOT}/VHOST" ]; then
     echo "VHOST file detected, skipping modification"
@@ -111,6 +227,7 @@ dpkg-handling() {
       db_get "dokku/hostname"
       echo "Setting VHOST contents to $RET"
       echo "$RET" >"${DOKKU_ROOT}/VHOST"
+      chown dokku:dokku "${DOKKU_ROOT}/VHOST"
     fi
   fi
 
@@ -125,13 +242,9 @@ dpkg-handling() {
 case "$1" in
   abort-upgrade | abort-remove | abort-deconfigure) ;;
 
-  \
-    configure)
+  configure)
     mandb
     [ ! -x /usr/bin/docker.io ] || ln -sf /usr/bin/docker.io /usr/local/bin/docker
-    if [[ -f /sbin/modprobe ]]; then
-      modprobe aufs || echo "WARNING: Restart server to finish installing dokku!"
-    fi
 
     setup-user
     setup-storage
@@ -139,6 +252,10 @@ case "$1" in
     dpkg-handling
     setup-plugins
     setup-sshcommand
+    setup-docker-live-restore
+    if [ -z "$2" ]; then
+      setup-default-site
+    fi
     ;;
 
   *)

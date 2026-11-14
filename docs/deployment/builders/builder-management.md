@@ -1,5 +1,6 @@
 # Builder Management
 
+> [!IMPORTANT]
 > New as of 0.24.0
 
 ```
@@ -17,6 +18,7 @@ Dokku supports the following built-in builders:
 
 - `builder-dockerfile`: Builds apps using a `Dockerfile` via `docker build`. See the [dockerfile builder documentation](/docs/deployment/builders/dockerfiles.md) for more information on how this builder functions.
 - `builder-herokuish`: Builds apps with Heroku's v2a Buildpack specification via `gliderlabs/herokuish`. See the [herokuish builder documentation](/docs/deployment/builders/herokuish-buildpacks.md) for more information on how this builder functions.
+- `builder-lambda`: Builds AWS Lambda functions in an environment simulating AWS Lambda runtimes via [lambda-builder](https://github.com/dokku/lambda-builder). See the [lambda builder documentation](/docs/deployment/builders/lambda.md) for more information on how this builder functions.
 - `builder-null`: Does nothing during the build phase. See the [null builder documentation](/docs/deployment/builders/null.md) for more information on how this builder functions.
 - `builder-pack`: Builds apps with Cloud Native Buildpacks via the `pack-cli`  tool. See the [cloud native buildpacks builder documentation](/docs/deployment/builders/cloud-native-buildpacks.md) for more information on how this builder functions.
 
@@ -24,7 +26,7 @@ Builders run a detection script against a source code repository, and the first 
 
 ### Overriding the auto-selected builder
 
-If desired, the builder can be specified via the `builder:set` command by speifying a value for `selected`. The selected builder will always be used.
+If desired, the builder can be specified via the `builder:set` command by specifying a value for `selected`. The selected builder will always be used.
 
 ```shell
 dokku builder:set node-js-app selected dockerfile
@@ -42,6 +44,9 @@ The `selected` property can also be set globally. The global default is an empty
 dokku builder:set --global selected herokuish
 ```
 
+> [!WARNING]
+> Selecting a global builder will result in _all_ applications using that builder unless a manual override is selected.
+
 The default value may be set by passing an empty value for the option.
 
 ```shell
@@ -50,7 +55,8 @@ dokku builder:set --global selected
 
 #### Changing the build directory
 
-> Warning: Please keep in mind that setting a custom build directory will result in loss of any changes to the top-level directory, such as the `git.keep-git-dir` property.
+> [!WARNING]
+> Please keep in mind that setting a custom build directory will result in loss of any changes to the top-level directory, such as the `git.keep-git-dir` property.
 
 When deploying a monorepo, it may be desirable to specify the specific build directory to use for a given app. This can be done via the `builder:set` command. If a value is specified and that directory does not exist within the repository, the build will fail.
 
@@ -75,6 +81,28 @@ The default value may be set by passing an empty value for the option.
 ```shell
 dokku builder:set --global build-dir
 ```
+
+#### Skipping container and image cleanup
+
+After a successful deploy, Dokku removes old containers and images that are no longer referenced by the app. On hosts where image rebuilds are expensive or where operators want to retain prior images for manual rollback, this cleanup can be disabled per-app or globally via the `skip-cleanup` property:
+
+```shell
+dokku builder:set node-js-app skip-cleanup true
+```
+
+The property can also be set globally:
+
+```shell
+dokku builder:set --global skip-cleanup true
+```
+
+The default behavior (cleanup enabled) may be restored by passing an empty value:
+
+```shell
+dokku builder:set node-js-app skip-cleanup
+```
+
+For backwards compatibility with bootstrap-time configuration, the `DOKKU_SKIP_CLEANUP` environment variable in `/etc/environment` or `~dokku/.dokkurc/*` is still honored when the `skip-cleanup` property is unset. The property is the canonical interface and takes precedence when set.
 
 ### Displaying builder reports for an app
 
@@ -130,17 +158,40 @@ dokku builder:report node-js-app --builder-selected
 To create a custom builder, the following triggers must be implemented:
 
 - `builder-build`:
-  - arguments: `BUILDER_TYPE` `APP` `SOURCECODE_WORK_DIR`
-  - description: Creates a docker image named with the output of `common#get_app_image_name $APP`.
+    - arguments: `BUILDER_TYPE` `APP` `SOURCECODE_WORK_DIR`
+    - description: Creates a docker image named with the output of `common#get_app_image_name $APP`.
 - `builder-detect`:
-  - arguments: `APP` `SOURCECODE_WORK_DIR`
-  - description: Outputs the name of the builder (without the `builder-` prefix) to use to build the app.
+    - arguments: `APP` `SOURCECODE_WORK_DIR`
+    - description: Outputs the name of the builder (without the `builder-` prefix) to use to build the app.
 - `builder-release`:
-  - arguments: `BUILDER_TYPE` `APP` `IMAGE_AG`
-  - description: A post-build, pre-release trigger that can be used to post-process the image. Usually simply tags and labels the image appropriately.
+    - arguments: `BUILDER_TYPE` `APP` `IMAGE_AG`
+    - description: A post-build, pre-release trigger that can be used to post-process the image. Usually simply tags and labels the image appropriately.
+
+When an app is rebuilt via `ps:rebuild --no-cache`, the `DOKKU_BUILD_NO_CACHE` environment variable is set to `true` during the `builder-build` trigger. Custom builders should skip any build cache they use when this variable is set.
 
 Custom plugins names _must_ have the prefix `builder-` or builder overriding via `builder:set` may not function as expected.
 
 Builders can use any tools available on the system to build the docker image, and may even be used to schedule building off-server. The only current requirement is that the image must exist on the server at the end of the `builder-build` command, though this requirement may be relaxed in a future release.
 
 For a simple example of how to implement this trigger, see `builder-pack`, which utilizes a cli tool - `pack-cli` - to generate an OCI image that is compatible with Docker and can be scheduled by the official scheduling plugins.
+
+## Properties
+
+### Settable properties
+
+> [!NOTE]
+> The `Report flags` column lists the CLI argument names accepted by `builder:report`. The JSON keys emitted by `builder:report --format json` are the same names with the leading `--builder-` stripped (e.g. `selected`, `global-selected`, `computed-selected`). Legacy keys with the `builder-` prefix are also emitted during the 0.38.x deprecation window and will be removed in a future major release.
+
+| Property | Scope | Default | Report flags | Description |
+| --- | --- | --- | --- | --- |
+| `build-dir` | app + global | none | `--builder-build-dir`, `--builder-global-build-dir`, `--builder-computed-build-dir` | Subdirectory within the repository to use as the build context |
+| `selected` | app + global | none | `--builder-selected`, `--builder-global-selected`, `--builder-computed-selected` | Builder plugin to use; overrides automatic detection |
+| `skip-cleanup` | app + global | `false` | `--builder-skip-cleanup`, `--builder-global-skip-cleanup`, `--builder-computed-skip-cleanup` | When `true`, leaves intermediate build artifacts in place after the build |
+
+### Read-only flags
+
+The following flags surface in `builder:report` but are not managed by `builder:set`:
+
+| Flag | Description |
+|---|---|
+| `--builder-detected` | Builder auto-selected for the app when `selected` is unset |

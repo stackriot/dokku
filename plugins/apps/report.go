@@ -2,23 +2,33 @@ package apps
 
 import (
 	"fmt"
-	"os"
+	"strings"
 
 	"github.com/dokku/dokku/plugins/common"
 )
 
 // ReportSingleApp is an internal function that displays the app report for one or more apps
 func ReportSingleApp(appName string, format string, infoFlag string) error {
-	if err := common.VerifyAppName(appName); err != nil {
-		return err
+	if appName != "--global" {
+		if err := common.VerifyAppName(appName); err != nil {
+			return err
+		}
 	}
 
-	flags := map[string]common.ReportFunc{
-		"--app-created-at":             reportCreatedAt,
-		"--app-deploy-source":          reportDeploySource,
-		"--app-deploy-source-metadata": reportDeploySourceMetadata,
-		"--app-dir":                    reportDir,
-		"--app-locked":                 reportLocked,
+	var flags map[string]common.ReportFunc
+	if appName == "--global" {
+		flags = map[string]common.ReportFunc{
+			"--app-global-disable-autocreation": reportGlobalDisableAutocreation,
+		}
+	} else {
+		flags = map[string]common.ReportFunc{
+			"--app-created-at":                  reportCreatedAt,
+			"--app-deploy-source":               reportDeploySource,
+			"--app-deploy-source-metadata":      reportDeploySourceMetadata,
+			"--app-dir":                         reportDir,
+			"--app-global-disable-autocreation": reportGlobalDisableAutocreation,
+			"--app-locked":                      reportLocked,
+		}
 	}
 
 	flagKeys := []string{}
@@ -26,19 +36,26 @@ func ReportSingleApp(appName string, format string, infoFlag string) error {
 		flagKeys = append(flagKeys, flagKey)
 	}
 
-	trimPrefix := false
-	uppercaseFirstCharacter := true
 	infoFlags := common.CollectReport(appName, infoFlag, flags)
-	return common.ReportSingleApp("app", appName, infoFlag, infoFlags, flagKeys, format, trimPrefix, uppercaseFirstCharacter)
+	return common.ReportSingleApp(common.ReportSingleAppInput{
+		ReportType:              "app",
+		AppName:                 appName,
+		InfoFlag:                infoFlag,
+		InfoFlags:               infoFlags,
+		InfoFlagKeys:            flagKeys,
+		Format:                  format,
+		TrimPrefix:              true,
+		UppercaseFirstCharacter: true,
+		EmitLegacyPrefix:        true,
+	})
 }
 
 func reportCreatedAt(appName string) string {
-	fi, err := os.Stat(common.AppRoot(appName))
+	createdAt, err := common.PropertyListGet("apps", appName, "created-at")
 	if err != nil {
 		return ""
 	}
-
-	return fmt.Sprint(fi.ModTime().Unix())
+	return fmt.Sprint(strings.Join(createdAt, ","))
 }
 
 func reportDeploySource(appName string) string {
@@ -51,6 +68,10 @@ func reportDeploySourceMetadata(appName string) string {
 
 func reportDir(appName string) string {
 	return common.AppRoot(appName)
+}
+
+func reportGlobalDisableAutocreation(appName string) string {
+	return common.PropertyGet("apps", "--global", "disable-autocreation")
 }
 
 func reportLocked(appName string) string {

@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 set -eo pipefail
 [[ $DOKKU_TRACE ]] && set -x
-export DOKKU_PORT=${DOKKU_PORT:=22}
+export DOKKU_PORT=${DOKKU_PORT:=}
 export DOKKU_HOST=${DOKKU_HOST:=}
+export DOKKU_APP_PATH=${DOKKU_APP_PATH:=}
 
 fn-random-number() {
   [[ -n "$1" ]] && RANGE="$1"
@@ -49,7 +50,7 @@ fn-dokku-host() {
   declare DOKKU_GIT_REMOTE="$1" DOKKU_HOST="$2"
 
   if [[ -z "$DOKKU_HOST" ]]; then
-    if [[ -d .git ]] || git rev-parse --git-dir >/dev/null 2>&1; then
+    if [[ -d .git ]] || git rev-parse --git-dir &>/dev/null; then
       DOKKU_HOST=$(git remote -v 2>/dev/null | grep -Ei "^${DOKKU_GIT_REMOTE}\s" | head -n 1 | cut -f1 -d' ' | cut -f2 -d '@' | cut -f1 -d':' 2>/dev/null || true)
     fi
   fi
@@ -61,9 +62,43 @@ fn-dokku-host() {
   echo "$DOKKU_HOST"
 }
 
+fn-dokku-app() {
+  declare DOKKU_GIT_REMOTE="$1" DOKKU_REMOTE_HOST="$2"
+  remote_output="$(git remote -v 2>/dev/null | grep -Ei "^${DOKKU_GIT_REMOTE}\s" | head -n 1 | awk '{print $2}')"
+
+  # check if there is a scheme
+  if echo "$remote_output" | grep -qEi "ssh://"; then
+    echo "$remote_output" | grep -Ei "ssh://dokku@$DOKKU_REMOTE_HOST" | cut -f2 -d'@' | cut -f2 -d'/' 2>/dev/null
+  else
+    echo "$remote_output" | grep -Ei "dokku@$DOKKU_REMOTE_HOST" | cut -f2 -d'@' | cut -f2 -d':' 2>/dev/null
+  fi
+}
+
+fn-dokku-port() {
+  declare DOKKU_GIT_REMOTE="$1" DOKKU_REMOTE_HOST="$2"
+  remote_output="$(git remote -v 2>/dev/null | grep -Ei "^${DOKKU_GIT_REMOTE}\s" | head -n 1 | awk '{print $2}')"
+
+  if echo "$remote_output" | grep -qEi "ssh://"; then
+    local output="$(echo "$remote_output" | grep -Ei "ssh://dokku@$DOKKU_REMOTE_HOST" | cut -f2 -d'@' | cut -f1 -d'/' 2>/dev/null)"
+    # check if output has a : and if so, get the port
+    if echo "$output" | grep -qEi ":"; then
+      echo "$output" | cut -f2 -d':' 2>/dev/null
+    else
+      echo "22"
+    fi
+  else
+    echo "22"
+  fi
+}
+
+fn-get-remote() {
+  git config dokku.remote 2>/dev/null || echo "dokku"
+}
+
 main() {
   declare CMD="$1" APP_ARG="$2"
-  local APP="" DOKKU_GIT_REMOTE="dokku" DOKKU_REMOTE_HOST=""
+
+  local APP="" DOKKU_GIT_REMOTE="$(fn-get-remote)" DOKKU_REMOTE_HOST=""
   local cmd_set=false next_index=1 skip=false args=("$@")
 
   for arg in "$@"; do
@@ -78,6 +113,10 @@ main() {
 
     if [[ "$arg" == "--app" ]]; then
       APP=${args[$next_index]}
+      skip=true
+      shift 2
+    elif [[ "$arg" == "--app-path" ]]; then
+      DOKKU_APP_PATH=${args[$next_index]}
       skip=true
       shift 2
     elif [[ "$arg" == "--remote" ]]; then
@@ -99,22 +138,41 @@ main() {
     next_index=$((next_index + 1))
   done
 
+  if [[ -n "$DOKKU_APP_PATH" ]]; then
+    pushd "$DOKKU_APP_PATH" &>/dev/null || exit 1
+    trap 'popd &>/dev/null || true' RETURN INT TERM
+  fi
+
   DOKKU_REMOTE_HOST="$(fn-dokku-host "$DOKKU_GIT_REMOTE" "$DOKKU_HOST")"
-  if [[ -z "$DOKKU_REMOTE_HOST" ]]; then
+  if [[ -z "$DOKKU_REMOTE_HOST" ]] && [[ "$CMD" != remote ]] && [[ "$CMD" != remote:* ]]; then
     fn-client-help-msg
   fi
 
   if [[ -z "$APP" ]]; then
-    if [[ -d .git ]] || git rev-parse --git-dir >/dev/null 2>&1; then
+    if [[ -d .git ]] || git rev-parse --git-dir &>/dev/null; then
       set +e
-      APP=$(git remote -v 2>/dev/null | grep -Ei "^${DOKKU_GIT_REMOTE}\s" | grep -Ei "dokku@$DOKKU_REMOTE_HOST" | head -n 1 | cut -f2 -d'@' | cut -f1 -d' ' | cut -f2 -d':' 2>/dev/null)
+      APP="$(fn-dokku-app "$DOKKU_GIT_REMOTE" "$DOKKU_REMOTE_HOST")"
       set -e
     else
       echo " !     This is not a git repository" 1>&2
     fi
   fi
 
+  if [[ -z "$DOKKU_PORT" ]]; then
+    DOKKU_PORT="$(fn-dokku-port "$DOKKU_GIT_REMOTE" "$DOKKU_REMOTE_HOST")"
+  fi
+
   case "$CMD" in
+    remote:show)
+      echo "dokku-app: $APP"
+      echo "dokku-git-remote: $DOKKU_GIT_REMOTE"
+      echo "dokku-host: $DOKKU_HOST"
+      echo "dokku-port: $DOKKU_PORT"
+      echo "dokku-remote-host: $DOKKU_REMOTE_HOST"
+      echo "dokku-ssh-user: dokku"
+      echo "dokku-constructed-remote: ssh://dokku@$DOKKU_REMOTE_HOST:$DOKKU_PORT/$APP"
+      exit 0
+      ;;
     apps:create)
       if [[ -z "$APP" ]] && [[ -z "$APP_ARG" ]]; then
         APP=$(fn-random-name)
@@ -125,7 +183,7 @@ main() {
             ssh -p "$DOKKU_PORT" "dokku@$DOKKU_REMOTE_HOST" apps
             exit 1
           else
-            APP=$(random_name)
+            APP=$(fn-random-name)
             counter=$((counter + 1))
           fi
         done
@@ -143,16 +201,60 @@ main() {
     apps:destroy)
       fn-is-git-repo && fn-has-dokku-remote && git remote remove "$DOKKU_GIT_REMOTE"
       ;;
+    remote)
+      echo "$DOKKU_GIT_REMOTE"
+      exit 0
+      ;;
+    remote:add)
+      shift 1
+      git remote add "$@"
+      exit "$?"
+      ;;
+    remote:list)
+      git remote
+      exit "$?"
+      ;;
+    remote:set)
+      shift 1
+      git config dokku.remote "$@"
+      exit "$?"
+      ;;
+    remote:remove)
+      shift 1
+      git remote remove "$@"
+      local exit_code="$?"
+      if [[ "$(git config dokku.remote)" == "$1" ]]; then
+        git config --unset dokku.remote
+      fi
+      exit "$exit_code"
+      ;;
+    remote:unset)
+      if [[ -n "$(git config dokku.remote)" ]]; then
+        git config --unset dokku.remote
+        exit "$?"
+      fi
+      exit 0
+      ;;
   esac
 
   [[ " apps certs help ls nginx shell storage trace version " == *" $CMD "* ]] && unset APP
-  [[ " certs:chain domains:add-global domains:remove-global domains:set-global ps:restore " == *" $CMD "* ]] && unset APP
+  [[ " certs:chain domains:add-global domains:clear-global domains:remove-global domains:set-global ps:restore " == *" $CMD "* ]] && unset APP
+  [[ " storage:ensure-directory " == *" $CMD "* ]] && unset APP
+  [[ " network:create network:destroy network:exists network:info network:list network:rebuildall " == *" $CMD "* ]] && unset APP
+  [[ " logs:vector-logs logs:vector-start logs:vector-stop " == *" $CMD "* ]] && unset APP
+  [[ " scheduler-k3s:cluster:add scheduler-k3s:cluster:list scheduler-k3s:cluster:remove " == *" $CMD "* ]] && unset APP
+  [[ " scheduler-k3s:ensure-charts scheduler-k3s:initialize scheduler-k3s:show-kubeconfig scheduler-k3s:uninstall " == *" $CMD "* ]] && unset APP
+  [[ " scheduler-k3s:profiles:add scheduler-k3s:profiles:list scheduler-k3s:profiles:remove " == *" $CMD "* ]] && unset APP
   [[ "$CMD" =~ events*|plugin*|ssh-keys* ]] && unset APP
   [[ -n "$APP_ARG" ]] && [[ "$APP_ARG" == "--global" ]] && unset APP
-  [[ -n "$@" ]] && [[ -n "$APP" ]] && app_arg="--app $APP"
+  if [[ -n "$@" ]] && [[ -n "$APP" ]]; then
+    set -- "$APP" "$@"
+    set -- "--app" "$@"
+  fi
   # echo "ssh -o LogLevel=QUIET -p $DOKKU_PORT -t dokku@$DOKKU_REMOTE_HOST -- $app_arg $@"
-  # shellcheck disable=SC2068,SC2086
-  ssh -o LogLevel=QUIET -p $DOKKU_PORT -t dokku@$DOKKU_REMOTE_HOST -- $app_arg $@ || {
+  local ssh_args=("-o" "LogLevel=QUIET" "-p" "$DOKKU_PORT" "-t" "dokku@$DOKKU_REMOTE_HOST" "--")
+  ssh_args+=("$@")
+  ssh "${ssh_args[@]}" || {
     ssh_exit_code="$?"
     echo " !     Failed to execute dokku command over ssh: exit code $?" 1>&2
     echo " !     If there was no output from Dokku, ensure your configured SSH Key can connect to the remote server" 1>&2

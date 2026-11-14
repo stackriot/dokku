@@ -1,8 +1,8 @@
 # Log Management
 
 ```
-logs <app> [-h] [-t|--tail] [-n|--num num] [-q|--quiet] [-p|--ps process]  # Display recent log output
-logs:failed [--all|<app>]                                                  # Shows the last failed deploy logs
+logs <app> [-h|--help] [-t|--tail] [-n|--num num] [-q|--quiet] [-p|--ps process]  # Display recent log output
+logs:failed --all|<app>                                                    # Shows the last failed deploy logs
 logs:report [<app>] [<flag>]                                               # Displays a logs report for one or more apps
 logs:set [--global|<app>] <key> <value>                                    # Set or clear a logs property for an app
 logs:vector-logs [--num num] [--tail]                                      # Display vector log output
@@ -19,6 +19,8 @@ You can easily get logs of an app using the `logs` command:
 ```shell
 dokku logs node-js-app
 ```
+
+Logs are pulled via integration with the scheduler for the specified application via "live tailing". As such, logs from previously running deployments are usually not available. Users that desire to see logs from previous deployments for debugging purposes should persist those logs to external services. Please see Dokku's [vector integration](/docs/deployment/logs.md#vector-logging-shipping) for more information on how to persist logs across deployments to ship logs to another service or a third-party platform.
 
 #### Behavioral modifiers
 
@@ -41,7 +43,8 @@ The above command will show logs continually from the web process.
 
 ### Failed deploy logs
 
-> Warning: The default [docker-local scheduler](/docs/advanced-usage/schedulers/docker-local.md) will "store" these until the next deploy or until the old containers are garbage collected - whichever runs first. If you require the logs beyond this point in time, please ship the logs to a centralized log server.
+> [!WARNING]
+> The default [docker-local scheduler](/docs/deployment/schedulers/docker-local.md) will "store" these until the next deploy or until the old containers are garbage collected - whichever runs first. If you require the logs beyond this point in time, please ship the logs to a centralized log server.
 
 In some cases, it may be useful to retrieve the logs from a previously failed deploy.
 
@@ -87,13 +90,15 @@ dokku logs:set --global max-size
 
 ### Vector Logging Shipping
 
+> [!IMPORTANT]
 > New as of 0.22.6
 
 Vector is an open-source, lightweight and ultra-fast tool for building observability pipelines. Dokku integrates with it for shipping container logs for the `docker-local` scheduler. Users may configure log-shipping on a per-app or global basis, neither of which interfere with the `dokku logs` commands.
 
 #### Starting the Vector container
 
-> Warning: While the default vector image may be updated over time, this will not impact running vector containers. Users are encouraged to view any Dokku and Vector changelogs to ensure their system will continue running as expected.
+> [!WARNING]
+> While the default vector image may be updated over time, this will not impact running vector containers. Users are encouraged to view any Dokku and Vector changelogs to ensure their system will continue running as expected.
 
 Vector may be started via the `logs:vector-start` command.
 
@@ -111,11 +116,28 @@ dokku logs:vector-start --vector-image timberio/vector:latest-debian
 
 The `vector` container will be started with the following volume mounts:
 
-- `/var/lib/dokku/data/logs/vector.json:/etc/vector/vector.json`
+- `/var/lib/dokku/data/logs:/etc/vector`
 - `/var/run/docker.sock:/var/run/docker.sock`
 - `/var/log/dokku/apps:/var/log/dokku/apps`
 
+The `/etc/vector` mount includes the `vector.json` configuration file, but also may be used to provide extra files to the vector container.
+
 The final volume mount - `/var/log/dokku/apps` - may be used for users that wish to ship logs to a file on disk that may be later logrotated. This directory is owned by the `dokku` user and group, with permissions set to `0755`. At this time, log-rotation is not configured for this directory.
+
+Operators using a `file` sink are encouraged to configure rotation themselves, as Dokku will not truncate these files. A minimal `/etc/logrotate.d/dokku-app-logs` might look like:
+
+```
+/var/log/dokku/apps/*/*.log {
+  daily
+  rotate 14
+  compress
+  missingok
+  notifempty
+  copytruncate
+}
+```
+
+`copytruncate` is used because Vector holds the file open between writes.
 
 #### Stopping the Vector container
 
@@ -150,6 +172,60 @@ dokku logs:vector-logs --tail --num 10
 
 The above command will show logs continually from the vector container, with an initial history of 10 log lines
 
+#### Changing the vector image
+
+Dokku integrates with a Vector docker image version that is known to be compatible with the documentation. In some cases, it may be useful to specify an alternative image version. To do so, set the global `vector-image` property.
+
+```shell
+dokku logs:set --global vector-image timberio/vector:0.35.X-debian
+```
+
+Once set, the vector container will need to be stopped and then started. Note that specifying the `--vector-image` flag on the `logs:vector-start` will override the setting.
+
+```shell
+dokku logs:vector-stop
+dokku logs:vector-start
+```
+
+Setting this to an empty string will reset the version to the version currently compatible with the Dokku installation.
+
+```shell
+dokku logs:set --global vector-image
+```
+
+#### Attaching Vector to additional Docker networks
+
+By default, the Vector container runs with `network_mode: bridge` and can only reach app containers that are also on the default bridge network. Apps deployed onto a per-app network or a custom network - typically via `dokku network:set <app> initial-network <name>` - are not reachable from Vector over Docker's internal DNS, so sinks that need to talk to those apps directly (for example, an in-host log search service such as [Logpond](https://github.com/dokku/logpond)) would have to route traffic out through the external proxy.
+
+The global `vector-networks` property accepts a comma-separated list of Docker networks for Vector to join.
+
+```shell
+dokku logs:set --global vector-networks dokku-logs
+```
+
+Multiple networks may be specified by separating them with a comma.
+
+```shell
+dokku logs:set --global vector-networks dokku-logs,observability
+```
+
+Setting this property **replaces** the default bridge attachment: the Vector container will be on the configured user-defined networks only, not the default Docker `bridge` network. Outbound traffic continues to work through the user-defined networks' NAT, so external sinks such as Datadog or hosted HTTP endpoints remain reachable.
+
+Each network must already exist; setting a non-existent network or the reserved `bridge` value will fail. The list can be cleared by setting an empty value, which restores the default `network_mode: bridge` configuration.
+
+```shell
+dokku logs:set --global vector-networks
+```
+
+Network attachments are reconciled by `docker compose` on every `logs:vector-start`, so after changing the value the Vector container must be cycled.
+
+```shell
+dokku logs:vector-stop
+dokku logs:vector-start
+```
+
+Once attached, an app on `dokku-logs` (for example via `dokku network:set node-js-app initial-network dokku-logs`) is reachable from Vector at `<app>.<process>:<port>` over the shared network without round-tripping through the external proxy.
+
 #### Configuring a log sink
 
 Vector uses the concept of log "sinks" to send logs to a given endpoint. Log sinks may be configured globally or on a per-app basis by specifying a `vector-sink` in DSN form with the `logs:set` command. Specifying a sink value will reload any running vector container.
@@ -180,6 +256,8 @@ As with app-specific sink settings, the global value may also be cleared by sett
 dokku logs:set --global vector-sink
 ```
 
+The generated vector configuration is also rewritten whenever an app is renamed, cloned or destroyed. A renamed app keeps shipping to its sink under the new name, a cloned app gets a source of its own for the sink it inherited, and a destroyed app's source and sink are removed rather than left pointing at an endpoint that was decommissioned with the app.
+
 ##### Log Sink DSN Format
 
 The DSN form of a sink is as follows:
@@ -206,4 +284,124 @@ For some sinks - such as the `http` sink - it may be useful to use special chara
 dokku logs:set test vector-sink "http://?uri=https%3A//loggerservice.com%3A1234/%3Ftoken%3Dabc1234%26type%3Dvector"
 ```
 
-Please read the [sink documentation](https://vector.dev/docs/reference/sinks/) for your sink of choice to configure the sink as desired.
+For kubernetes, it may be necessary to use template syntax - `{{ .parent.child }}` - in the sink configuration. Naively using brackets will fail due to the Helm chart install process assuming that the template should be interpreted at Helm install time vs by Vector itself. To avoid this, use `base64enc:` values (available only for top-level properties at this time). The following example shows how to use `{{ pod }}` as a value.
+
+```shell
+# encode the value with a Helm `print` statement wrapper
+encoded="$(echo '{{ print "{{ pod }}" }}' | base64)"
+# the value of encoded should be: e3sgcHJpbnQgInt7IHBvZCB9fSIgfX0K
+
+# set the value 
+dokku logs:set test vector-sink "http://?process=base64enc%3A${encoded}"
+```
+
+This will transform the value to it's encoded form when configuring Vector sinks for Kubernetes.
+
+Please read the [sink documentation](https://vector.dev/docs/reference/configuration/sinks/) for your sink of choice to configure the sink as desired.
+
+#### Configuring a cron task log sink
+
+Scheduled cron tasks run in one-off containers that carry the app's usual labels, so their output is already collected by the `vector-sink` configured for the app or globally. To send that output somewhere separate, set a `vector-cron-sink`.
+
+```shell
+dokku logs:set node-js-app vector-cron-sink "console://?encoding[codec]=text"
+```
+
+As with `vector-sink`, the value may be cleared by setting an empty value, and may also be set globally:
+
+```shell
+dokku logs:set --global vector-cron-sink "console://?encoding[codec]=text"
+```
+
+Setting a cron sink **moves** cron task output rather than copying it. Vector routes each log line to exactly one of the two sinks:
+
+| Configuration | Where cron output goes | Where all other output goes |
+| --- | --- | --- |
+| `vector-sink` only | `vector-sink` | `vector-sink` |
+| `vector-cron-sink` only | `vector-cron-sink` | nowhere |
+| both | `vector-cron-sink` | `vector-sink` |
+
+If an app is already shipping to a metered service via `vector-sink`, adding a cron sink will stop cron output from arriving there.
+
+Events on the cron branch have two extra fields added to them, so that they can be used in sink options that support templating:
+
+- `dokku_app`: the name of the app the task belongs to
+- `dokku_cron_id`: the cron task ID, as shown by `dokku cron:list`
+
+> [!WARNING]
+> Cron task containers are removed as soon as the task exits. Vector attaches to a container after it starts, so output from tasks that finish almost immediately - a bare `echo`, for instance - may be missed. Log shipping should not be relied on as the sole record that a task ran; use an external check for that.
+
+##### Writing cron output to a file on disk
+
+The `file` sink writes to a path within the vector container. The `/var/log/dokku/apps` directory is mounted into that container from the host at the same path, so it is the correct destination for output that should survive on the host.
+
+```shell
+dokku logs:set node-js-app vector-cron-sink "file://?path=/var/log/dokku/apps/node-js-app/cron.log&encoding[codec]=text"
+```
+
+Because `path` supports templating, `dokku_cron_id` can be used to give each task its own file:
+
+```shell
+dokku logs:set node-js-app vector-cron-sink "file://?path=/var/log/dokku/apps/node-js-app/cron-{{ dokku_cron_id }}.log&encoding[codec]=text"
+```
+
+Quoting the value is required, both for the `&` separators and for the spaces inside the template.
+
+> [!WARNING]
+> Vector drops any event whose templated `path` references a field it cannot resolve. Only `dokku_app` and `dokku_cron_id` are guaranteed to exist on cron events - referencing anything else risks silently discarding log lines.
+
+Vector creates missing parent directories, and buffers writes before flushing. Set `idle_timeout_secs` to shorten that delay for infrequent tasks:
+
+```shell
+dokku logs:set node-js-app vector-cron-sink "file://?path=/var/log/dokku/apps/node-js-app/cron.log&encoding[codec]=text&idle_timeout_secs=5"
+```
+
+##### Configuring the app label
+
+Dokku labels every app container with `com.dokku.app-name`, and events shipped by vector carry that label as the field `label."com.dokku.app-name"`. Some sinks cannot use a field named that way - Loki label names, for instance, may only contain letters, digits and underscores - so the field can be renamed on the way to the sink via the `app-label-alias` logs property. Specifying a new alias will reload any running vector container.
+
+```shell
+dokku logs:set node-js-app app-label-alias "app_name"
+```
+
+Events for `node-js-app` then carry `label.app_name` and no longer carry `label."com.dokku.app-name"`.
+
+An alias may be removed by setting an empty value, which will also reload the running vector container.
+
+```shell
+dokku logs:set node-js-app app-label-alias
+```
+
+Only one alias may be specified on a per-app basis at a given time. Valid values start with a letter or number and may otherwise contain letters, numbers, underscores, periods and hyphens.
+
+App label aliases can also be specified globally by specifying the `--global` flag to `logs:set` with no app name specified:
+
+```shell
+dokku logs:set --global app-label-alias "app_name"
+```
+
+As with app-specific label alias settings, the global value may also be cleared by setting no value.
+
+```shell
+dokku logs:set --global app-label-alias
+```
+
+An app-specific value takes precedence over the global one, and is applied to that app's events whether they are shipped by the app's own `vector-sink` or by the global one.
+
+The alias only changes the shipped event. Containers are always discovered by the `com.dokku.app-name` label, so changing this property never affects which logs are collected, and a change takes effect on the next vector reload without redeploying the app. Cron events are unaffected in another respect too: `dokku_app` is read from the container label before the rename, so it holds the app name regardless of the configured alias.
+
+## Properties
+
+### Settable properties
+
+> [!NOTE]
+> The `Report flags` column lists the CLI argument names accepted by `logs:report`. The JSON keys emitted by `logs:report --format json` are the same names with the leading `--logs-` stripped (e.g. `max-size`, `global-max-size`, `computed-max-size`). Legacy keys with the `logs-` prefix are also emitted during the 0.38.x deprecation window and will be removed in a future major release.
+
+| Property | Scope | Default | Report flags | Description |
+| --- | --- | --- | --- | --- |
+| `app-label-alias` | app + global | `com.dokku.app-name` | `--logs-app-label-alias`, `--logs-global-app-label-alias`, `--logs-computed-app-label-alias` | Field name the app name is shipped under, renamed from `com.dokku.app-name` on the event |
+| `max-size` | app + global | `10m` | `--logs-max-size`, `--logs-global-max-size`, `--logs-computed-max-size` | Maximum size of an individual log file before rotation |
+| `vector-image` | global only | _parsed from `plugins/logs/Dockerfile`_ | `--logs-global-vector-image`, `--logs-computed-vector-image` | Docker image used to run the vector log-shipper container |
+| `vector-networks` | global only | none | `--logs-global-vector-networks`, `--logs-computed-vector-networks` | Comma-separated list of docker networks the vector container is attached to |
+| `vector-cron-sink` | app + global | none | `--logs-vector-cron-sink`, `--logs-global-vector-cron-sink`, `--logs-computed-vector-cron-sink` | DSN-style sink configuration for scheduled cron task output; when set, cron output is routed here instead of to `vector-sink` |
+| `vector-sink` | app + global | none | `--logs-vector-sink`, `--logs-global-vector-sink`, `--logs-computed-vector-sink` | DSN-style sink configuration for vector (e.g. `console://` or `loki://...`) |

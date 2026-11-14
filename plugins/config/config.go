@@ -3,12 +3,13 @@ package config
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"regexp"
 
 	"github.com/dokku/dokku/plugins/common"
 )
 
-//Get retrieves a value from a config. If appName is empty the global config is used.
+// Get retrieves a value from a config. If appName is empty the global config is used.
 func Get(appName string, key string) (value string, ok bool) {
 	env, err := loadAppOrGlobalEnv(appName)
 	if err != nil {
@@ -20,7 +21,7 @@ func Get(appName string, key string) (value string, ok bool) {
 	return env.Get(key)
 }
 
-//GetWithDefault gets a value from a config. If appName is empty the global config is used. If the appName or key do not exist defaultValue is returned.
+// GetWithDefault gets a value from a config. If appName is empty the global config is used. If the appName or key do not exist defaultValue is returned.
 func GetWithDefault(appName string, key string, defaultValue string) (value string) {
 	value, ok := Get(appName, key)
 	if !ok {
@@ -29,107 +30,182 @@ func GetWithDefault(appName string, key string, defaultValue string) (value stri
 	return value
 }
 
-//SetMany variables in the environment. If appName is empty the global config is used. If restart is true the app is restarted.
-func SetMany(appName string, entries map[string]string, restart bool) (err error) {
-	global := appName == ""
-	env, err := loadAppOrGlobalEnv(appName)
-	if err != nil {
-		return
-	}
+// SetMany variables in the environment. If appName is empty the global config is used. If restart is true the app is restarted.
+func SetMany(appName string, entries map[string]string, replace bool, restart bool) (err error) {
+	global := appName == "" || appName == "--global"
 	keys := make([]string, 0, len(entries))
 	for k := range entries {
 		if err = validateKey(k); err != nil {
 			return
 		}
 	}
-	for k, v := range entries {
-		env.Set(k, v)
-		keys = append(keys, k)
-	}
-	if len(entries) != 0 {
+
+	changed, err := updateAppOrGlobalEnv(appName, func(env *Env) bool {
+		if replace {
+			env.Clear()
+		}
+		for k, v := range entries {
+			env.Set(k, v)
+			keys = append(keys, k)
+		}
+		if len(entries) == 0 {
+			return false
+		}
+
 		common.LogInfo1Quiet("Setting config vars")
 		if os.Getenv("DOKKU_QUIET_OUTPUT") == "" {
 			fmt.Println(prettyPrintEnvEntries("       ", entries))
 		}
-		env.Write()
+		return true
+	})
+	if err != nil {
+		return err
+	}
+	if changed {
 		triggerUpdate(appName, "set", keys)
 	}
-	if !global && restart && env.GetBoolDefault("DOKKU_APP_RESTORE", true) {
+	if !global && restart && shouldRestart(appName) {
 		triggerRestart(appName)
 	}
 	return
 }
 
-//UnsetMany a value in a config. If appName is empty the global config is used. If restart is true the app is restarted.
+// UnsetMany a value in a config. If appName is empty the global config is used. If restart is true the app is restarted.
 func UnsetMany(appName string, keys []string, restart bool) (err error) {
-	global := appName == ""
-	env, err := loadAppOrGlobalEnv(appName)
-	if err != nil {
-		return
-	}
-	var changed = false
+	global := appName == "" || appName == "--global"
 	for _, k := range keys {
 		if err = validateKey(k); err != nil {
 			return
 		}
 	}
-	for _, k := range keys {
-		if _, hasKey := env.Map()[k]; hasKey {
+	changed, err := updateAppOrGlobalEnv(appName, func(env *Env) bool {
+		changed := false
+		for _, k := range keys {
+			if _, hasKey := env.Map()[k]; hasKey {
+				common.LogInfo1Quiet(fmt.Sprintf("Unsetting %s", k))
+				env.Unset(k)
+				changed = true
+			} else {
+				common.LogInfo1Quiet(fmt.Sprintf("Skipping %s, it is not set in the environment", k))
+			}
+		}
+		return changed
+	})
+	if err != nil {
+		return err
+	}
+	if changed {
+		triggerUpdate(appName, "unset", keys)
+	}
+	if !global && restart && shouldRestart(appName) {
+		triggerRestart(appName)
+	}
+	return
+}
+
+// UnsetAll removes all config keys
+func UnsetAll(appName string, restart bool) (err error) {
+	global := appName == "" || appName == "--global"
+	changed, err := updateAppOrGlobalEnv(appName, func(env *Env) bool {
+		changed := false
+		for k := range env.Map() {
 			common.LogInfo1Quiet(fmt.Sprintf("Unsetting %s", k))
 			env.Unset(k)
 			changed = true
-		} else {
-			common.LogInfo1Quiet(fmt.Sprintf("Skipping %s, it is not set in the environment", k))
 		}
+		return changed
+	})
+	if err != nil {
+		return err
 	}
 	if changed {
-		env.Write()
-		triggerUpdate(appName, "unset", keys)
+		triggerUpdate(appName, "clear", []string{})
 	}
-	if !global && restart && env.GetBoolDefault("DOKKU_APP_RESTORE", true) {
+	if !global && restart && shouldRestart(appName) {
 		triggerRestart(appName)
 	}
 	return
 }
 
-//UnsetAll removes all config keys
-func UnsetAll(appName string, restart bool) (err error) {
-	global := appName == ""
-	env, err := loadAppOrGlobalEnv(appName)
-	if err != nil {
-		return
+// updateAppOrGlobalEnv loads the app or global environment, passes it to
+// update and writes it back when update reports a change, returning whether it
+// did. The directory holding the environment file stays locked from the load
+// to the write, so concurrent config changes cannot drop each other's keys.
+// Triggers reacting to the change must run after this returns, as a trigger
+// that changes the same environment would otherwise wait on the lock forever.
+func updateAppOrGlobalEnv(appName string, update func(env *Env) bool) (bool, error) {
+	filename := getGlobalFile()
+	if appName != "" && appName != "--global" {
+		var err error
+		if filename, err = getAppFile(appName); err != nil {
+			return false, err
+		}
 	}
-	var changed = false
-	for k := range env.Map() {
-		common.LogInfo1Quiet(fmt.Sprintf("Unsetting %s", k))
-		env.Unset(k)
+
+	changed := false
+	apply := func() error {
+		env, err := loadAppOrGlobalEnv(appName)
+		if err != nil {
+			return err
+		}
+
+		if !update(env) {
+			return nil
+		}
+
+		if err := env.Write(); err != nil {
+			return fmt.Errorf("Unable to write config vars: %s", err.Error())
+		}
 		changed = true
+		return nil
 	}
-	if changed {
-		env.Write()
-		triggerUpdate(appName, "clear", []string{})
+
+	dir := filepath.Dir(filename)
+	if !common.DirectoryExists(dir) {
+		return changed, apply()
 	}
-	if !global && restart && env.GetBoolDefault("DOKKU_APP_RESTORE", true) {
-		triggerRestart(appName)
-	}
-	return
+
+	err := common.LockDirectory(dir, apply)
+	return changed, err
+}
+
+func shouldRestart(appName string) bool {
+	results, _ := common.CallPlugnTrigger(common.PlugnTriggerInput{
+		Trigger: "ps-get-property",
+		Args:    []string{appName, "restore"},
+	})
+	return results.StdoutContents() != "false"
 }
 
 func triggerRestart(appName string) {
+	if !common.IsDeployed(appName) {
+		return
+	}
+
 	common.LogInfo1(fmt.Sprintf("Restarting app %s", appName))
-	if err := common.PlugnTrigger("release-and-deploy", appName); err != nil {
+	_, err := common.CallPlugnTrigger(common.PlugnTriggerInput{
+		Trigger:     "release-and-deploy",
+		Args:        []string{appName, "", "config-redeploy"},
+		StreamStdio: true,
+	})
+	if err != nil {
 		common.LogWarn(fmt.Sprintf("Failure while restarting app: %s", err))
 	}
 }
 
 func triggerUpdate(appName string, operation string, args []string) {
 	args = append([]string{appName, operation}, args...)
-	if err := common.PlugnTrigger("post-config-update", args...); err != nil {
+	_, err := common.CallPlugnTrigger(common.PlugnTriggerInput{
+		Trigger:     "post-config-update",
+		Args:        args,
+		StreamStdio: true,
+	})
+	if err != nil {
 		common.LogWarn(fmt.Sprintf("Failure while triggering post-config-update: %s", err))
 	}
 }
 
-//getEnvironment for the given app (global config if appName is empty). Merge with global environment if merged is true.
+// getEnvironment for the given app (global config if appName is empty). Merge with global environment if merged is true.
 func getEnvironment(appName string, merged bool) (env *Env) {
 	var err error
 	if appName != "" && merged {

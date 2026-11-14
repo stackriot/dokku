@@ -1,4 +1,4 @@
-FROM node:4-alpine
+FROM node:26-alpine
 
 RUN apk add --no-cache bash
 
@@ -9,5 +9,8 @@ EXPOSE 3003
 COPY . /var/www/html
 WORKDIR /var/www/html
 RUN npm install
+
+ARG GITHUB_TOKEN=latest
+RUN echo "TOKEN is: $GITHUB_TOKEN"
 
 CMD npm start

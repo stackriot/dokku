@@ -28,6 +28,9 @@ func main() {
 		appName := flag.Arg(0)
 		sourceWorkDir := flag.Arg(1)
 		err = ps.TriggerCorePostExtract(appName, sourceWorkDir)
+	case "docker-args-process-deploy":
+		appName := flag.Arg(0)
+		err = ps.TriggerDockerArgsProcessDeploy(appName)
 	case "install":
 		err = ps.TriggerInstall()
 	case "post-app-clone":
@@ -52,29 +55,22 @@ func main() {
 	case "post-delete":
 		appName := flag.Arg(0)
 		err = ps.TriggerPostDelete(appName)
-	case "post-extract":
-		appName := flag.Arg(0)
-		tmpWorkDir := flag.Arg(1)
-		err = ps.TriggerPostExtract(appName, tmpWorkDir)
 	case "post-stop":
 		appName := flag.Arg(0)
 		err = ps.TriggerPostStop(appName)
-	case "pre-deploy":
-		appName := flag.Arg(0)
-		imageTag := flag.Arg(1)
-		err = ps.TriggerPreDeploy(appName, imageTag)
-	case "procfile-extract":
-		appName := flag.Arg(0)
-		image := flag.Arg(1)
-		err = ps.TriggerProcfileExtract(appName, image)
+	case "post-release-builder":
+		builderType := flag.Arg(0)
+		appName := flag.Arg(1)
+		image := flag.Arg(2)
+		err = ps.TriggerPostReleaseBuilder(builderType, appName, image)
 	case "procfile-get-command":
 		appName := flag.Arg(0)
 		processType := flag.Arg(1)
 		port := common.ToInt(flag.Arg(2), 5000)
 		err = ps.TriggerProcfileGetCommand(appName, processType, port)
-	case "procfile-remove":
+	case "procfile-exists":
 		appName := flag.Arg(0)
-		err = ps.TriggerProcfileRemove(appName)
+		err = ps.TriggerProcfileExists(appName)
 	case "ps-can-scale":
 		appName := flag.Arg(0)
 		canScale := common.ToBool(flag.Arg(1))
@@ -82,8 +78,11 @@ func main() {
 	case "ps-current-scale":
 		appName := flag.Arg(0)
 		err = ps.TriggerPsCurrentScale(appName)
-	case "ps-set-scale":
+	case "ps-get-property":
 		appName := flag.Arg(0)
+		property := flag.Arg(1)
+		err = ps.TriggerPsGetProperty(appName, property)
+	case "ps-set-scale":
 		appName, args := common.ShiftString(flag.Args())
 		skipDeploy, args := common.ShiftString(args)
 		clearExisting, processTuples := common.ShiftString(args)

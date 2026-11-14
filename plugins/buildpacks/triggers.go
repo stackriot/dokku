@@ -2,41 +2,52 @@ package buildpacks
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 
 	"github.com/dokku/dokku/plugins/common"
 )
-
-// TriggerBuildpackStackName echos the stack name for the app
-func TriggerBuildpackStackName(appName string) error {
-	if stack := common.PropertyGetDefault("buildpacks", appName, "stack", ""); stack != "" {
-		fmt.Println(stack)
-		return nil
-	}
-
-	if stack := common.PropertyGetDefault("buildpacks", "--global", "stack", ""); stack != "" {
-		fmt.Println(stack)
-		return nil
-	}
-
-	b, _ := common.PlugnTriggerOutput("config-get", []string{appName, "DOKKU_IMAGE"}...)
-	dokkuImage := strings.TrimSpace(string(b[:]))
-	if dokkuImage != "" {
-		common.LogWarn("Deprecated: use buildpacks:set-property instead of specifying DOKKU_IMAGE environment variable")
-		fmt.Println(dokkuImage)
-		return nil
-	}
-
-	return nil
-}
 
 // TriggerInstall runs the install step for the buildpacks plugin
 func TriggerInstall() error {
 	if err := common.PropertySetup("buildpacks"); err != nil {
 		return fmt.Errorf("Unable to install the buildpacks plugin: %s", err.Error())
+	}
+
+	return migrateStackProperty()
+}
+
+// migrateStackProperty moves any legacy buildpacks stack values to the
+// appropriate builder plugin, detecting herokuish vs pack stacks. It is
+// idempotent: once a value is migrated the buildpacks stack key is removed.
+func migrateStackProperty() error {
+	appNames := []string{"--global"}
+	apps, err := common.DokkuApps()
+	if err != nil && !errors.Is(err, common.NoAppsExist) {
+		return err
+	}
+	appNames = append(appNames, apps...)
+
+	for _, appName := range appNames {
+		if !common.PropertyExists("buildpacks", appName, "stack") {
+			continue
+		}
+
+		value := common.PropertyGet("buildpacks", appName, "stack")
+		if value != "" {
+			builder := builderForStack(value)
+			if !common.PropertyExists(builder, appName, "stack") {
+				if err := common.PropertyWrite(builder, appName, "stack", value); err != nil {
+					return err
+				}
+			}
+		}
+
+		if err := common.PropertyDelete("buildpacks", appName, "stack"); err != nil {
+			return err
+		}
 	}
 
 	return nil
@@ -72,7 +83,7 @@ func TriggerPostDelete(appName string) error {
 
 // TriggerPostExtract writes a .buildpacks file into the app
 func TriggerPostExtract(appName string, sourceWorkDir string) error {
-	buildpacks, err := common.PropertyListGet("buildpacks", appName, "buildpacks")
+	buildpacks, err := getBuildpacks(appName)
 	if err != nil {
 		return nil
 	}
@@ -89,13 +100,20 @@ func TriggerPostExtract(appName string, sourceWorkDir string) error {
 
 	w := bufio.NewWriter(file)
 	for _, buildpack := range buildpacks {
+		buildpack, err = validBuildpackURL(buildpack)
+		if err != nil {
+			return err
+		}
+
 		fmt.Fprintln(w, buildpack)
 	}
 
 	if err = w.Flush(); err != nil {
 		return fmt.Errorf("Error writing .buildpacks file: %s", err.Error())
 	}
-	file.Chmod(0600)
+	if err = file.Chmod(0600); err != nil {
+		return fmt.Errorf("Error setting .buildpacks file permissions: %s", err.Error())
+	}
 
 	return nil
 }

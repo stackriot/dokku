@@ -6,4 +6,7 @@
 /subcommands/*
 /triggers
 /triggers/*
+/app-json-get-content
+/app-json-is-valid
 /app-json-process-deploy-parallelism
+/core-*

@@ -1,20 +1,40 @@
 package network
 
 import (
-	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/dokku/dokku/plugins/common"
-
-	sh "github.com/codeskyblue/go-sh"
 )
+
+// dokkuNetworkNameLabel is the docker label network:create applies to every
+// network it creates. Its presence is the marker used to identify a network as
+// dokku-managed.
+const dokkuNetworkNameLabel = "com.dokku.network-name"
+
+type DockerNetwork struct {
+	CreatedAt    time.Time
+	DokkuManaged bool
+	Driver       string
+	ID           string
+	Internal     bool
+	IPv6         bool
+	Labels       map[string]string
+	Name         string
+	Scope        string
+}
 
 // attachAppToNetwork attaches a container to a network
 func attachAppToNetwork(containerID string, networkName string, appName string, phase string, processType string) error {
+	if isContainerInNetwork(containerID, networkName) {
+		return nil
+	}
+
 	cmdParts := []string{
-		common.DockerBin(),
 		"network",
 		"connect",
 	}
@@ -41,17 +61,49 @@ func attachAppToNetwork(containerID string, networkName string, appName string, 
 
 	cmdParts = append(cmdParts, networkName)
 	cmdParts = append(cmdParts, containerID)
-	attachCmd := common.NewShellCmd(strings.Join(cmdParts, " "))
-	var stderr bytes.Buffer
-	attachCmd.ShowOutput = false
-	attachCmd.Command.Stderr = &stderr
-	_, err := attachCmd.Output()
+
+	result, err := common.CallExecCommand(common.ExecCommandInput{
+		Command: common.DockerBin(),
+		Args:    cmdParts,
+	})
 	if err != nil {
-		err = errors.New(strings.TrimSpace(stderr.String()))
-		return fmt.Errorf("Unable to attach container to network: %v", err.Error())
+		return fmt.Errorf("Unable to attach container to network: %w", err)
+	}
+	if result.ExitCode != 0 {
+		return fmt.Errorf("Unable to attach container to network: %s", result.StderrContents())
 	}
 
 	return nil
+}
+
+// isContainerInNetwork returns true if the container is already attached to the specified network
+func isContainerInNetwork(containerID string, networkName string) bool {
+	result, err := common.CallExecCommand(common.ExecCommandInput{
+		Command: common.DockerBin(),
+		Args:    []string{"container", "inspect", "--format", "{{range $net, $v := .NetworkSettings.Networks}}{{println $net}}{{end}}", containerID},
+	})
+
+	if err != nil {
+		common.LogVerboseQuiet(fmt.Sprintf("Error checking container networking status: %v", err.Error()))
+		return false
+	}
+	if result.ExitCode != 0 {
+		common.LogVerboseQuiet(fmt.Sprintf("Error checking container networking status: %v", result.StderrContents()))
+		return false
+	}
+
+	for _, line := range strings.Split(result.StdoutContents(), "\n") {
+		network := strings.TrimSpace(line)
+		if network == "" {
+			continue
+		}
+
+		if network == networkName {
+			return true
+		}
+	}
+
+	return false
 }
 
 // isConflictingPropertyValue returns true if the other attach property has a conflicting value
@@ -78,13 +130,13 @@ func networkExists(networkName string) (bool, error) {
 
 	exists := false
 
-	networks, err := listNetworks()
+	networks, err := getNetworks()
 	if err != nil {
 		return false, err
 	}
 
-	for _, n := range networks {
-		if networkName == n {
+	for _, network := range networks {
+		if networkName == network.Name {
 			exists = true
 			break
 		}
@@ -93,17 +145,79 @@ func networkExists(networkName string) (bool, error) {
 	return exists, nil
 }
 
-// listNetworks returns a list of docker networks
-func listNetworks() ([]string, error) {
-	b, err := sh.Command(common.DockerBin(), "network", "list", "--format", "{{ .Name }}").Output()
-	output := strings.TrimSpace(string(b[:]))
-
-	networks := []string{}
+// getNetworks returns a list of docker networks
+func getNetworks() (map[string]DockerNetwork, error) {
+	result, err := common.CallExecCommand(common.ExecCommandInput{
+		Command: common.DockerBin(),
+		Args:    []string{"network", "ls", "--format", "json"},
+	})
 	if err != nil {
-		common.LogVerboseQuiet(output)
-		return networks, err
+		common.LogVerboseQuiet(result.StderrContents())
+		return map[string]DockerNetwork{}, err
+	}
+	if result.ExitCode != 0 {
+		common.LogVerboseQuiet(result.StderrContents())
+		return map[string]DockerNetwork{}, fmt.Errorf("Unable to list networks")
 	}
 
-	networks = strings.Split(output, "\n")
+	networkLines := strings.Split(result.StdoutContents(), "\n")
+	networks := map[string]DockerNetwork{}
+	for _, line := range networkLines {
+		if line == "" {
+			continue
+		}
+		result := make(map[string]interface{})
+		err := json.Unmarshal([]byte(line), &result)
+		if err != nil {
+			return map[string]DockerNetwork{}, err
+		}
+
+		network := DockerNetwork{
+			Driver: result["Driver"].(string),
+			ID:     result["ID"].(string),
+			Name:   result["Name"].(string),
+			Scope:  result["Scope"].(string),
+			Labels: map[string]string{},
+		}
+
+		if createdAtVal := result["CreatedAt"].(string); createdAtVal != "" {
+			createdAt, err := time.Parse("2006-01-02 15:04:05.999999999 -0700 MST", "2024-02-25 01:55:24.275184461 +0000 UTC")
+			if err == nil {
+				network.CreatedAt = createdAt
+			}
+		}
+
+		if ipv6Val := result["IPv6"].(string); ipv6Val != "" {
+			val, err := strconv.ParseBool(ipv6Val)
+			if err == nil {
+				network.IPv6 = val
+			}
+		}
+		if internalVal := result["Internal"].(string); internalVal != "" {
+			val, err := strconv.ParseBool(internalVal)
+			if err == nil {
+				network.Internal = val
+			}
+		}
+
+		labels := strings.Split(result["Labels"].(string), ",")
+		for _, v := range labels {
+			parts := strings.SplitN(v, "=", 2)
+			if len(parts) != 2 {
+				continue
+			}
+
+			key := parts[0]
+			value := parts[1]
+			network.Labels[key] = value
+		}
+
+		if _, ok := network.Labels[dokkuNetworkNameLabel]; ok {
+			network.DokkuManaged = true
+		}
+
+		networks[network.Name] = network
+	}
+
 	return networks, nil
 }

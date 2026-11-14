@@ -6,14 +6,24 @@ import (
 
 // ReportSingleApp is an internal function that displays the builder report for one or more apps
 func ReportSingleApp(appName string, format string, infoFlag string) error {
-	if err := common.VerifyAppName(appName); err != nil {
-		return err
+	if appName != "--global" {
+		if err := common.VerifyAppName(appName); err != nil {
+			return err
+		}
 	}
 
-	flags := map[string]common.ReportFunc{
-		"--app-json-computed-selected": reportComputedAppjsonpath,
-		"--app-json-global-selected":   reportGlobalAppjsonpath,
-		"--app-json-selected":          reportAppjsonpath,
+	var flags map[string]common.ReportFunc
+	if appName == "--global" {
+		flags = map[string]common.ReportFunc{
+			"--app-json-computed-appjson-path": reportComputedAppjsonpath,
+			"--app-json-global-appjson-path":   reportGlobalAppjsonpath,
+		}
+	} else {
+		flags = map[string]common.ReportFunc{
+			"--app-json-computed-appjson-path": reportComputedAppjsonpath,
+			"--app-json-global-appjson-path":   reportGlobalAppjsonpath,
+			"--app-json-appjson-path":          reportAppjsonpath,
+		}
 	}
 
 	flagKeys := []string{}
@@ -21,10 +31,18 @@ func ReportSingleApp(appName string, format string, infoFlag string) error {
 		flagKeys = append(flagKeys, flagKey)
 	}
 
-	trimPrefix := false
-	uppercaseFirstCharacter := true
 	infoFlags := common.CollectReport(appName, infoFlag, flags)
-	return common.ReportSingleApp("app-json", appName, infoFlag, infoFlags, flagKeys, format, trimPrefix, uppercaseFirstCharacter)
+	return common.ReportSingleApp(common.ReportSingleAppInput{
+		ReportType:              "app-json",
+		AppName:                 appName,
+		InfoFlag:                infoFlag,
+		InfoFlags:               infoFlags,
+		InfoFlagKeys:            flagKeys,
+		Format:                  format,
+		TrimPrefix:              true,
+		UppercaseFirstCharacter: true,
+		EmitLegacyPrefix:        true,
+	})
 }
 
 func reportComputedAppjsonpath(appName string) string {
@@ -32,12 +50,15 @@ func reportComputedAppjsonpath(appName string) string {
 	if value == "" {
 		value = reportGlobalAppjsonpath(appName)
 	}
+	if value == "" {
+		value = "app.json"
+	}
 
 	return value
 }
 
 func reportGlobalAppjsonpath(appName string) string {
-	return common.PropertyGetDefault("app-json", "--global", "appjson-path", "app.json")
+	return common.PropertyGet("app-json", "--global", "appjson-path")
 }
 
 func reportAppjsonpath(appName string) string {

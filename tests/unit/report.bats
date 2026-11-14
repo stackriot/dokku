@@ -4,17 +4,18 @@ load test_helper
 
 setup() {
   global_setup
-  deploy_app
   rm -f /tmp/fake-docker-bin
 }
 
 teardown() {
   rm -f /tmp/fake-docker-bin
-  destroy_app
+  destroy_app || true
   global_teardown
 }
 
 @test "(report) report" {
+  deploy_app
+
   run /bin/bash -c "dokku report"
   echo "output: $output"
   echo "status: $status"
@@ -25,7 +26,7 @@ teardown() {
   echo "output: $output"
   echo "status: $status"
   assert_output_contains "herokuish version:"
-  assert_output_contains "Deployed:                      false" "0"
+  assert_output_contains "Deployed:                         false" "0"
   assert_success
 
   run /bin/bash -c "dokku report fake-app-name"
@@ -39,17 +40,26 @@ teardown() {
   assert_output_contains "App fake-app-name does not exist"
   assert_failure
 
-  dokku apps:create "${TEST_APP}-2"
+  run /bin/bash -c "dokku apps:create ${TEST_APP}-2"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
   run /bin/bash -c "dokku report ${TEST_APP}-2 2>&1"
   echo "output: $output"
   echo "status: $status"
-  assert_output_contains "Deployed:                      false"
+  assert_output_contains "Deployed:                         false"
   assert_success
 
-  dokku --force apps:destroy "${TEST_APP}-2"
+  run /bin/bash -c "dokku --force apps:destroy ${TEST_APP}-2"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
 }
 
 @test "(report) custom docker bin" {
+  deploy_app
+
   export DOCKER_BIN="docker"
   run /bin/bash -c "dokku report"
   echo "output: $output"
@@ -77,4 +87,113 @@ teardown() {
   assert_success
 
   unset DOCKER_BIN
+}
+
+@test "(report) exit 0 when no apps exist" {
+  run /bin/bash -c "dokku report"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  plugins=(
+    app-json
+    apps
+    builder
+    builder-dockerfile
+    builder-herokuish
+    builder-lambda
+    builder-nixpacks
+    builder-railpack
+    builder-pack
+    buildpacks
+    caddy
+    certs
+    checks
+    cron
+    docker-options
+    domains
+    git
+    haproxy
+    logs
+    network
+    nginx
+    openresty
+    ports
+    proxy
+    ps
+    registry
+    resource
+    scheduler
+    scheduler-docker-local
+    scheduler-k3s
+    storage
+    traefik
+  )
+
+  for plugin in "${plugins[@]}"; do
+    run /bin/bash -c "dokku $plugin:report 2>&1"
+    echo "output: $output"
+    echo "status: $status"
+    assert_success
+    assert_output_contains "You haven't deployed any applications yet"
+  done
+}
+
+@test "(report) storage report when apps exist" {
+  run create_app
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku report $TEST_APP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  plugins=(
+    app-json
+    apps
+    builder
+    builder-dockerfile
+    builder-herokuish
+    builder-lambda
+    builder-nixpacks
+    builder-railpack
+    builder-pack
+    buildpacks
+    caddy
+    certs
+    checks
+    cron
+    docker-options
+    domains
+    git
+    haproxy
+    logs
+    network
+    nginx
+    openresty
+    ports
+    proxy
+    ps
+    registry
+    resource
+    scheduler
+    scheduler-docker-local
+    scheduler-k3s
+    storage
+    traefik
+  )
+
+  for plugin in "${plugins[@]}"; do
+    run /bin/bash -c "dokku $plugin:report 2>&1"
+    echo "output: $output"
+    echo "status: $status"
+    assert_success
+
+    run /bin/bash -c "dokku $plugin:report $TEST_APP 2>&1"
+    echo "output: $output"
+    echo "status: $status"
+    assert_success
+  done
 }

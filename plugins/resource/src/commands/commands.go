@@ -19,11 +19,10 @@ Additional commands:`
 
 	helpContent = `
     resource:limit [--process-type <process-type>] [RESOURCE_OPTS...] <app>, Limit resources for a given app/process-type combination
-    resource:limit-clear [--process-type <process-type>] <app>, Limit resources for a given app/process-type combination
+    resource:limit-clear [--process-type <process-type>] <app>, Clear resource limits for a given app/process-type combination
     resource:report [<app>] [<flag>], Displays a resource report for one or more apps
     resource:reserve [--process-type <process-type>] [RESOURCE_OPTS...] <app>, Reserve resources for a given app/process-type combination
-    resource:reserve-clear [--process-type <process-type>] <app>, Reserve resources for a given app/process-type combination
-`
+    resource:reserve-clear [--process-type <process-type>] <app>, Clear resource reservations for a given app/process-type combination`
 )
 
 func main() {
@@ -35,11 +34,11 @@ func main() {
 	case "resource", "resource:help":
 		usage()
 	case "help":
-		command := common.NewShellCmd(fmt.Sprintf("ps -o command= %d", os.Getppid()))
-		command.ShowOutput = false
-		output, err := command.Output()
-
-		if err == nil && strings.Contains(string(output), "--all") {
+		result, err := common.CallExecCommand(common.ExecCommandInput{
+			Command: "ps",
+			Args:    []string{"-o", "command=", strconv.Itoa(os.Getppid())},
+		})
+		if err == nil && strings.Contains(result.StdoutContents(), "--all") {
 			fmt.Println(helpContent)
 		} else {
 			fmt.Print("\n    resource, Manage resource settings for an app\n")

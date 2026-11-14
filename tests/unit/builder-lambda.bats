@@ -1,0 +1,262 @@
+#!/usr/bin/env bats
+
+load test_helper
+
+setup() {
+  create_app
+}
+
+teardown() {
+  destroy_app
+}
+
+@test "(builder-lambda:report) info-flag works before deploy" {
+  run /bin/bash -c "dokku builder-lambda:report $TEST_APP --builder-lambda-lambdayml-path"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku builder-lambda:set $TEST_APP lambdayml-path lambda.alt.yml"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku builder-lambda:report $TEST_APP --builder-lambda-lambdayml-path"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "lambda.alt.yml"
+
+  run /bin/bash -c "dokku builder-lambda:report $TEST_APP --builder-lambda-invalid-flag"
+  echo "output: $output"
+  echo "status: $status"
+  assert_failure
+  assert_output_contains "Invalid flag passed"
+}
+
+@test "(builder-lambda:report) --global --builder-lambda-global-lambdayml-path" {
+  run /bin/bash -c "dokku builder-lambda:set --global lambdayml-path lambda.alt.yml"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku builder-lambda:report --global --builder-lambda-global-lambdayml-path"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "lambda.alt.yml"
+
+  run /bin/bash -c "dokku builder-lambda:set --global lambdayml-path"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+}
+
+@test "(builder-lambda:report) lambdayml-path raw vs computed vs global" {
+  run /bin/bash -c "dokku builder-lambda:set --global lambdayml-path"
+  assert_success
+
+  run /bin/bash -c "dokku builder-lambda:report $TEST_APP --builder-lambda-lambdayml-path"
+  assert_success
+  assert_output_not_exists
+
+  run /bin/bash -c "dokku builder-lambda:report $TEST_APP --builder-lambda-global-lambdayml-path"
+  assert_success
+  assert_output_not_exists
+
+  run /bin/bash -c "dokku builder-lambda:report $TEST_APP --builder-lambda-computed-lambdayml-path"
+  assert_success
+  assert_output "lambda.yml"
+
+  run /bin/bash -c "dokku builder-lambda:set --global lambdayml-path lambda.global.yml"
+  assert_success
+
+  run /bin/bash -c "dokku builder-lambda:report $TEST_APP --builder-lambda-global-lambdayml-path"
+  assert_success
+  assert_output "lambda.global.yml"
+
+  run /bin/bash -c "dokku builder-lambda:report $TEST_APP --builder-lambda-computed-lambdayml-path"
+  assert_success
+  assert_output "lambda.global.yml"
+
+  run /bin/bash -c "dokku builder-lambda:set $TEST_APP lambdayml-path lambda.app.yml"
+  assert_success
+
+  run /bin/bash -c "dokku builder-lambda:report $TEST_APP --builder-lambda-lambdayml-path"
+  assert_success
+  assert_output "lambda.app.yml"
+
+  run /bin/bash -c "dokku builder-lambda:report $TEST_APP --builder-lambda-global-lambdayml-path"
+  assert_success
+  assert_output "lambda.global.yml"
+
+  run /bin/bash -c "dokku builder-lambda:report $TEST_APP --builder-lambda-computed-lambdayml-path"
+  assert_success
+  assert_output "lambda.app.yml"
+
+  run /bin/bash -c "dokku builder-lambda:set $TEST_APP lambdayml-path"
+  assert_success
+
+  run /bin/bash -c "dokku builder-lambda:set --global lambdayml-path"
+  assert_success
+}
+
+@test "(builder-lambda:set)" {
+  run /bin/bash -c "dokku config:set $TEST_APP SECRET_KEY=fjdkslafjdk"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku builder:set $TEST_APP selected lambda"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run deploy_app lambda-python dokku@$DOKKU_DOMAIN:$TEST_APP inject_lambda_yml
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output_contains 'Building app with image mlupin/docker-lambda:python3.9-build'
+  assert_output_contains 'Installing dependencies via pip'
+
+  run /bin/bash -c "dokku logs $TEST_APP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_output_contains "Hello World" 0
+  assert_success
+
+  run /bin/bash -c "curl -d {} --silent --write-out '%{http_code}\n' $(dokku url $TEST_APP)/2015-03-31/functions/function.handler/invocations | grep 200"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku logs $TEST_APP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_output_contains "Hello World"
+  assert_success
+
+  run /bin/bash -c "dokku builder-lambda:set $TEST_APP lambdayml-path nonexistent.yml"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku ps:rebuild $TEST_APP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output_contains 'Building app with image mlupin/docker-lambda:python3.9-build'
+  assert_output_contains 'Installing dependencies via pip'
+
+  run /bin/bash -c "dokku logs $TEST_APP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_output_contains "Hello World" 0
+  assert_success
+
+  run /bin/bash -c "curl -d {} --silent --write-out '%{http_code}\n' $(dokku url $TEST_APP)/2015-03-31/functions/function.handler/invocations | grep 200"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku logs $TEST_APP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_output_contains "Hello World"
+  assert_success
+
+  run /bin/bash -c "dokku builder-lambda:set $TEST_APP lambdayml-path lambda2.yml"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku ps:rebuild $TEST_APP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output_contains 'Building app with image mlupin/docker-lambda:python3.9-build'
+  assert_output_contains 'Installing dependencies via pip'
+
+  run /bin/bash -c "dokku logs $TEST_APP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_output_contains "Hello World" 0
+  assert_success
+
+  run /bin/bash -c "curl -d {} --silent --write-out '%{http_code}\n' $(dokku url $TEST_APP)/2015-03-31/functions/function.handler/invocations | grep 200"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku logs $TEST_APP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_output_contains "Hello World"
+  assert_success
+
+  run /bin/bash -c "dokku builder-lambda:set $TEST_APP lambdayml-path"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  # cache will be used
+  run /bin/bash -c "dokku ps:rebuild $TEST_APP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output_contains 'Building app with image mlupin/docker-lambda:python3.9-build'
+  assert_output_contains 'Installing dependencies via pip' 0
+
+  run /bin/bash -c "dokku logs $TEST_APP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_output_contains "Hello World" 0
+  assert_success
+
+  run /bin/bash -c "curl -d {} --silent --write-out '%{http_code}\n' $(dokku url $TEST_APP)/2015-03-31/functions/function.handler/invocations | grep 200"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku logs $TEST_APP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_output_contains "Hello World"
+  assert_success
+}
+
+@test "(builder-lambda) core-post-extract renames the configured lambda.yml" {
+  echo "---" >"$BATS_TEST_TMPDIR/lambda2.yml"
+
+  run /bin/bash -c "dokku builder-lambda:set $TEST_APP lambdayml-path lambda2.yml"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run_plugin_script builder-lambda core-post-extract "$TEST_APP" "$BATS_TEST_TMPDIR" HEAD
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "test -f $BATS_TEST_TMPDIR/lambda.yml"
+  assert_success
+
+  run /bin/bash -c "test ! -e $BATS_TEST_TMPDIR/lambda2.yml"
+  assert_success
+}
+
+inject_lambda_yml() {
+  local APP="$1"
+  local APP_REPO_DIR="$2"
+  [[ -z "$APP" ]] && local APP="$TEST_APP"
+  echo "-----> Injecting lambda.yml"
+  echo "---" >>"$APP_REPO_DIR/lambda.yml"
+
+  echo "-----> Injecting lambda.yml"
+  echo "---" >>"$APP_REPO_DIR/lambda.yml"
+
+  echo "-----> Injecting lambda2.yml"
+  echo "---" >>"$APP_REPO_DIR/lambda2.yml"
+  echo "build_image: mlupin/docker-lambda:python3.9-build" >>"$APP_REPO_DIR/lambda2.yml"
+  echo "run_image: mlupin/docker-lambda:python3.9" >>"$APP_REPO_DIR/lambda2.yml"
+}

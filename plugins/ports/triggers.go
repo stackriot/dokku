@@ -1,0 +1,229 @@
+package ports
+
+import (
+	"encoding/json"
+	"fmt"
+	"sort"
+
+	"github.com/dokku/dokku/plugins/common"
+)
+
+// TriggerInstall migrates the ports config to properties
+func TriggerInstall() error {
+	if err := common.PropertySetup("ports"); err != nil {
+		return fmt.Errorf("Unable to install the ports plugin: %s", err.Error())
+	}
+
+	if err := common.MigrateConfigToProperties("ports", []common.MigrateConfigEntry{
+		{
+			ConfigVar:    "DOKKU_PROXY_PORT_MAP",
+			Property:     "map",
+			ListProperty: true,
+			Transform:    transformPortMap,
+		},
+	}); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// TriggerPortsClear removes all ports for the specified app
+func TriggerPortsClear(appName string) error {
+	return clearPorts(appName)
+}
+
+// TriggerPortsConfigure ensures we have a port mapping
+func TriggerPortsConfigure(appName string) error {
+	if err := initializeProxyPort(appName); err != nil {
+		return err
+	}
+
+	if err := initializeProxySSLPort(appName); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// TriggerPortsGet prints out the port mapping for a given app
+func TriggerPortsGet(appName string, format string) error {
+	if format == "" {
+		format = "stdout"
+	}
+	if format != "json" && format != "stdout" {
+		return fmt.Errorf("Invalid format specified: %s", format)
+	}
+
+	portMaps := getPortMaps(appName)
+	if len(portMaps) == 0 {
+		portMaps = getDetectedPortMaps(appName)
+	}
+
+	persisted := []PortMap{}
+	for _, portMap := range portMaps {
+		if portMap.AllowsPersistence() {
+			continue
+		}
+
+		persisted = append(persisted, portMap)
+	}
+
+	persisted = uniquePortMaps(persisted)
+
+	if format == "json" {
+		b, err := json.Marshal(persisted)
+		if err != nil {
+			return fmt.Errorf("Unable to marshal port mapping: %s", err.Error())
+		}
+
+		fmt.Println(string(b))
+		return nil
+	}
+
+	for _, portMap := range persisted {
+		fmt.Println(portMap)
+	}
+
+	return nil
+}
+
+// TriggerPortsGetAvailable prints out an available port greater than 1024
+func TriggerPortsGetAvailable() error {
+	port := getAvailablePort()
+	if port > 0 {
+		common.Log(fmt.Sprint(port))
+	}
+
+	return nil
+}
+
+// TriggerPortsGetProperty writes the ports key to stdout for a given app container
+func TriggerPortsGetProperty(appName string, key string) error {
+	if key == "proxy-port" {
+		fmt.Println(getComputedProxyPort(appName))
+		return nil
+	}
+
+	if key == "proxy-ssl-port" {
+		fmt.Println(getComputedProxySSLPort(appName))
+		return nil
+	}
+
+	fmt.Println(common.PropertyGet("ports", appName, key))
+	return nil
+}
+
+// TriggerPortsSetDetected writes out detected ports
+func TriggerPortsSetDetected(appName string, portMapString string) error {
+	portMaps, _ := parsePortMapString(portMapString)
+
+	var value []string
+	for _, portMap := range uniquePortMaps(portMaps) {
+		if portMap.AllowsPersistence() {
+			continue
+		}
+
+		value = append(value, portMap.String())
+	}
+
+	sort.Strings(value)
+	return common.PropertyListWrite("ports", appName, "map-detected", value)
+}
+
+// TriggerPostAppCloneSetup creates new ports files
+func TriggerPostAppCloneSetup(oldAppName string, newAppName string) error {
+	err := common.PropertyClone("ports", oldAppName, newAppName)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// TriggerPostAppRenameSetup renames ports files
+func TriggerPostAppRenameSetup(oldAppName string, newAppName string) error {
+	if err := common.PropertyClone("ports", oldAppName, newAppName); err != nil {
+		return err
+	}
+
+	if err := common.PropertyDestroy("ports", oldAppName); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// TriggerPostCertsRemove unsets port properties after SSL cert is removed
+func TriggerPostCertsRemove(appName string) error {
+	if err := common.PropertyDelete("proxy", appName, "proxy-ssl-port"); err != nil {
+		return err
+	}
+
+	return common.PropertyLock("ports", appName, func(p *common.LockedProperties) error {
+		return removePortMapsWithLock(p, appName, filterAppPortMaps(appName, "https", 443))
+	})
+}
+
+// TriggerPostCertsUpdate sets port properties after SSL cert is added
+func TriggerPostCertsUpdate(appName string) error {
+	return common.PropertyLock("ports", appName, func(p *common.LockedProperties) error {
+		return postCertsUpdateWithLock(p, appName)
+	})
+}
+
+// postCertsUpdateWithLock adds https:443 port maps mirroring the app's http:80
+// port maps. The caller must hold the app's ports property lock.
+func postCertsUpdateWithLock(p *common.LockedProperties, appName string) error {
+	port := common.PropertyGet("proxy", appName, "proxy-port")
+	sslPort := common.PropertyGet("proxy", appName, "proxy-ssl-port")
+	portMaps := getPortMaps(appName)
+
+	if port == "80" {
+		common.PropertyDelete("proxy", appName, "proxy-port")
+	}
+	if sslPort == "443" {
+		common.PropertyDelete("proxy", appName, "proxy-ssl-port")
+	}
+
+	for _, portMap := range portMaps {
+		if portMap.Scheme == "https" && portMap.HostPort == 443 {
+			return nil
+		}
+	}
+
+	var http80Ports []PortMap
+	for _, portMap := range portMaps {
+		if portMap.Scheme == "http" && portMap.HostPort == 80 {
+			http80Ports = append(http80Ports, portMap)
+		}
+	}
+
+	http80Ports = uniquePortMaps(http80Ports)
+
+	if len(http80Ports) > 0 {
+		var toAdd []PortMap
+		for _, portMap := range http80Ports {
+			toAdd = append(toAdd, PortMap{
+				Scheme:        "https",
+				HostPort:      443,
+				ContainerPort: portMap.ContainerPort,
+			})
+		}
+
+		if err := addPortMapsWithLock(p, appName, toAdd); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// TriggerPostDelete is the ports post-delete plugin trigger
+func TriggerPostDelete(appName string) error {
+	if err := common.PropertyDestroy("ports", appName); err != nil {
+		common.LogWarn(err.Error())
+	}
+
+	return nil
+}

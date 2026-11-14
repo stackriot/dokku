@@ -1,25 +1,56 @@
 package registry
 
 import (
+	"os"
+	"path/filepath"
+	"strings"
+
 	"github.com/dokku/dokku/plugins/common"
 )
 
 // ReportSingleApp is an internal function that displays the registry report for one or more apps
 func ReportSingleApp(appName string, format string, infoFlag string) error {
-	if err := common.VerifyAppName(appName); err != nil {
-		return err
+	if appName != "--global" {
+		if err := common.VerifyAppName(appName); err != nil {
+			return err
+		}
 	}
 
-	flags := map[string]common.ReportFunc{
-		"--registry-computed-image-repo":      reportComputedImageRepo,
-		"--registry-image-repo":               reportImageRepo,
-		"--registry-computed-push-on-release": reportComputedPushOnRelease,
-		"--registry-global-push-on-release":   reportGlobalPushOnRelease,
-		"--registry-push-on-release":          reportPushOnRelease,
-		"--registry-computed-server":          reportComputedServer,
-		"--registry-global-server":            reportGlobalServer,
-		"--registry-server":                   reportServer,
-		"--registry-tag-version":              reportTagVersion,
+	var flags map[string]common.ReportFunc
+	if appName == "--global" {
+		flags = map[string]common.ReportFunc{
+			"--registry-computed-auth-servers":        reportComputedAuthServers,
+			"--registry-global-auth-servers":          reportGlobalAuthServers,
+			"--registry-computed-push-on-release":     reportComputedPushOnRelease,
+			"--registry-global-push-on-release":       reportGlobalPushOnRelease,
+			"--registry-computed-server":              reportComputedServer,
+			"--registry-global-server":                reportGlobalServer,
+			"--registry-computed-image-repo-template": reportComputedImageRepoTemplate,
+			"--registry-global-image-repo-template":   reportGlobalImageRepoTemplate,
+			"--registry-computed-push-extra-tags":     reportComputedPushExtraTags,
+			"--registry-global-push-extra-tags":       reportGlobalPushExtraTags,
+		}
+	} else {
+		flags = map[string]common.ReportFunc{
+			"--registry-auth-servers":                 reportAuthServers,
+			"--registry-computed-auth-servers":        reportComputedAuthServers,
+			"--registry-global-auth-servers":          reportGlobalAuthServers,
+			"--registry-computed-image-repo":          reportComputedImageRepo,
+			"--registry-image-repo":                   reportImageRepo,
+			"--registry-computed-push-on-release":     reportComputedPushOnRelease,
+			"--registry-global-push-on-release":       reportGlobalPushOnRelease,
+			"--registry-push-on-release":              reportPushOnRelease,
+			"--registry-computed-server":              reportComputedServer,
+			"--registry-global-server":                reportGlobalServer,
+			"--registry-computed-image-repo-template": reportComputedImageRepoTemplate,
+			"--registry-global-image-repo-template":   reportGlobalImageRepoTemplate,
+			"--registry-image-repo-template":          reportImageRepoTemplate,
+			"--registry-server":                       reportServer,
+			"--registry-tag-version":                  reportTagVersion,
+			"--registry-push-extra-tags":              reportPushExtraTags,
+			"--registry-global-push-extra-tags":       reportGlobalPushExtraTags,
+			"--registry-computed-push-extra-tags":     reportComputedPushExtraTags,
+		}
 	}
 
 	flagKeys := []string{}
@@ -27,14 +58,26 @@ func ReportSingleApp(appName string, format string, infoFlag string) error {
 		flagKeys = append(flagKeys, flagKey)
 	}
 
-	trimPrefix := false
-	uppercaseFirstCharacter := true
 	infoFlags := common.CollectReport(appName, infoFlag, flags)
-	return common.ReportSingleApp("registry", appName, infoFlag, infoFlags, flagKeys, format, trimPrefix, uppercaseFirstCharacter)
+	return common.ReportSingleApp(common.ReportSingleAppInput{
+		ReportType:              "registry",
+		AppName:                 appName,
+		InfoFlag:                infoFlag,
+		InfoFlags:               infoFlags,
+		InfoFlagKeys:            flagKeys,
+		Format:                  format,
+		TrimPrefix:              true,
+		UppercaseFirstCharacter: true,
+		EmitLegacyPrefix:        true,
+	})
 }
 
 func reportComputedImageRepo(appName string) string {
-	imageRepo := reportImageRepo(appName)
+	imageRepo := strings.TrimSpace(reportImageRepo(appName))
+	if imageRepo == "" {
+		imageRepo, _ = getImageRepoFromTemplate(appName)
+	}
+
 	if imageRepo == "" {
 		imageRepo = common.GetAppImageRepo(appName)
 	}
@@ -48,6 +91,7 @@ func reportImageRepo(appName string) string {
 
 func reportComputedPushOnRelease(appName string) string {
 	value := reportPushOnRelease(appName)
+	value = strings.TrimSpace(value)
 	if value == "" {
 		value = reportGlobalPushOnRelease(appName)
 	}
@@ -68,7 +112,24 @@ func reportPushOnRelease(appName string) string {
 }
 
 func reportComputedServer(appName string) string {
-	return getRegistryServerForApp(appName)
+	server := getRegistryServerForApp(appName)
+	return strings.TrimSpace(server)
+}
+
+func reportImageRepoTemplate(appName string) string {
+	return common.PropertyGet("registry", appName, "image-repo-template")
+}
+
+func reportGlobalImageRepoTemplate(appName string) string {
+	return common.PropertyGet("registry", "--global", "image-repo-template")
+}
+
+func reportComputedImageRepoTemplate(appName string) string {
+	value := strings.TrimSpace(reportImageRepoTemplate(appName))
+	if value == "" {
+		value = reportGlobalImageRepoTemplate(appName)
+	}
+	return value
 }
 
 func reportGlobalServer(appName string) string {
@@ -80,5 +141,58 @@ func reportServer(appName string) string {
 }
 
 func reportTagVersion(appName string) string {
-	return common.PropertyGet("registry", appName, "tag-version")
+	tagVersion := common.PropertyGet("registry", appName, "tag-version")
+	return strings.TrimSpace(tagVersion)
+}
+
+func reportPushExtraTags(appName string) string {
+	return common.PropertyGet("registry", appName, "push-extra-tags")
+}
+
+func reportGlobalPushExtraTags(appName string) string {
+	return common.PropertyGet("registry", "--global", "push-extra-tags")
+}
+
+func reportComputedPushExtraTags(appName string) string {
+	value := strings.TrimSpace(reportPushExtraTags(appName))
+	if value == "" {
+		value = reportGlobalPushExtraTags(appName)
+	}
+	if value == "" {
+		value = DefaultProperties["push-extra-tags"]
+	}
+	return value
+}
+
+// reportAuthServers lists the servers the app has its own credentials for
+func reportAuthServers(appName string) string {
+	return authServersFromConfigPath(GetAppRegistryConfigPath(appName))
+}
+
+// reportGlobalAuthServers lists the servers the global config has credentials for
+func reportGlobalAuthServers(appName string) string {
+	return authServersFromConfigPath(GetGlobalRegistryConfigPath())
+}
+
+// reportComputedAuthServers lists the servers whose credentials dokku would use
+// for the app. Docker is pointed at one config directory or the other rather
+// than a merge of both, so an app with any credential of its own shadows the
+// global config entirely.
+func reportComputedAuthServers(appName string) string {
+	return authServersFromConfigPath(filepath.Join(GetComputedAppRegistryConfigDir(appName), "config.json"))
+}
+
+// authServersFromConfigPath lists the servers a docker config holds credentials for
+func authServersFromConfigPath(configPath string) string {
+	contents, err := os.ReadFile(configPath)
+	if err != nil {
+		return ""
+	}
+
+	config, err := parseDockerConfig(contents)
+	if err != nil {
+		return ""
+	}
+
+	return strings.Join(authServersFromConfig(config), ",")
 }

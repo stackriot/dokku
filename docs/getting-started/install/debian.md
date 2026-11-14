@@ -3,18 +3,15 @@
 As of 0.3.18, Dokku defaults to being installed via Debian package. While certain hosts may require extra work to get running, you may optionally wish to automate the installation of Dokku without the use of our `bootstrap.sh` Bash script. The following are the steps run by said script:
 
 ```shell
-# install prerequisites
-sudo apt-get update -qq >/dev/null
-sudo apt-get -qq -y --no-install-recommends install apt-transport-https
-
 # install docker
 wget -nv -O - https://get.docker.com/ | sh
 
 # install dokku
-wget -nv -O - https://packagecloud.io/dokku/dokku/gpgkey | apt-key add -
-OS_ID="$(lsb_release -cs 2>/dev/null || echo "bionic")"
-echo "bionic focal" | grep -q "$OS_ID" || OS_ID="bionic"
-echo "deb https://packagecloud.io/dokku/dokku/ubuntu/ ${OS_ID} main" | sudo tee /etc/apt/sources.list.d/dokku.list
+wget -qO- https://packagecloud.io/dokku/dokku/gpgkey | sudo tee /etc/apt/trusted.gpg.d/dokku.asc
+# programmatically determine distro and codename
+DISTRO="$(awk -F= '$1=="ID" { print tolower($2) ;}' /etc/os-release)"
+OS_ID="$(awk -F= '$1=="VERSION_CODENAME" { print tolower($2) ;}' /etc/os-release)"
+echo "deb https://packagecloud.io/dokku/dokku/${DISTRO}/ ${OS_ID} main" | sudo tee /etc/apt/sources.list.d/dokku.list
 sudo apt-get update -qq >/dev/null
 sudo apt-get -qq -y install dokku
 sudo dokku plugin:install-dependencies --core
@@ -40,4 +37,14 @@ After setting the desired options, proceed with the installation as described ab
 | dokku/hostname     | string  | dokku.me              | Hostname, used as vhost domain and for showing app URL after deploy      |
 | dokku/skip_key_file| boolean | false                 | Don't check for the existence of the dokku/key_file. Warning: Setting this to true, will require you to manually add an SSH key later on. |
 | dokku/key_file     | string  | /root/.ssh/id_rsa.pub | Path on disk to an SSH key to add to the Dokku user (Will be ignored on `dpkg-reconfigure`) |
-| dokku/nginx_enable | boolean | true                  | Enable nginx-vhosts plugin |
+| dokku/nginx_enable | boolean | true                  | Enable nginx-vhosts plugin. When `false`, the plugin is installed but left disabled, and the `nginx:*` commands are unavailable. |
+| dokku/install_default_site | boolean | true          | Install a catch-all nginx default site on fresh install |
+
+### Enabling the nginx-vhosts plugin after installation
+
+If Dokku was installed with `dokku/nginx_enable` set to `false`, the nginx-vhosts plugin can be enabled later. The `plugin:install --core` call runs the plugin's install trigger, which sets up the nginx configuration required by Dokku.
+
+```shell
+sudo dokku plugin:enable nginx-vhosts
+sudo dokku plugin:install --core
+```

@@ -1,1 +1,6 @@
 /pagesize
+/nginx-property
+/report
+/report-subcommand
+/triggers
+/subcommands/report

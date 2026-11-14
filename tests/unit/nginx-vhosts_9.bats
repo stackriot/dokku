@@ -9,13 +9,16 @@ setup() {
 }
 
 teardown() {
-  destroy_app 0 $TEST_APP
+  destroy_app
   [[ -f "$DOKKU_ROOT/VHOST.bak" ]] && mv "$DOKKU_ROOT/VHOST.bak" "$DOKKU_ROOT/VHOST" && chown dokku:dokku "$DOKKU_ROOT/VHOST"
   global_teardown
 }
 
 @test "(nginx-vhosts) logging" {
-  deploy_app
+  run deploy_app
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
 
   run [ -a "/var/log/nginx/$TEST_APP-access.log" ]
   echo "output: $output"
@@ -39,14 +42,17 @@ teardown() {
 }
 
 @test "(nginx-vhosts) log-path" {
-  deploy_app
+  run deploy_app
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
 
   run /bin/bash -c "dokku nginx:set $TEST_APP access-log-path off"
   echo "output: $output"
   echo "status: $status"
   assert_success
 
-  run /bin/bash -c "dokku nginx:build-config $TEST_APP"
+  run /bin/bash -c "dokku proxy:build-config $TEST_APP"
   echo "output: $output"
   echo "status: $status"
   assert_success
@@ -54,14 +60,14 @@ teardown() {
   run /bin/bash -c "dokku nginx:show-config $TEST_APP"
   echo "output: $output"
   echo "status: $status"
-  assert_output_contains "off;"
+  assert_output_contains "access_log  off;"
 
   run /bin/bash -c "dokku nginx:set $TEST_APP access-log-path"
   echo "output: $output"
   echo "status: $status"
   assert_success
 
-  run /bin/bash -c "dokku nginx:build-config $TEST_APP"
+  run /bin/bash -c "dokku proxy:build-config $TEST_APP"
   echo "output: $output"
   echo "status: $status"
   assert_success
@@ -69,14 +75,14 @@ teardown() {
   run /bin/bash -c "dokku nginx:show-config $TEST_APP"
   echo "output: $output"
   echo "status: $status"
-  assert_output_contains "off;" 0
+  assert_output_contains "access_log  off;" 0
 
   run /bin/bash -c "dokku nginx:set $TEST_APP error-log-path off"
   echo "output: $output"
   echo "status: $status"
   assert_success
 
-  run /bin/bash -c "dokku nginx:build-config $TEST_APP"
+  run /bin/bash -c "dokku proxy:build-config $TEST_APP"
   echo "output: $output"
   echo "status: $status"
   assert_success
@@ -84,14 +90,14 @@ teardown() {
   run /bin/bash -c "dokku nginx:show-config $TEST_APP"
   echo "output: $output"
   echo "status: $status"
-  assert_output_contains "off;"
+  assert_output_contains "error_log   off;"
 
   run /bin/bash -c "dokku nginx:set $TEST_APP error-log-path"
   echo "output: $output"
   echo "status: $status"
   assert_success
 
-  run /bin/bash -c "dokku nginx:build-config $TEST_APP"
+  run /bin/bash -c "dokku proxy:build-config $TEST_APP"
   echo "output: $output"
   echo "status: $status"
   assert_success
@@ -99,18 +105,21 @@ teardown() {
   run /bin/bash -c "dokku nginx:show-config $TEST_APP"
   echo "output: $output"
   echo "status: $status"
-  assert_output_contains "off;" 0
+  assert_output_contains "error_log   off;" 0
 }
 
 @test "(nginx-vhosts) access-log-format" {
-  deploy_app
+  run deploy_app
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
 
   run /bin/bash -c "dokku nginx:set $TEST_APP access-log-format combined"
   echo "output: $output"
   echo "status: $status"
   assert_success
 
-  run /bin/bash -c "dokku nginx:build-config $TEST_APP"
+  run /bin/bash -c "dokku proxy:build-config $TEST_APP"
   echo "output: $output"
   echo "status: $status"
   assert_success
@@ -125,7 +134,7 @@ teardown() {
   echo "status: $status"
   assert_success
 
-  run /bin/bash -c "dokku nginx:build-config $TEST_APP"
+  run /bin/bash -c "dokku proxy:build-config $TEST_APP"
   echo "output: $output"
   echo "status: $status"
   assert_success
@@ -133,7 +142,7 @@ teardown() {
   run /bin/bash -c "dokku nginx:show-config $TEST_APP"
   echo "output: $output"
   echo "status: $status"
-  assert_output_contains "off;"
+  assert_output_contains "access_log  off;"
 
   run /bin/bash -c "dokku nginx:set $TEST_APP access-log-format"
   run /bin/bash -c "dokku nginx:set $TEST_APP access-log-path"
@@ -141,7 +150,7 @@ teardown() {
   echo "status: $status"
   assert_success
 
-  run /bin/bash -c "dokku nginx:build-config $TEST_APP"
+  run /bin/bash -c "dokku proxy:build-config $TEST_APP"
   echo "output: $output"
   echo "status: $status"
   assert_success
@@ -152,22 +161,54 @@ teardown() {
   assert_output_contains "-access.log;"
 }
 
-@test "(nginx-vhosts) nginx:build-config (with SSL and unrelated domain)" {
+@test "(nginx-vhosts) proxy:build-config (with SSL and unrelated domain)" {
   setup_test_tls
-  add_domain "node-js-app.dokku.me"
-  add_domain "test.dokku.me"
-  deploy_app
-  dokku nginx:show-config $TEST_APP
-  assert_ssl_domain "node-js-app.dokku.me"
-  assert_http_redirect "http://test.dokku.me" "https://test.dokku.me:443/"
+  run /bin/bash -c "dokku domains:add $TEST_APP node-js-app.${DOKKU_DOMAIN}"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku domains:add $TEST_APP test.${DOKKU_DOMAIN}"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run deploy_app
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku nginx:show-config $TEST_APP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  assert_ssl_domain "node-js-app.${DOKKU_DOMAIN}"
+  assert_http_redirect "http://test.${DOKKU_DOMAIN}" "https://test.${DOKKU_DOMAIN}:443/"
 }
 
-@test "(nginx-vhosts) nginx:build-config (wildcard SSL)" {
+@test "(nginx-vhosts) proxy:build-config (wildcard SSL)" {
   setup_test_tls wildcard
-  add_domain "wildcard1.dokku.me"
-  add_domain "wildcard2.dokku.me"
-  deploy_app
-  dokku nginx:show-config $TEST_APP
-  assert_ssl_domain "wildcard1.dokku.me"
-  assert_ssl_domain "wildcard2.dokku.me"
+  run /bin/bash -c "dokku domains:add $TEST_APP wildcard1.${DOKKU_DOMAIN}"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku domains:add $TEST_APP wildcard2.${DOKKU_DOMAIN}"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run deploy_app
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku nginx:show-config $TEST_APP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  assert_ssl_domain "wildcard1.${DOKKU_DOMAIN}"
+  assert_ssl_domain "wildcard2.${DOKKU_DOMAIN}"
 }

@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+source "$PLUGIN_CORE_AVAILABLE_PATH/common/functions"
+source "$PLUGIN_CORE_AVAILABLE_PATH/common/property-functions"
+set -eo pipefail
+[[ $DOKKU_TRACE ]] && set -x
+
+fn-builder-lambda-computed-lambdayml-path() {
+  declare APP="$1"
+
+  file="$(fn-builder-lambda-lambdayml-path "$APP")"
+  if [[ "$file" == "" ]]; then
+    file="$(fn-builder-lambda-global-lambdayml-path "$APP")"
+  fi
+  if [[ "$file" == "" ]]; then
+    file="lambda.yml"
+  fi
+
+  echo "$file"
+}
+
+fn-builder-lambda-global-lambdayml-path() {
+  declare APP="$1"
+
+  fn-plugin-property-get-default "builder-lambda" "--global" "lambdayml-path" ""
+}
+
+fn-builder-lambda-lambdayml-path() {
+  declare APP="$1"
+
+  fn-plugin-property-get-default "builder-lambda" "$APP" "lambdayml-path" ""
+}

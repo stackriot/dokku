@@ -14,6 +14,13 @@ trigger-scheduler-docker-local-install() {
 
   fn-plugin-property-setup "scheduler-docker-local"
 
+  rm -f "/etc/sudoers.d/dokku-cron"
+
+  local docker_container_healthchecker_path
+  docker_container_healthchecker_path="$(command -v docker-container-healthchecker)"
+  echo "%dokku ALL=(ALL) NOPASSWD:$docker_container_healthchecker_path" >"/etc/sudoers.d/dokku-docker-container-healthchecker"
+  chmod "0440" "/etc/sudoers.d/dokku-docker-container-healthchecker"
+
   DOKKU_PATH="$(command -v dokku)"
 
   if [[ $(systemctl 2>/dev/null) =~ -\.mount ]]; then
@@ -27,6 +34,7 @@ After=docker.service
 Type=oneshot
 User=$DOKKU_SYSTEM_USER
 ExecStart=$DOKKU_PATH ps:retire
+SuccessExitStatus=137
 
 [Install]
 WantedBy=docker.service

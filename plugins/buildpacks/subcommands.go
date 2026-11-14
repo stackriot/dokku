@@ -3,6 +3,7 @@ package buildpacks
 import (
 	"errors"
 	"fmt"
+	"os"
 
 	"github.com/dokku/dokku/plugins/common"
 )
@@ -28,6 +29,41 @@ func CommandClear(appName string) error {
 	}
 
 	return common.PropertyDelete("buildpacks", appName, "buildpacks")
+}
+
+// CommandDetect implements buildpacks:detect
+func CommandDetect(appName string, branch string) (err error) {
+	if err := common.VerifyAppName(appName); err != nil {
+		return err
+	}
+
+	workDir := common.AppRoot(appName)
+	checkedOutDir, err := checkoutBareGitRepo(workDir, branch)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err := os.RemoveAll(checkedOutDir); err != nil {
+			common.LogWarn(fmt.Sprintf("Failed to remove temporary directory %s: %v", checkedOutDir, err))
+		}
+	}()
+
+	dockerArgs := []string{
+		"run", "--rm",
+		"-v", fmt.Sprintf("%s:/tmp/app", checkedOutDir),
+		"gliderlabs/herokuish", "/bin/herokuish", "buildpack", "detect", "/tmp/app",
+	}
+
+	result, err := common.CallExecCommand(common.ExecCommandInput{
+		Command: common.DockerBin(),
+		Args:    dockerArgs,
+	})
+	if err != nil {
+		return fmt.Errorf("Buildpack detection failed: %s", result.StderrContents())
+	}
+
+	common.LogVerbose(result.StdoutContents())
+	return nil
 }
 
 // CommandList implements buildpacks:list
@@ -65,7 +101,7 @@ func CommandRemove(appName string, buildpack string, index int) (err error) {
 	}
 
 	buildpack, err = validBuildpackURL(buildpack)
-	if err != nil {
+	if index == 0 && err != nil {
 		return err
 	}
 
@@ -108,6 +144,10 @@ func CommandReport(appName string, format string, infoFlag string) error {
 	if len(appName) == 0 {
 		apps, err := common.DokkuApps()
 		if err != nil {
+			if errors.Is(err, common.NoAppsExist) {
+				common.LogWarn(err.Error())
+				return nil
+			}
 			return err
 		}
 		for _, appName := range apps {
@@ -122,12 +162,24 @@ func CommandReport(appName string, format string, infoFlag string) error {
 }
 
 // CommandSet implements buildpacks:set
-func CommandSet(appName string, buildpack string, index int) error {
+func CommandSet(appName string, buildpacks []string, index int, replace bool) error {
 	if err := common.VerifyAppName(appName); err != nil {
 		return err
 	}
 
-	buildpack, err := validBuildpackURL(buildpack)
+	if replace {
+		return setBuildpackList(appName, buildpacks, index)
+	}
+
+	if len(buildpacks) > 1 {
+		return errors.New("Setting multiple buildpacks requires the --replace flag")
+	}
+
+	if len(buildpacks) == 0 {
+		return errors.New("Must specify a buildpack")
+	}
+
+	buildpack, err := validBuildpackURL(buildpacks[0])
 	if err != nil {
 		return err
 	}
@@ -139,27 +191,88 @@ func CommandSet(appName string, buildpack string, index int) error {
 	return common.PropertyListSet("buildpacks", appName, "buildpacks", buildpack, index)
 }
 
-// CommandSetProperty implements buildpacks:set-property
-func CommandSetProperty(appName string, property string, value string) error {
-	oldStack := ""
-	if property == "stack" {
-		oldStack = common.PropertyGet("buildpacks", appName, "stack")
+// setBuildpackList atomically replaces the entire ordered buildpack list
+func setBuildpackList(appName string, buildpacks []string, index int) error {
+	if index != 0 {
+		return errors.New("The --index flag cannot be used with --replace")
 	}
 
-	common.CommandPropertySet("buildpacks", appName, property, value, DefaultProperties, GlobalProperties)
-	if property == "stack" && oldStack != value {
-		if appName != "--global" {
-			return common.PlugnTrigger("post-stack-set", []string{appName, value}...)
-		}
+	if len(buildpacks) == 0 {
+		return errors.New("Must specify at least one buildpack, use buildpacks:clear to remove all buildpacks")
+	}
 
-		apps, err := common.DokkuApps()
+	validated := make([]string, 0, len(buildpacks))
+	for _, buildpack := range buildpacks {
+		url, err := validBuildpackURL(buildpack)
 		if err != nil {
 			return err
 		}
-		for _, app := range apps {
-			if err := common.PlugnTrigger("post-stack-set", []string{app, value}...); err != nil {
+		validated = append(validated, url)
+	}
+
+	return common.PropertyListWrite("buildpacks", appName, "buildpacks", validated)
+}
+
+// CommandSetProperty implements buildpacks:set-property
+func CommandSetProperty(appName string, property string, value string) error {
+	if property != "stack" {
+		common.CommandPropertySet("buildpacks", appName, property, value, DefaultProperties, GlobalProperties)
+		return nil
+	}
+
+	if value != "" {
+		builder := builderForStack(value)
+		common.LogWarn(fmt.Sprintf("Deprecated: buildpacks:set-property stack is deprecated, use %s:set stack instead", builder))
+		if err := common.PropertyWrite(builder, appName, "stack", value); err != nil {
+			return err
+		}
+		return clearBuilderCache(builder, appName)
+	}
+
+	common.LogWarn("Deprecated: buildpacks:set-property stack is deprecated, use builder-herokuish:set stack or builder-pack:set stack instead")
+	for _, builder := range []string{"builder-herokuish", "builder-pack"} {
+		if err := common.PropertyDelete(builder, appName, "stack"); err != nil {
+			return err
+		}
+		if err := clearBuilderCache(builder, appName); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// clearBuilderCache clears the build cache for the given builder after a stack
+// change. The herokuish cache is the cache-$APP volume removed by repo via the
+// post-stack-set trigger, while the pack cache lives in pack-managed volumes and
+// is cleared by flagging the next build to run with --clear-cache.
+func clearBuilderCache(builder string, appName string) error {
+	apps := []string{appName}
+	if appName == "--global" {
+		dokkuApps, err := common.DokkuApps()
+		if err != nil {
+			if errors.Is(err, common.NoAppsExist) {
+				return nil
+			}
+			return err
+		}
+		apps = dokkuApps
+	}
+
+	for _, app := range apps {
+		if builder == "builder-herokuish" {
+			if _, err := common.CallPlugnTrigger(common.PlugnTriggerInput{
+				Trigger:     "post-stack-set",
+				Args:        []string{app, ""},
+				StreamStdio: true,
+			}); err != nil {
 				return err
 			}
+			continue
+		}
+
+		if err := common.PropertyWrite("builder-pack", app, "clear-cache", "true"); err != nil {
+			return err
 		}
 	}
 

@@ -1,0 +1,124 @@
+#!/usr/bin/env bash
+source "$PLUGIN_CORE_AVAILABLE_PATH/common/functions"
+source "$PLUGIN_CORE_AVAILABLE_PATH/common/property-functions"
+source "$PLUGIN_AVAILABLE_PATH/proxy/command-functions"
+source "$PLUGIN_AVAILABLE_PATH/traefik-vhosts/internal-functions"
+set -eo pipefail
+[[ $DOKKU_TRACE ]] && set -x
+
+cmd-traefik-labels-add() {
+  declare desc="adds container label to app for specified proxy"
+  declare cmd="traefik:labels:add"
+  [[ "$1" == "$cmd" ]] && shift 1
+
+  cmd-proxy-labels-add "proxy:labels:add" "traefik" "$@"
+}
+
+cmd-traefik-labels-remove() {
+  declare desc="removes container label from app for specified proxy"
+  declare cmd="traefik:labels:remove"
+  [[ "$1" == "$cmd" ]] && shift 1
+
+  cmd-proxy-labels-remove "proxy:labels:remove" "traefik" "$@"
+}
+
+cmd-traefik-labels-show() {
+  declare desc="shows container labels for app for specified proxy"
+  declare cmd="traefik:labels:show"
+  [[ "$1" == "$cmd" ]] && shift 1
+
+  cmd-proxy-labels-show "proxy:labels:show" "traefik" "$@"
+}
+
+cmd-traefik-logs() {
+  declare desc="display traefik logs from command line"
+  declare cmd="traefik:logs"
+  [[ "$1" == "$cmd" ]] && shift 1
+  local NUM="100" TAIL=false
+
+  local TEMP=$(getopt -o htn: --long help,tail,num: -n 'dokku traefik:logs' -- "$@")
+  local EXIT_CODE="$?"
+  if [[ "$EXIT_CODE" != 0 ]]; then
+    fn-traefik-logs-usage >&2
+    exit 1
+  fi
+  eval set -- "$TEMP"
+
+  while true; do
+    case "$1" in
+      -t | --tail)
+        local TAIL=true
+        shift
+        ;;
+      -n | --num)
+        local NUM="$2"
+        shift 2
+        ;;
+      --)
+        shift
+        break
+        ;;
+      *) dokku_log_fail "Internal error" ;;
+    esac
+  done
+
+  fn-traefik-logs "$TAIL" "$NUM"
+}
+
+cmd-traefik-show-config() {
+  declare desc="display traefik config"
+  declare cmd="traefik:show-config"
+  [[ "$1" == "$cmd" ]] && shift 1
+
+  if ! fn-is-compose-installed; then
+    dokku_log_fail "Required docker compose plugin is not installed"
+  fi
+
+  local TMP_COMPOSE_FILE=$(mktemp "/tmp/dokku-${DOKKU_PID}-${FUNCNAME[0]}.XXXXXX")
+  trap "rm -rf '$TMP_COMPOSE_FILE' >/dev/null" RETURN INT TERM EXIT
+
+  fn-traefik-template-compose-file "$TMP_COMPOSE_FILE"
+  cat "$TMP_COMPOSE_FILE"
+}
+
+cmd-traefik-start() {
+  declare desc="Starts the traefik server"
+  declare cmd="traefik:start"
+  [[ "$1" == "$cmd" ]] && shift 1
+
+  if ! fn-is-compose-installed; then
+    dokku_log_fail "Required docker compose plugin is not installed"
+  fi
+
+  local TMP_COMPOSE_FILE=$(mktemp "/tmp/dokku-${DOKKU_PID}-${FUNCNAME[0]}.XXXXXX")
+  trap "rm -rf '$TMP_COMPOSE_FILE' >/dev/null" RETURN INT TERM EXIT
+
+  fn-plugin-property-write "traefik" "--global" "proxy-status" "started"
+  touch "${DOKKU_LIB_ROOT}/data/traefik/traefik-acme.json"
+  chmod 600 "${DOKKU_LIB_ROOT}/data/traefik/traefik-acme.json"
+  fn-traefik-template-compose-file "$TMP_COMPOSE_FILE"
+  if ! "$PLUGIN_CORE_AVAILABLE_PATH/common/common" compose-up "traefik" "$TMP_COMPOSE_FILE"; then
+    return 1
+  fi
+}
+
+cmd-traefik-stop() {
+  declare desc="Stops the traefik server"
+  declare cmd="traefik:stop"
+  [[ "$1" == "$cmd" ]] && shift 1
+
+  if ! fn-is-compose-installed; then
+    dokku_log_fail "Required docker compose plugin is not installed"
+  fi
+
+  local TMP_COMPOSE_FILE=$(mktemp "/tmp/dokku-${DOKKU_PID}-${FUNCNAME[0]}.XXXXXX")
+  trap "rm -rf '$TMP_COMPOSE_FILE' >/dev/null" RETURN INT TERM EXIT
+
+  fn-plugin-property-write "traefik" "--global" "proxy-status" "stopped"
+  touch "${DOKKU_LIB_ROOT}/data/traefik/traefik-acme.json"
+  chmod 600 "${DOKKU_LIB_ROOT}/data/traefik/traefik-acme.json"
+  fn-traefik-template-compose-file "$TMP_COMPOSE_FILE"
+  if ! "$PLUGIN_CORE_AVAILABLE_PATH/common/common" compose-down "traefik" "$TMP_COMPOSE_FILE"; then
+    return 1
+  fi
+}

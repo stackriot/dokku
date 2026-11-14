@@ -6,7 +6,8 @@ The best plan for disaster recovery is to always keep multiple (remote) copies o
 
 ## TLDR
 
-> Warning: This method has many caveats. Please read this entire document before assuming these backups work as expected, and test your backups on a regular basis.
+> [!WARNING]
+> This method has many caveats. Please read this entire document before assuming these backups work as expected, and test your backups on a regular basis.
 
 ### Creating a backup
 
@@ -94,6 +95,14 @@ Dokku doesn't enforce a [300mb](https://devcenter.heroku.com/articles/slug-compi
 System administrators are highly encouraged to store persistent data in app-specific subdirectories of the path `/var/lib/dokku/data/storage`. This will help ensure restores of the aforementioned primary Dokku directories will restore service to all apps.
 
 See the [persistent storage documentation](/docs/advanced-usage/persistent-storage.md) for more information on how to attach persistent storage to your app.
+
+### Restoring on a machine with a different CPU Architecture
+
+When restoring a backup on a machine that has a different CPU architecture, you will need to clear out the `~/.basher`  as it's not portable across different CPU architectures. Do so with the following command immediately after restoring your dokku configs:
+
+```shell
+rm -rf /home/dokku/.basher
+```
 
 ## Recovering app code
 

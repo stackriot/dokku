@@ -6,17 +6,33 @@ import (
 
 // ReportSingleApp is an internal function that displays the builder report for one or more apps
 func ReportSingleApp(appName string, format string, infoFlag string) error {
-	if err := common.VerifyAppName(appName); err != nil {
-		return err
+	if appName != "--global" {
+		if err := common.VerifyAppName(appName); err != nil {
+			return err
+		}
 	}
 
-	flags := map[string]common.ReportFunc{
-		"--builder-computed-selected":  reportComputedSelected,
-		"--builder-global-selected":    reportGlobalSelected,
-		"--builder-selected":           reportSelected,
-		"--builder-computed-build-dir": reportComputedBuildDir,
-		"--builder-global-build-dir":   reportGlobalBuildDir,
-		"--builder-build-dir":          reportBuildDir,
+	var flags map[string]common.ReportFunc
+	if appName == "--global" {
+		flags = map[string]common.ReportFunc{
+			"--builder-global-selected":       reportGlobalSelected,
+			"--builder-global-build-dir":      reportGlobalBuildDir,
+			"--builder-global-skip-cleanup":   reportGlobalSkipCleanup,
+			"--builder-computed-skip-cleanup": reportComputedSkipCleanup,
+		}
+	} else {
+		flags = map[string]common.ReportFunc{
+			"--builder-computed-selected":     reportComputedSelected,
+			"--builder-global-selected":       reportGlobalSelected,
+			"--builder-selected":              reportSelected,
+			"--builder-detected":              reportDetected,
+			"--builder-computed-build-dir":    reportComputedBuildDir,
+			"--builder-global-build-dir":      reportGlobalBuildDir,
+			"--builder-build-dir":             reportBuildDir,
+			"--builder-computed-skip-cleanup": reportComputedSkipCleanup,
+			"--builder-global-skip-cleanup":   reportGlobalSkipCleanup,
+			"--builder-skip-cleanup":          reportSkipCleanup,
+		}
 	}
 
 	flagKeys := []string{}
@@ -24,10 +40,18 @@ func ReportSingleApp(appName string, format string, infoFlag string) error {
 		flagKeys = append(flagKeys, flagKey)
 	}
 
-	trimPrefix := false
-	uppercaseFirstCharacter := true
 	infoFlags := common.CollectReport(appName, infoFlag, flags)
-	return common.ReportSingleApp("builder", appName, infoFlag, infoFlags, flagKeys, format, trimPrefix, uppercaseFirstCharacter)
+	return common.ReportSingleApp(common.ReportSingleAppInput{
+		ReportType:              "builder",
+		AppName:                 appName,
+		InfoFlag:                infoFlag,
+		InfoFlags:               infoFlags,
+		InfoFlagKeys:            flagKeys,
+		Format:                  format,
+		TrimPrefix:              true,
+		UppercaseFirstCharacter: true,
+		EmitLegacyPrefix:        true,
+	})
 }
 
 func reportComputedSelected(appName string) string {
@@ -41,6 +65,10 @@ func reportComputedSelected(appName string) string {
 
 func reportGlobalSelected(appName string) string {
 	return common.PropertyGet("builder", "--global", "selected")
+}
+
+func reportDetected(appName string) string {
+	return common.PropertyGet("builder", appName, "detected")
 }
 
 func reportSelected(appName string) string {
@@ -61,4 +89,24 @@ func reportGlobalBuildDir(appName string) string {
 
 func reportBuildDir(appName string) string {
 	return common.PropertyGet("builder", appName, "build-dir")
+}
+
+func reportComputedSkipCleanup(appName string) string {
+	value := reportSkipCleanup(appName)
+	if value == "" {
+		value = reportGlobalSkipCleanup(appName)
+	}
+	if value == "" {
+		value = "false"
+	}
+
+	return value
+}
+
+func reportGlobalSkipCleanup(appName string) string {
+	return common.PropertyGet("builder", "--global", "skip-cleanup")
+}
+
+func reportSkipCleanup(appName string) string {
+	return common.PropertyGet("builder", appName, "skip-cleanup")
 }

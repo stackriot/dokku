@@ -1,0 +1,977 @@
+#!/usr/bin/env bats
+
+load test_helper
+
+setup() {
+  global_setup
+  dokku nginx:stop
+  dokku openresty:set --global letsencrypt-server https://acme-staging-v02.api.letsencrypt.org/directory
+  dokku openresty:set --global letsencrypt-email
+  dokku openresty:start
+  create_app
+}
+
+teardown() {
+  dokku openresty:set --global log-level >/dev/null 2>&1 || true
+  for key in bind-address-ipv6 keepalive-timeout client-body-timeout client-header-timeout client-max-body-size; do
+    dokku openresty:set --global "$key" >/dev/null || true
+  done
+  global_teardown
+  destroy_app
+  dokku openresty:stop
+  dokku nginx:start
+}
+
+@test "(openresty:report) --global --openresty-computed-letsencrypt-server" {
+  run /bin/bash -c "dokku openresty:report --global --openresty-computed-letsencrypt-server"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "https://acme-staging-v02.api.letsencrypt.org/directory"
+
+  run /bin/bash -c "dokku openresty:report --global --openresty-global-letsencrypt-server"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "https://acme-staging-v02.api.letsencrypt.org/directory"
+}
+
+@test "(openresty:report) --global raw and computed keys in --format json" {
+  run /bin/bash -c "dokku openresty:report --global --format json | jq -r '.\"global-letsencrypt-server\"'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "https://acme-staging-v02.api.letsencrypt.org/directory"
+
+  run /bin/bash -c "dokku openresty:report --global --format json | jq -r '.\"computed-letsencrypt-server\"'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "https://acme-staging-v02.api.letsencrypt.org/directory"
+
+  run /bin/bash -c "dokku openresty:report --global --format json | jq -r '.\"global-letsencrypt-email\"'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output ""
+
+  run /bin/bash -c "dokku openresty:report --global --format json | jq -r '.\"computed-letsencrypt-email\"'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output ""
+
+  run /bin/bash -c "dokku openresty:report --global --format json | jq -r '.\"global-image\"'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output ""
+
+  run /bin/bash -c "dokku openresty:report --global --format json | jq -r '.\"computed-image\"'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output_exists
+
+  run /bin/bash -c "dokku openresty:report --global --format json | jq -r '.\"global-allowed-letsencrypt-domains-func-base64\"'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output ""
+
+  run /bin/bash -c "dokku openresty:report --global --format json | jq -r '.\"computed-allowed-letsencrypt-domains-func-base64\"'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output_exists
+
+  run /bin/bash -c "dokku openresty:report --global --format json | jq -r '.\"global-hsts\"'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output ""
+
+  run /bin/bash -c "dokku openresty:report --global --format json | jq -r '.\"computed-hsts\"'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "true"
+
+  for key in image letsencrypt-email letsencrypt-server allowed-letsencrypt-domains-func-base64; do
+    run /bin/bash -c "dokku openresty:report --global --format json | jq -e \"has(\\\"$key\\\")\""
+    echo "key: $key"
+    echo "output: $output"
+    echo "status: $status"
+    assert_failure
+    assert_output "false"
+  done
+}
+
+@test "(openresty:report) --global global vs computed image" {
+  run /bin/bash -c "dokku openresty:report --global --openresty-global-image"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output ""
+
+  run /bin/bash -c "dokku openresty:report --global --openresty-computed-image"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output_exists
+
+  run /bin/bash -c "dokku openresty:set --global image dokku/openresty-docker-proxy:0.5.6"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku openresty:report --global --openresty-global-image"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "dokku/openresty-docker-proxy:0.5.6"
+
+  run /bin/bash -c "dokku openresty:report --global --openresty-computed-image"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "dokku/openresty-docker-proxy:0.5.6"
+
+  run /bin/bash -c "dokku openresty:set --global image"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku openresty:report --global --openresty-global-image"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output ""
+
+  run /bin/bash -c "dokku openresty:report --global --openresty-computed-image"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output_exists
+}
+
+@test "(openresty:report) --global log-level raw vs computed" {
+  run /bin/bash -c "dokku openresty:report --global --openresty-global-log-level"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output ""
+
+  run /bin/bash -c "dokku openresty:report --global --openresty-computed-log-level"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "ERROR"
+
+  run /bin/bash -c "dokku openresty:set --global log-level DEBUG"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku openresty:report --global --openresty-global-log-level"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "DEBUG"
+
+  run /bin/bash -c "dokku openresty:report --global --openresty-computed-log-level"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "DEBUG"
+
+  run /bin/bash -c "dokku openresty:report --global --format json | jq -r '.\"global-log-level\"'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "DEBUG"
+
+  run /bin/bash -c "dokku openresty:report --global --format json | jq -r '.\"computed-log-level\"'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "DEBUG"
+
+  run /bin/bash -c "dokku openresty:set --global log-level"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku openresty:report --global --openresty-global-log-level"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output ""
+
+  run /bin/bash -c "dokku openresty:report --global --openresty-computed-log-level"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "ERROR"
+}
+
+@test "(openresty:report) per-app raw vs global vs computed for bind-address-ipv6" {
+  run /bin/bash -c "dokku openresty:report $TEST_APP --openresty-bind-address-ipv6"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output ""
+
+  run /bin/bash -c "dokku openresty:report $TEST_APP --openresty-global-bind-address-ipv6"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output ""
+
+  run /bin/bash -c "dokku openresty:report $TEST_APP --openresty-computed-bind-address-ipv6"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "::"
+
+  run /bin/bash -c "dokku openresty:set $TEST_APP bind-address-ipv6 ::1"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku openresty:report $TEST_APP --openresty-bind-address-ipv6"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "::1"
+
+  run /bin/bash -c "dokku openresty:report $TEST_APP --openresty-computed-bind-address-ipv6"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "::1"
+
+  run /bin/bash -c "dokku openresty:report $TEST_APP --openresty-global-bind-address-ipv6"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output ""
+
+  run /bin/bash -c "dokku openresty:set $TEST_APP bind-address-ipv6"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku openresty:report $TEST_APP --openresty-computed-bind-address-ipv6"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "::"
+}
+
+@test "(openresty:report) per-app inherits global value, per-app overrides global" {
+  run /bin/bash -c "dokku openresty:set --global keepalive-timeout 90s"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku openresty:report $TEST_APP --openresty-keepalive-timeout"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output ""
+
+  run /bin/bash -c "dokku openresty:report $TEST_APP --openresty-global-keepalive-timeout"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "90s"
+
+  run /bin/bash -c "dokku openresty:report $TEST_APP --openresty-computed-keepalive-timeout"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "90s"
+
+  run /bin/bash -c "dokku openresty:set $TEST_APP keepalive-timeout 30s"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku openresty:report $TEST_APP --openresty-keepalive-timeout"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "30s"
+
+  run /bin/bash -c "dokku openresty:report $TEST_APP --openresty-computed-keepalive-timeout"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "30s"
+
+  run /bin/bash -c "dokku openresty:report $TEST_APP --format json | jq -r '.\"keepalive-timeout\"'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "30s"
+
+  run /bin/bash -c "dokku openresty:report $TEST_APP --format json | jq -r '.\"global-keepalive-timeout\"'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "90s"
+
+  run /bin/bash -c "dokku openresty:report $TEST_APP --format json | jq -r '.\"computed-keepalive-timeout\"'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "30s"
+
+  run /bin/bash -c "dokku openresty:set $TEST_APP keepalive-timeout"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku openresty:set --global keepalive-timeout"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku openresty:report $TEST_APP --openresty-computed-keepalive-timeout"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "75s"
+}
+
+@test "(openresty:report) client-header-timeout reads its own property key" {
+  run /bin/bash -c "dokku openresty:set $TEST_APP client-body-timeout 99s"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku openresty:report $TEST_APP --openresty-computed-client-header-timeout"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "60s"
+
+  run /bin/bash -c "dokku openresty:set $TEST_APP client-header-timeout 30s"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku openresty:report $TEST_APP --openresty-client-header-timeout"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "30s"
+
+  run /bin/bash -c "dokku openresty:report $TEST_APP --openresty-computed-client-header-timeout"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "30s"
+
+  run /bin/bash -c "dokku openresty:report $TEST_APP --openresty-computed-client-body-timeout"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "99s"
+}
+
+@test "(openresty:report) client-max-body-size computed default is 1m" {
+  run /bin/bash -c "dokku openresty:report $TEST_APP --openresty-client-max-body-size"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output ""
+
+  run /bin/bash -c "dokku openresty:report $TEST_APP --openresty-computed-client-max-body-size"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "1m"
+}
+
+@test "(openresty) per-app properties are settable globally" {
+  run /bin/bash -c "dokku openresty:set --global keepalive-timeout 90s"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku openresty:report --global --openresty-global-keepalive-timeout"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "90s"
+
+  run /bin/bash -c "dokku openresty:report --global --openresty-computed-keepalive-timeout"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "90s"
+
+  run /bin/bash -c "dokku openresty:set --global keepalive-timeout"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+}
+
+@test "(openresty) global-only keys" {
+  for key in allowed-letsencrypt-domains-func-base64 image log-level letsencrypt-email letsencrypt-server; do
+    run /bin/bash -c "dokku openresty:set $TEST_APP $key somevalue"
+    echo "key: $key"
+    echo "output: $output"
+    echo "status: $status"
+    assert_failure
+    assert_output_contains "can only be set globally"
+  done
+
+  run /bin/bash -c "dokku openresty:set $TEST_APP bind-address-ipv4 127.0.0.1"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku openresty:report $TEST_APP --openresty-bind-address-ipv4"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "127.0.0.1"
+
+  run /bin/bash -c "dokku openresty:set $TEST_APP bind-address-ipv4"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+}
+
+@test "(openresty) openresty:help" {
+  run /bin/bash -c "dokku openresty"
+  echo "output: $output"
+  echo "status: $status"
+  assert_output_contains "Manage the openresty proxy integration"
+  help_output="$output"
+
+  run /bin/bash -c "dokku openresty:help"
+  echo "output: $output"
+  echo "status: $status"
+  assert_output_contains "Manage the openresty proxy integration"
+  assert_output "$help_output"
+}
+
+@test "(openresty) single domain" {
+  run /bin/bash -c "dokku proxy:set $TEST_APP openresty"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run deploy_app python dokku@$DOKKU_DOMAIN:$TEST_APP convert_to_dockerfile
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  assert_http_localhost_response "http" "$TEST_APP.dokku.me" "80" "" "python/http.server"
+}
+
+@test "(openresty) multiple domains" {
+  run /bin/bash -c "dokku proxy:set $TEST_APP openresty"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku domains:add $TEST_APP $TEST_APP.dokku.me"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku domains:add $TEST_APP $TEST_APP-2.dokku.me"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run deploy_app python dokku@$DOKKU_DOMAIN:$TEST_APP convert_to_dockerfile
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  assert_http_localhost_response "http" "$TEST_APP.dokku.me" "80" "" "python/http.server"
+  assert_http_localhost_response "http" "$TEST_APP-2.dokku.me" "80" "" "python/http.server"
+}
+
+@test "(openresty) ssl" {
+  run /bin/bash -c "dokku builder-herokuish:set $TEST_APP allowed true"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku proxy:set $TEST_APP openresty"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run deploy_app
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_http_localhost_response "http" "$TEST_APP.dokku.me" "80" "" "python/http.server"
+
+  run /bin/bash -c "dokku ports:report $TEST_APP --ports-map-detected"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "http:80:5000"
+
+  run /bin/bash -c "docker inspect $TEST_APP.web.1 --format '{{ index .Config.Labels \"openresty.letsencrypt\" }}'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "false"
+
+  run /bin/bash -c "dokku openresty:set --global letsencrypt-email test@example.com"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku openresty:stop"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku openresty:start"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku ps:rebuild $TEST_APP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku ps:inspect $TEST_APP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "docker inspect $TEST_APP.web.1 --format '{{ index .Config.Labels \"openresty.letsencrypt\" }}'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "true"
+
+  run /bin/bash -c "dokku ports:report $TEST_APP --ports-map-detected"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "http:80:5000 https:443:5000"
+}
+
+@test "(openresty) allowed-domains" {
+  run /bin/bash -c "dokku proxy:set $TEST_APP openresty"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  value="$(echo 'return true' | base64 -w 0)"
+  run /bin/bash -c "dokku openresty:set --global allowed-letsencrypt-domains-func-base64 $value"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku openresty:start"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "docker exec openresty-openresty-1 /usr/local/openresty/nginx/sbin/nginx -t"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  body='allowed_domains = {"domain.com", "extra-domain.com"}
+  for index, value in ipairs(allowed_domains) do
+    if value == domain then
+      return true
+    end
+  end
+  return false
+  '
+  value="$(echo "$body" | base64 -w 0)"
+  run /bin/bash -c "dokku openresty:set --global allowed-letsencrypt-domains-func-base64 $value"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku openresty:stop"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku openresty:start"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "docker exec openresty-openresty-1 /usr/local/openresty/nginx/sbin/nginx -t"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku openresty:set --global allowed-letsencrypt-domains-func-base64"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku openresty:stop"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku openresty:start"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+}
+
+@test "(openresty) includes" {
+  run /bin/bash -c "dokku proxy:set $TEST_APP openresty"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run deploy_app python dokku@$DOKKU_DOMAIN:$TEST_APP add_openresty_include
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku ps:inspect $TEST_APP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "docker inspect $TEST_APP.web.1 --format '{{ index .Config.Labels \"openresty.include-http-example.conf\" }}'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "IyBmb3JjZSB0aGUgY2hhcmFjdGVyIHNldCB0byB1dGYtOApjaGFyc2V0IFVURi04Owo="
+
+  run /bin/bash -c "docker logs openresty-openresty-1"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "docker exec openresty-openresty-1 /usr/local/openresty/nginx/sbin/nginx -t"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "docker exec openresty-openresty-1 cat /etc/nginx/sites-enabled/sites.conf"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output_contains "force the character set to utf-8"
+  assert_output_contains "charset UTF-8;"
+}
+
+@test "(openresty) [security] eval injection via malicious include filename" {
+  rm -f /tmp/openresty-include
+
+  run /bin/bash -c "dokku proxy:set $TEST_APP openresty"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run deploy_app python dokku@$DOKKU_DOMAIN:$TEST_APP add_openresty_include_unsafe
+  echo "output: $output"
+  echo "status: $status"
+  assert_failure
+  assert_output_contains "unsafe filename" -1
+
+  # No injection payload to test since we're using a simple space character
+  # The test should have failed during core-post-extract, not during eval
+}
+
+@test "(openresty) label management" {
+  run /bin/bash -c "dokku proxy:set $TEST_APP openresty"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku openresty:labels:add $TEST_APP openresty.directive value"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku openresty:labels:show $TEST_APP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output_contains "openresty.directive=value"
+
+  run /bin/bash -c "dokku openresty:labels:show $TEST_APP openresty.directive"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "value"
+
+  run /bin/bash -c "dokku openresty:labels:show $TEST_APP openresty.directive2"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output_not_exists
+
+  run deploy_app
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "docker inspect $TEST_APP.web.1 --format '{{ index .Config.Labels \"openresty.directive\" }}'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "value"
+
+  run /bin/bash -c "dokku openresty:labels:remove $TEST_APP openresty.directive"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku openresty:labels:show $TEST_APP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output_not_contains "openresty.directive=value"
+
+  run /bin/bash -c "dokku openresty:labels:show $TEST_APP openresty.directive"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output_not_exists
+
+  run /bin/bash -c "dokku ps:rebuild $TEST_APP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "docker inspect $TEST_APP.web.1 --format '{{ index .Config.Labels \"openresty.directive\" }}'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output_not_exists
+}
+
+@test "(openresty) healthcheck labels from app.json" {
+  run /bin/bash -c "dokku proxy:set $TEST_APP openresty"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run deploy_app python dokku@$DOKKU_DOMAIN:$TEST_APP setup_openresty_readiness_healthcheck
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "docker inspect $TEST_APP.web.1 --format '{{ index .Config.Labels \"openresty.upstream-max-fails\" }}'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "1"
+
+  run /bin/bash -c "docker inspect $TEST_APP.web.1 --format '{{ index .Config.Labels \"openresty.upstream-fail-timeout\" }}'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "2s"
+
+  run /bin/bash -c "docker inspect $TEST_APP.web.1 --format '{{ index .Config.Labels \"openresty.proxy-next-upstream-timeout\" }}'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "5s"
+
+  run /bin/bash -c "docker inspect $TEST_APP.web.1 --format '{{ index .Config.Labels \"openresty.healthcheck-path\" }}'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "/"
+
+  run /bin/bash -c "docker inspect $TEST_APP.web.1 --format '{{ index .Config.Labels \"openresty.healthcheck-interval\" }}'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "2"
+
+  run /bin/bash -c "docker inspect $TEST_APP.web.1 --format '{{ index .Config.Labels \"openresty.healthcheck-timeout\" }}'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "5"
+
+  run /bin/bash -c "docker inspect $TEST_APP.web.1 --format '{{ index .Config.Labels \"openresty.healthcheck-fall\" }}'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "3"
+
+  run /bin/bash -c "docker inspect $TEST_APP.web.1 --format '{{ index .Config.Labels \"openresty.healthcheck-host\" }}'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "$TEST_APP.dokku.me"
+
+  run /bin/bash -c "docker exec openresty-openresty-1 /usr/local/openresty/nginx/sbin/nginx -t"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "docker exec openresty-openresty-1 cat /etc/nginx/sites-enabled/sites.conf"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output_contains "max_fails=1 fail_timeout=2s;"
+  assert_output_contains "proxy_next_upstream_timeout 5s;"
+
+  sleep 5
+
+  run /bin/bash -c "docker exec openresty-openresty-1 wget -qO- http://127.0.0.1:8999/upstream-healthcheck-status"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output_contains "Upstream $TEST_APP-web-5000"
+  assert_output_contains " UP"
+  assert_output_contains "(NO checkers)" 0
+
+  assert_http_localhost_response "http" "$TEST_APP.dokku.me" "80" "" "python/http.server"
+}
+
+@test "(openresty) no healthcheck labels without readiness check" {
+  run /bin/bash -c "dokku proxy:set $TEST_APP openresty"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run deploy_app python dokku@$DOKKU_DOMAIN:$TEST_APP convert_to_dockerfile
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "docker inspect $TEST_APP.web.1 --format '{{ index .Config.Labels \"openresty.upstream-max-fails\" }}'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output_not_exists
+
+  run /bin/bash -c "docker inspect $TEST_APP.web.1 --format '{{ index .Config.Labels \"openresty.proxy-next-upstream-timeout\" }}'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output_not_exists
+
+  run /bin/bash -c "docker inspect $TEST_APP.web.1 --format '{{ index .Config.Labels \"openresty.healthcheck-path\" }}'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output_not_exists
+}
+
+@test "(openresty) healthcheck headers from app.json" {
+  run /bin/bash -c "dokku proxy:set $TEST_APP openresty"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run deploy_app python dokku@$DOKKU_DOMAIN:$TEST_APP setup_openresty_readiness_healthcheck_headers
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "docker inspect $TEST_APP.web.1 --format '{{ index .Config.Labels \"openresty.healthcheck-header.X-Check\" }}'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "dokku"
+
+  run /bin/bash -c "docker inspect $TEST_APP.web.1 --format '{{ index .Config.Labels \"openresty.healthcheck-host\" }}'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "check.dokku.me"
+
+  run /bin/bash -c "docker inspect $TEST_APP.web.1 --format '{{ index .Config.Labels \"openresty.healthcheck-header.Host\" }}'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output_not_exists
+
+  assert_http_localhost_response "http" "$TEST_APP.dokku.me" "80" "" "python/http.server"
+}
+
+@test "(openresty) invalid stored healthcheck path fails restart" {
+  run /bin/bash -c "dokku proxy:set $TEST_APP openresty"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run deploy_app python dokku@$DOKKU_DOMAIN:$TEST_APP setup_openresty_readiness_healthcheck
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "jq '.healthchecks.web[0].path = \"/health check\"' /var/lib/dokku/data/app-json/$TEST_APP/app.json > /var/lib/dokku/data/app-json/$TEST_APP/app.json.tmp && mv /var/lib/dokku/data/app-json/$TEST_APP/app.json.tmp /var/lib/dokku/data/app-json/$TEST_APP/app.json"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku ps:restart $TEST_APP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_failure
+  assert_output_contains "Invalid app.json healthcheck path for openresty" -1
+}
+
+add_openresty_include() {
+  local APP="$1"
+  local APP_REPO_DIR="$2"
+  [[ -z "$APP" ]] && local APP="$TEST_APP"
+  mkdir -p "$APP_REPO_DIR/openresty/http-includes"
+  touch "$APP_REPO_DIR/openresty/http-includes/example.conf"
+  echo "# force the character set to utf-8" >>"$APP_REPO_DIR/openresty/http-includes/example.conf"
+  echo "charset UTF-8;" >>"$APP_REPO_DIR/openresty/http-includes/example.conf"
+
+  mkdir -p "$APP_REPO_DIR/openresty/http-location-includes"
+  touch "$APP_REPO_DIR/openresty/http-location-includes/example.conf"
+  echo "# location-block" >>"$APP_REPO_DIR/openresty/http-location-includes/example.conf"
+}
+
+add_openresty_include_unsafe() {
+  local APP="$1"
+  local APP_REPO_DIR="$2"
+  [[ -z "$APP" ]] && local APP="$TEST_APP"
+
+  mkdir -p "$APP_REPO_DIR/openresty/http-includes"
+  # Create a filename with a space - simpler test that should be rejected by [^a-zA-Z0-9_.-]
+  printf 'charset UTF-8;\n' >"$APP_REPO_DIR/openresty/http-includes/unsafe filename.conf"
+
+  mkdir -p "$APP_REPO_DIR/openresty/http-location-includes"
+  printf '# location\n' >"$APP_REPO_DIR/openresty/http-location-includes/unsafe filename.conf"
+}
+
+setup_openresty_readiness_healthcheck() {
+  local APP="$1"
+  local APP_REPO_DIR="$2"
+  [[ -z "$APP" ]] && local APP="$TEST_APP"
+  APP_REPO_DIR="$(realpath "$APP_REPO_DIR")"
+
+  convert_to_dockerfile "$APP" "$APP_REPO_DIR"
+  mv "$APP_REPO_DIR/app-readiness.json" "$APP_REPO_DIR/app.json"
+}
+
+setup_openresty_readiness_healthcheck_headers() {
+  local APP="$1"
+  local APP_REPO_DIR="$2"
+  [[ -z "$APP" ]] && local APP="$TEST_APP"
+  APP_REPO_DIR="$(realpath "$APP_REPO_DIR")"
+
+  convert_to_dockerfile "$APP" "$APP_REPO_DIR"
+  jq '.healthchecks.web[0].httpHeaders = [{"name": "X-Check", "value": "dokku"}, {"name": "Host", "value": "check.dokku.me"}]' "$APP_REPO_DIR/app-readiness.json" >"$APP_REPO_DIR/app.json"
+}

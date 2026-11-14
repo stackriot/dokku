@@ -18,18 +18,28 @@ func main() {
 
 	var err error
 	switch trigger {
+	case "install":
+		err = proxy.TriggerInstall()
 	case "proxy-is-enabled":
 		appName := flag.Arg(0)
 		err = proxy.TriggerProxyIsEnabled(appName)
 	case "proxy-type":
 		appName := flag.Arg(0)
 		err = proxy.TriggerProxyType(appName)
-	case "post-certs-remove":
+	case "proxy-routes-list":
 		appName := flag.Arg(0)
-		err = proxy.TriggerPostCertsRemove(appName)
-	case "post-certs-update":
+		err = proxy.TriggerProxyRoutesList(appName)
+	case "post-app-clone-setup":
+		oldAppName := flag.Arg(0)
+		newAppName := flag.Arg(1)
+		err = proxy.TriggerPostAppCloneSetup(oldAppName, newAppName)
+	case "post-app-rename-setup":
+		oldAppName := flag.Arg(0)
+		newAppName := flag.Arg(1)
+		err = proxy.TriggerPostAppRenameSetup(oldAppName, newAppName)
+	case "post-delete":
 		appName := flag.Arg(0)
-		err = proxy.TriggerPostCertsUpdate(appName)
+		err = proxy.TriggerPostDelete(appName)
 	case "report":
 		appName := flag.Arg(0)
 		err = proxy.ReportSingleApp(appName, "", "")

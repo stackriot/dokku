@@ -29,13 +29,16 @@ fn-help-content() {
   cat <<help_content
     git:allow-host <host>, Adds a host to known_hosts
     git:auth <host> [<username> <password>], Configures netrc authentication for a given git server
+    git:auth-status <host> [<username> <password>], Reports whether the netrc entry matches the requested state (exit 0 if matches)
     git:from-archive <app> <archive-url> [<git-username> <git-email>], Updates an app's git repository with a given archive file
     git:from-image <app> <docker-image> [<git-username> <git-email>], Updates an app's git repository with a given docker image
-    git:sync [--build] <app> <repository> [<git-ref>], Clone or fetch an app from remote git repo
+    git:load-image <app> <docker-image> [<git-username> <git-email>], Updates an app's git repository with a docker image loaded from stdin
+    git:sync [--build|--build-if-changes] [--skip-deploy-branch] <app> <repository> [<git-ref>], Clone or fetch an app from remote git repo
     git:initialize <app>, Initialize a git repository for an app
+    git:generate-deploy-key, Generates a deploy ssh key
     git:public-key, Outputs the dokku public deploy key
     git:report [<app>] [<flag>], Displays a git report for one or more apps
     git:set <app> <property> (<value>), Set or clear a git property for an app
-    git:unlock <app> [--force], Removes previous git clone folder for new deployment 
+    git:status <app>, show the working tree status for an app
 help_content
 }

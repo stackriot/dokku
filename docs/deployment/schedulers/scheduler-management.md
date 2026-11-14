@@ -1,5 +1,6 @@
 # Scheduler Management
 
+> [!IMPORTANT]
 > New as of 0.26.0
 
 ```
@@ -17,8 +18,6 @@ Dokku supports the following built-in schedulers:
 
 - `scheduler-docker-local`: Schedules apps against the local docker socket and runs containers directly on the Dokku host. See the [docker-local scheduler documentation](/docs/deployment/schedulers/docker-local.md) for more information on how this scheduler functions.
 - `scheduler-null`: Does nothing during the scheduler phase. See the [null scheduler documentation](/docs/deployment/schedulers/null.md) for more information on how this scheduler functions.
-
-See the [alternate schedulers documentation](/docs/deployment/schedulers/alternate-schedulers.md) for more information on other scheduler plugins.
 
 ### Overriding the auto-selected scheduler
 
@@ -46,6 +45,26 @@ The default value may be set by passing an empty value for the option.
 dokku scheduler:set --global selected
 ```
 
+### Setting the app shell
+
+The shell used for `dokku run` and `dokku enter` invocations against an app can be customized via the `shell` property. This is useful for images that ship with a non-default shell - for example, alpine-based images that only have `/bin/sh`.
+
+```shell
+dokku scheduler:set node-js-app shell sh
+```
+
+The `shell` property can also be set globally:
+
+```shell
+dokku scheduler:set --global shell sh
+```
+
+The default value (an empty string, which lets the scheduler pick its own default) may be restored by passing an empty value:
+
+```shell
+dokku scheduler:set node-js-app shell
+```
+
 ### Displaying scheduler reports for an app
 
 You can get a report about the app's scheduler status using the `scheduler:report` command:
@@ -61,13 +80,15 @@ dokku scheduler:report
        Scheduler selected: herokuish
 =====> python-sample scheduler information
        Scheduler computed selected: dockerfile
-       Scheduler global selected: herokuish
+       Scheduler global selected:
        Scheduler selected: dockerfile
 =====> ruby-sample scheduler information
-       Scheduler computed selected: herokuish
-       Scheduler global selected: herokuish
+       Scheduler computed selected: docker-local
+       Scheduler global selected:
        Scheduler selected:
 ```
+
+The `selected` and `global-selected` keys hold the raw per-app and global value respectively, and are empty when nothing has been set. The `computed-selected` key holds the effective value used at deploy time, falling back to the global value (where one has been set) and then to the built-in default of `docker-local`.
 
 You can run the command for a specific app also.
 
@@ -77,6 +98,8 @@ dokku scheduler:report node-js-app
 
 ```
 =====> node-js-app scheduler information
+       Scheduler computed selected:  herokuish
+       Scheduler global selected:
        Scheduler selected: herokuish
 ```
 
@@ -93,26 +116,46 @@ Custom plugins names _must_ have the prefix `scheduler-` or scheduler overriding
 At this time, the following dokku commands are used to implement a complete scheduler.
 
 - `apps:destroy`: stops the app processes on the scheduler
-  - triggers: post-delete, scheduler-register-retired, scheduler-retire
+    - triggers: post-delete, scheduler-register-retired, scheduler-retire
 - `apps:rename`: handles app renaming
-  - triggers: post-app-rename-setup
+    - triggers: post-app-rename-setup
 - `apps:clone`: handles app cloning
-  - triggers: post-app-clone-setup
-- `deploy`: deploys app proceses and checks the status of a deploy
-  - triggers: scheduler-app-status, scheduler-deploy, scheduler-is-deployed, scheduler-logs-failed
+    - triggers: post-app-clone-setup
+- `cron`: generates cron tasks for the app
+    - triggers: scheduler-uses-host-cron, scheduler-cron-write
+- `deploy`: deploys app processes and checks the status of a deploy
+    - triggers: scheduler-app-status, scheduler-deploy, scheduler-is-deployed, scheduler-logs-failed
 - `enter`: enters a running container
-  - triggers: scheduler-enter
+    - triggers: scheduler-enter
 - `logs`: fetches app logs
-  - triggers: scheduler-logs
+    - triggers: scheduler-logs
 - `run`: starts one-off run containers (detached and non-detached) as well as listing run processes
-  - triggers: scheduler-run, scheduler-run-list
+    - triggers: scheduler-run, scheduler-run-list
+- `run:list`: lists running containers
+    - triggers: scheduler-run-list
+- `run:logs`: fetches running container logs
+    - triggers: scheduler-run-logs
 - `ps:stop`: stops app processes
-  - triggers: scheduler-stop
+    - triggers: scheduler-stop, scheduler-cron-write
+- `ps:start`: starts app processes
+    - triggers: scheduler-deploy, scheduler-cron-write
 - `ps:inspect`: outputs inspect output for processes in an app
-  - triggers: scheduler-inspect
+    - triggers: scheduler-inspect
 
 Schedulers may decide to omit some functionality here, or use plugin triggers to supplement config with information from other plugins. Additionally, a scheduler may implement other triggers in order handle any extra processes needed during a deploy.
 
 Schedulers can use any tools available on the system to build the docker image, and may even be used to interact with off-server systems. The only current requirement is that the scheduler must have access to the image built in the build phase. If this is not the case, the registry plugin can be used to push the image to a registry that the scheduler software can access.
 
 Deployment tasks are currently executed directly on the primary Dokku server.
+
+## Properties
+
+### Settable properties
+
+> [!NOTE]
+> The `Report flags` column lists the CLI argument names accepted by `scheduler:report`. The JSON keys emitted by `scheduler:report --format json` are the same names with the leading `--scheduler-` stripped (e.g. `selected`, `global-selected`, `computed-selected`). Legacy keys with the `scheduler-` prefix are also emitted during the 0.38.x deprecation window and will be removed in a future major release.
+
+| Property | Scope | Default | Report flags | Description |
+| --- | --- | --- | --- | --- |
+| `selected` | app + global | `docker-local` | `--scheduler-selected`, `--scheduler-global-selected`, `--scheduler-computed-selected` | Scheduler plugin used to deploy this app (`docker-local`, `k3s`, etc.) |
+| `shell` | app + global | none | `--scheduler-shell`, `--scheduler-global-shell`, `--scheduler-computed-shell` | Shell used by `enter`/`run` commands when entering a container |

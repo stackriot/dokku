@@ -3,16 +3,24 @@ set -eo pipefail
 [[ $DOKKU_TRACE ]] && set -x
 
 trigger-domains-post-app-rename-setup() {
-  declare desc="updates VHOST and URLS files during rename"
+  declare desc="updates VHOST files during rename"
   declare trigger="post-app-rename-setup"
   declare OLD_APP="$1" NEW_APP="$2"
 
-  if [[ -f "$DOKKU_ROOT/$NEW_APP/URLS" ]]; then
-    sed -i -e "s/$OLD_APP/$NEW_APP/g" "$DOKKU_ROOT/$NEW_APP/URLS"
+  if [[ ! -f "$DOKKU_ROOT/$OLD_APP/VHOST" ]]; then
+    return
   fi
-  if [[ -f "$DOKKU_ROOT/$NEW_APP/VHOST" ]]; then
-    sed -i -e "s/$OLD_APP/$NEW_APP/g" "$DOKKU_ROOT/$NEW_APP/VHOST"
+
+  cp -f "$DOKKU_ROOT/$OLD_APP/VHOST" "$DOKKU_ROOT/$NEW_APP/VHOST"
+
+  if [[ ! -f "$DOKKU_ROOT/VHOST" ]]; then
+    return
   fi
+
+  while read -r VHOST || [[ -n "$VHOST" ]]; do
+    [[ -z "$VHOST" ]] && continue
+    sed -i -e "s/${OLD_APP}\.${VHOST}/${NEW_APP}.${VHOST}/g" "$DOKKU_ROOT/$NEW_APP/VHOST"
+  done <"$DOKKU_ROOT/VHOST"
 }
 
 trigger-domains-post-app-rename-setup "$@"

@@ -1,5 +1,6 @@
 # User Management
 
+> [!IMPORTANT]
 > New as of 0.7.0
 
 ```
@@ -34,6 +35,7 @@ The output contains the following information:
 - The `KEY_NAME`.
 - A comma separated list of SSH options under the `SSHCOMMAND_ALLOWED_KEYS` name.
 
+> [!IMPORTANT]
 > New as of 0.20.2
 
 The keys for a specific user may be listed by specifying a second argument to the `ssh-keys:list` command:
@@ -42,7 +44,8 @@ The keys for a specific user may be listed by specifying a second argument to th
 dokku ssh-keys:list admin
 ```
 
-> 0.22.3
+> [!IMPORTANT]
+> New as of 0.22.3
 
 The output format may be specified via the `--format` flag. Supported values include `json` and `text`.
 
@@ -58,7 +61,7 @@ dokku ssh-keys:list --format json admin
 
 ### Adding SSH keys
 
-You can add your public key to Dokku with the `ssh-keys:add` command. The output will be the fingerprint of the SSH key:
+You can add your public key to Dokku with the `ssh-keys:add` command. The path specified must contain your desired public ssh key contents and must exist on the server. Any special characters - such as `~` - are interpreted under the `dokku` user context. The output will be the fingerprint of the SSH key:
 
 ```shell
 dokku ssh-keys:add KEY_NAME path/to/id_rsa.pub
@@ -71,6 +74,24 @@ SHA256:ABC123ABC123+abc123abc123Zabc123abcZ123abc
 `KEY_NAME` is the name you want to use to refer to this particular key. Including the word `admin` in the name will grant the user privileges to add additional keys remotely.
 
 > `KEY_NAME` is a unique name which is used to identify public keys. Attempting to re-use a key name will result in an error. The SSH (Git) user is *always* `dokku`, as this is the system user that the `dokku` binary uses to perform all its actions.
+
+Alternatively, you may pipe the contents of your ssh key via `cat` or `echo` into the `ssh-keys:add` command instead of specifying a path to the ssh key:
+
+```shell
+echo "$CONTENTS_OF_YOUR_PUBLIC_SSH_KEY_HERE" | dokku ssh-keys:add KEY_NAME
+```
+
+```
+SHA256:ABC123ABC123+abc123abc123Zabc123abcZ123abc
+```
+
+```shell
+cat path/to/id_rsa.pub | dokku ssh-keys:add KEY_NAME
+```
+
+```
+SHA256:ABC123ABC123+abc123abc123Zabc123abcZ123abc
+```
 
 Admin users and root can add keys remotely by specifying the `dokku` bin on their `ssh` command:
 
@@ -114,3 +135,9 @@ Use `visudo /etc/sudoers.d/dokku-users`, or `visudo /etc/sudoers` to add the fol
 ```
 %dokku ALL=(ALL:ALL) NOPASSWD:SETENV: /usr/bin/dokku
 ```
+
+The `SETENV:` tag is required. When a user other than `dokku` runs the `dokku` binary, it re-executes
+itself as the `dokku` user and names the environment variables that have to survive that step via
+`sudo --preserve-env=`. Without `SETENV:` those variables are filtered out, and global flags such as
+`--quiet`, `--trace` and `--force` stop taking effect. See
+[Forwarding environment variables](/docs/configuration/environment-variables.md#forwarding-environment-variables).

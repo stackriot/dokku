@@ -1,17 +1,18 @@
 # Plugin Management
 
+> [!IMPORTANT]
 > New as of 0.4.0
 
 ```
 plugin:disable <name>                    # Disable an installed plugin (third-party only)
 plugin:enable <name>                     # Enable a previously disabled plugin
-plugin:install [--core|git-url [--committish tag|branch|commit|--name custom-plugin-name]]           # Optionally download git-url (with custom tag/committish) & run install trigger for active plugins (or only core ones)
+plugin:install [--core|git-url] [--committish branch|commit|tag] [--name custom-plugin-name] [--skip-install-trigger] # Optionally download git-url (and pin to the specified branch/commit/tag) & run install trigger for active plugins (or only core ones)
 plugin:installed <name>                  # Checks if a plugin is installed
 plugin:install-dependencies [--core]     # Run install-dependencies trigger for active plugins (or only core ones)
-plugin:list                              # Print active plugins
+plugin:list [--format stdout|json]       # Print active plugins
 plugin:trigger <args...>.                # Trigger an arbitrary plugin hook
 plugin:uninstall <name>                  # Uninstall a plugin (third-party only)
-plugin:update [name [committish]]        # Optionally update named plugin from git (with custom tag/committish) & run update trigger for active plugins
+plugin:update [name [branch|commit|tag]] # Optionally update named plugin from git (and pin to the specified branch/commit/tag) & run update trigger for active plugins
 ```
 
 ```shell
@@ -35,38 +36,72 @@ dokku plugin:list
 
 ```
 plugn: dev
-  00_dokku-standard    0.26.8 enabled    dokku core standard plugin
-  20_events            0.26.8 enabled    dokku core events logging plugin
-  app-json             0.26.8 enabled    dokku core app-json plugin
-  apps                 0.26.8 enabled    dokku core apps plugin
-  build-env            0.26.8 enabled    dokku core build-env plugin
-  buildpacks           0.26.8 enabled    dokku core buildpacks plugin
-  certs                0.26.8 enabled    dokku core certificate management plugin
-  checks               0.26.8 enabled    dokku core checks plugin
-  common               0.26.8 enabled    dokku core common plugin
-  config               0.26.8 enabled    dokku core config plugin
-  docker-options       0.26.8 enabled    dokku core docker-options plugin
-  domains              0.26.8 enabled    dokku core domains plugin
-  enter                0.26.8 enabled    dokku core enter plugin
-  git                  0.26.8 enabled    dokku core git plugin
-  logs                 0.26.8 enabled    dokku core logs plugin
-  network              0.26.8 enabled    dokku core network plugin
-  nginx-vhosts         0.26.8 enabled    dokku core nginx-vhosts plugin
-  plugin               0.26.8 enabled    dokku core plugin plugin
-  proxy                0.26.8 enabled    dokku core proxy plugin
-  ps                   0.26.8 enabled    dokku core ps plugin
-  repo                 0.26.8 enabled    dokku core repo plugin
-  resource             0.26.8 enabled    dokku core resource plugin
-  scheduler-docker-local 0.26.8 enabled    dokku core scheduler-docker-local plugin
-  shell                0.26.8 enabled    dokku core shell plugin
-  ssh-keys             0.26.8 enabled    dokku core ssh-keys plugin
-  storage              0.26.8 enabled    dokku core storage plugin
-  tags                 0.26.8 enabled    dokku core tags plugin
-  tar                  0.26.8 enabled    dokku core tar plugin
-  trace                0.26.8 enabled    dokku core trace plugin
+  00_dokku-standard    0.38.34 enabled    dokku core standard plugin
+  20_events            0.38.34 enabled    dokku core events logging plugin
+  app-json             0.38.34 enabled    dokku core app-json plugin
+  apps                 0.38.34 enabled    dokku core apps plugin
+  build-env            0.38.34 enabled    dokku core build-env plugin
+  buildpacks           0.38.34 enabled    dokku core buildpacks plugin
+  certs                0.38.34 enabled    dokku core certificate management plugin
+  checks               0.38.34 enabled    dokku core checks plugin
+  common               0.38.34 enabled    dokku core common plugin
+  config               0.38.34 enabled    dokku core config plugin
+  docker-options       0.38.34 enabled    dokku core docker-options plugin
+  domains              0.38.34 enabled    dokku core domains plugin
+  enter                0.38.34 enabled    dokku core enter plugin
+  git                  0.38.34 enabled    dokku core git plugin
+  logs                 0.38.34 enabled    dokku core logs plugin
+  network              0.38.34 enabled    dokku core network plugin
+  nginx-vhosts         0.38.34 enabled    dokku core nginx-vhosts plugin
+  plugin               0.38.34 enabled    dokku core plugin plugin
+  proxy                0.38.34 enabled    dokku core proxy plugin
+  ps                   0.38.34 enabled    dokku core ps plugin
+  repo                 0.38.34 enabled    dokku core repo plugin
+  resource             0.38.34 enabled    dokku core resource plugin
+  scheduler-docker-local 0.38.34 enabled    dokku core scheduler-docker-local plugin
+  shell                0.38.34 enabled    dokku core shell plugin
+  ssh-keys             0.38.34 enabled    dokku core ssh-keys plugin
+  storage              0.38.34 enabled    dokku core storage plugin
+  tags                 0.38.34 enabled    dokku core tags plugin
+  tar                  0.38.34 enabled    dokku core tar plugin
+  trace                0.38.34 enabled    dokku core trace plugin
 ```
 
-> Warning: All plugin commands other than `plugin:list` and `plugin:help` require sudo access and must be run directly from the Dokku server.
+The list can also be emitted as JSON via the `--format json` flag. In addition to the name, version, enabled state, and description shown in the default output, the JSON output includes whether a plugin is a core plugin and - for git-based third-party plugins - the install source (the git remote URL, the currently checked-out commit, and the followed branch). This is useful for tooling that reconstructs a server's set of installed plugins:
+
+```shell
+dokku plugin:list --format json
+```
+
+```json
+[
+  {
+    "name": "apps",
+    "version": "0.38.34",
+    "enabled": true,
+    "core": true,
+    "description": "dokku core apps plugin",
+    "source_url": "",
+    "committish": "",
+    "branch": ""
+  },
+  {
+    "name": "postgres",
+    "version": "1.42.0",
+    "enabled": true,
+    "core": false,
+    "description": "dokku postgres service plugin",
+    "source_url": "https://github.com/dokku/dokku-postgres.git",
+    "committish": "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0",
+    "branch": "master"
+  }
+]
+```
+
+The `source_url`, `committish`, and `branch` fields are only populated for plugins installed from a git repository. They are empty for core plugins as well as for plugins installed from a tarball or a local `file://` path. When a plugin is pinned to a specific commit or tag (a detached checkout), the `branch` field is empty while `committish` still reports the exact commit.
+
+> [!WARNING]
+> All plugin commands other than `plugin:list` and `plugin:help` require sudo access and must be run directly from the Dokku server.
 
 ### Checking if a plugin is installed
 
@@ -77,6 +112,9 @@ dokku plugin:installed postgres
 ```
 
 ### Installing a plugin
+
+> [!NOTE]
+> Plugins installed in this method within a [docker-based installation](/docs/getting-started/install/docker.md) of Dokku do not persist across installs. Please see the [plugin installation section](/docs/getting-started/install/docker.md#plugin-installation) of the docker-based installation docs for further details.
 
 Installing a plugin is easy as well using the `plugin:install` command. This command will also trigger the `install` pluginhook on all existing plugins.
 
@@ -123,6 +161,12 @@ The `--core` flag may also be indicated as the sole argument, though it is only 
 dokku plugin:install --core
 ```
 
+If installing plugins in a Dockerfile, you will want to skip the `install` trigger. This will be run on container boot.
+
+```shell
+dokku plugin:install https://github.com/dokku/smoke-test-plugin.git --name smoke-test-plugin --skip-install-trigger
+```
+
 Finally, all flags may be omitted to trigger the `install` procedures for both core and third-party plugins:
 
 ```shell
@@ -163,6 +207,12 @@ An optional commit SHA-like object may be specified.
 dokku plugin:update postgres 2.0.0
 ```
 
+Any future invocation of `plugin:update` will respect the previously specified SHA-like object. To follow a particular branch again, specify that branch:
+
+```shell
+dokku plugin:update postgres main
+```
+
 ### Uninstalling a plugin
 
 Third party plugins can be uninstalled using the `plugin:uninstall` command:
@@ -198,6 +248,8 @@ dokku plugin:enable postgres
 ```
 -----> Plugin postgres enabled
 ```
+
+Core plugins that were not enabled at install time - such as the nginx-vhosts plugin when the `dokku/nginx_enable` debconf option is set to `false` - can also be enabled this way. Run `dokku plugin:install --core` afterwards so the plugin's install trigger is executed.
 
 ### Triggering a plugin trigger
 

@@ -2,15 +2,42 @@ package common
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"strconv"
 	"strings"
 	"sync"
+
+	"github.com/hashicorp/go-multierror"
 )
 
 // ErrWithExitCode wraps error and exposes an ExitCode method
 type ErrWithExitCode interface {
 	ExitCode() int
+}
+
+// ExitCodeError carries an explicit exit code for a command failure. A blank
+// Message exits with the code without printing anything, which suits commands
+// that report their result through the exit code alone.
+type ExitCodeError struct {
+	// Code is the exit code to terminate with
+	Code int
+
+	// Message is the error text printed to stderr, if any
+	Message string
+}
+
+var _ ErrWithExitCode = (*ExitCodeError)(nil)
+
+// Error returns the error text to print to stderr
+func (e *ExitCodeError) Error() string {
+	return e.Message
+}
+
+// ExitCode returns an exit code to use in case this error bubbles
+// up into an os.Exit() call
+func (e *ExitCodeError) ExitCode() int {
+	return e.Code
 }
 
 type writer struct {
@@ -44,6 +71,30 @@ func (w *writer) Write(bytes []byte) (int, error) {
 	return len(bytes), nil
 }
 
+// PrefixingWriter is a writer that prefixes all writes with a given prefix
+type PrefixingWriter struct {
+	Prefix []byte
+	Writer io.Writer
+}
+
+// Write writes the given bytes to the writer with the prefix
+func (pw *PrefixingWriter) Write(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+
+	// Perform an "atomic" write of a prefix and p to make sure that it doesn't interleave
+	// sub-line when used concurrently with io.PipeWrite.
+	n, err := pw.Writer.Write(append(pw.Prefix, p...))
+	if n > len(p) {
+		// To comply with the io.Writer interface requirements we must
+		// return a number of bytes written from p (0 <= n <= len(p)),
+		// so we are ignoring the length of the prefix here.
+		return len(p), err
+	}
+	return n, err
+}
+
 // LogFail is the failure log formatter
 // prints text to stderr and exits with status 1
 func LogFail(text string) {
@@ -54,7 +105,32 @@ func LogFail(text string) {
 // LogFailWithError is the failure log formatter
 // prints text to stderr and exits with the specified exit code
 func LogFailWithError(err error) {
-	fmt.Fprintln(os.Stderr, fmt.Sprintf(" !     %s", err.Error()))
+	if err == nil {
+		return
+	}
+
+	if merr, ok := err.(*multierror.Error); ok {
+		for _, e := range merr.Errors {
+			fmt.Fprintf(os.Stderr, " !     %s\n", e.Error())
+		}
+	} else {
+		if err.Error() != "" {
+			fmt.Fprintf(os.Stderr, " !     %s\n", err.Error())
+		}
+	}
+	if errExit, ok := err.(ErrWithExitCode); ok {
+		os.Exit(errExit.ExitCode())
+	}
+	os.Exit(1)
+}
+
+// LogFailWithErrorQuiet is the failure log formatter (with quiet option)
+// prints text to stderr and exits with the specified exit code
+// The error message is not printed if DOKKU_QUIET_OUTPUT has any value
+func LogFailWithErrorQuiet(err error) {
+	if os.Getenv("DOKKU_QUIET_OUTPUT") == "" {
+		fmt.Fprintln(os.Stderr, fmt.Sprintf(" !     %s", err.Error()))
+	}
 	if errExit, ok := err.(ErrWithExitCode); ok {
 		os.Exit(errExit.ExitCode())
 	}
@@ -149,22 +225,27 @@ func LogVerboseQuietContainerLogsTail(containerID string, lines int, tail bool) 
 		args = append(args, "--follow")
 	}
 
-	sc := NewShellCmdWithArgs(DockerBin(), args...)
 	var mu sync.Mutex
-	sc.Command.Stdout = &writer{
-		mu:     &mu,
-		source: "stdout",
-	}
-	sc.Command.Stderr = &writer{
-		mu:     &mu,
-		source: "stderr",
-	}
+	result, err := CallExecCommand(ExecCommandInput{
+		Command:            DockerBin(),
+		Args:               args,
+		DisableStdioBuffer: true,
+		StdoutWriter: &writer{
+			mu:     &mu,
+			source: "stdout",
+		},
+		StderrWriter: &writer{
+			mu:     &mu,
+			source: "stderr",
+		},
+	})
 
-	if err := sc.Command.Start(); err != nil {
+	if err != nil {
 		LogExclaim(fmt.Sprintf("Failed to fetch container logs: %s", containerID))
+		return
 	}
 
-	if err := sc.Command.Wait(); err != nil {
+	if !tail && result.ExitCode != 0 {
 		LogExclaim(fmt.Sprintf("Failed to fetch container logs: %s", containerID))
 	}
 }

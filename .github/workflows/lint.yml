@@ -10,52 +10,77 @@ on:
     branches:
       - 'master'
 
+concurrency:
+  group: lint-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   hadolint:
     name: hadolint
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-24.04
     steps:
       - name: Clone
-        uses: actions/checkout@v2
+        uses: actions/checkout@v7
       - name: Run hadolint
-        uses: hadolint/hadolint-action@d7b38582334d9ac11c12021c16f21d63015fa250
-        # v1.6.0 => d7b38582334d9ac11c12021c16f21d63015fa250
+        uses: hadolint/hadolint-action@2332a7b74a6de0dda2e2221d575162eba76ba5e5
+        # v3.0.0 => 4b5806eb9c6bee4954fc0e0cc3ad6175fc9782c1
 
   markdown-lint:
     name: markdown-lint
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-24.04
     steps:
       - name: Clone
-        uses: actions/checkout@v2
-      - name: Run markdown-lint
-        uses: avto-dev/markdown-lint@04d43ee9191307b50935a753da3b775ab695eceb
-        # v1.5.0 => 04d43ee9191307b50935a753da3b775ab695eceb
+        uses: actions/checkout@v7
+      - name: Setup node
+        uses: actions/setup-node@v7
         with:
-          config: '.github/linters/.markdown-lint.yml'
-          args: './README.md'
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: '.github/workflows/lint.yml'
+      - name: Install markdownlint-cli
+        run: npm install -g markdownlint-cli@0.50.0
+      - name: Run markdown-lint
+        run: markdownlint -c .github/linters/.markdown-lint.yml --ignore tests/apps '**/*.md'
+
+  packer:
+    name: packer
+    runs-on: ubuntu-24.04
+    if: github.event.pull_request.user.login != 'dependabot[bot]'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+      - name: Setup packer
+        uses: hashicorp/setup-packer@main
+        with:
+          version: latest
+      - name: Run packer init
+        run: "make image/init/digitalocean"
+        env:
+          PACKER_GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Run `packer validate`
+        env:
+          DIGITALOCEAN_TOKEN: ${{ secrets.DIGITALOCEAN_TOKEN }}
+        run: "make image/validate/digitalocean"
 
   shellcheck:
     name: shellcheck
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-24.04
     steps:
       - name: Clone
-        uses: actions/checkout@v2
+        uses: actions/checkout@v7
       - name: Run shellcheck
-        uses: ludeeus/action-shellcheck@94e0aab03ca135d11a35e5bfc14e6746dc56e7e9
+        uses: ludeeus/action-shellcheck@00cae500b08a931fb5698e11e79bfbd38e612a38
         # 1.1.0 => 94e0aab03ca135d11a35e5bfc14e6746dc56e7e9
-        env:
-          # keep in sync with tests/shellcheck-exclude
-          SHELLCHECK_OPTS: -e SC1001 -e SC1003 -e SC1090 -e SC1091 -e SC1117 -e SC2029 -e SC2030 -e SC2031 -e SC2034 -e SC2046 -e SC2064 -e SC2068 -e SC2086 -e SC2119 -e SC2120 -e SC2128 -e SC2148 -e SC2153 -e SC2154 -e SC2155 -e SC2162 -e SC2174 -e SC2179 -e SC2191 -e SC2199 -e SC2207 -e SC2219 -e SC2220 -e SC2230 -e SC2231 -e SC2235 -e SC2267 -e SC2295
 
   shfmt:
     name: shfmt
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-24.04
     steps:
       - name: Clone
-        uses: actions/checkout@v2
+        uses: actions/checkout@v7
       - name: Run shfmt
-        uses: luizm/action-sh-checker@7f44869033b40ee4ffe7dc76c87a1bc66e3d025a
-        # v0.3.0 => 7f44869033b40ee4ffe7dc76c87a1bc66e3d025a
+        uses: luizm/action-sh-checker@883217215b11c1fabbf00eb1a9a041f62d74c744
+        # v0.5.0 => edd0e45ecff35b05f162052b50df50976c1b74fc
         env:
           SHFMT_OPTS: -l -bn -ci -i 2 -d
         with:
@@ -63,12 +88,12 @@ jobs:
 
   yamllint:
     name: yamllint
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-24.04
     steps:
       - name: Clone
-        uses: actions/checkout@v2
+        uses: actions/checkout@v7
       - name: Run yamllint
-        uses: ibiqlik/action-yamllint@ed2b6e911569708ed121c14b87d513860a7e36a7
-        # v3.0.4 => ed2b6e911569708ed121c14b87d513860a7e36a7
+        uses: ibiqlik/action-yamllint@2576378a8e339169678f9939646ee3ee325e845c
+        # v3.1.1 => 2576378a8e339169678f9939646ee3ee325e845c
         with:
           config_file: '.github/linters/.yamllint.yml'

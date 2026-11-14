@@ -20,6 +20,9 @@ teardown() {
   echo "output: $output"
   echo "status: $status"
   assert_success
+  assert_output_contains "Executing predeploy task from app.json: touch /app/predeploy.test"
+  assert_output_contains "Executing postdeploy task from app.json in ephemeral container: touch /app/postdeploy.test"
+  assert_output_contains "Executing prebuild task from app.json in ephemeral container: touch /app/prebuild.test" 0
 
   run docker inspect "${TEST_APP}.web.1" --format "{{json .Config.Cmd}}"
   echo "output: $output"
@@ -37,22 +40,24 @@ teardown() {
   echo "status: $status"
   assert_success
 
-  CID=$(docker ps -a -q  -f "ancestor=dokku/${TEST_APP}" -f "label=dokku_phase_script=postdeploy")
-  DOCKER_COMMIT_LABEL_ARGS=("--change" "LABEL org.label-schema.schema-version=1.0" "--change" "LABEL org.label-schema.vendor=dokku" "--change" "LABEL com.dokku.app-name=$TEST_APP")
-  IMAGE_ID=$(docker commit "${DOCKER_COMMIT_LABEL_ARGS[@]}" $CID dokku-test/${TEST_APP})
-  run /bin/bash -c "docker run --rm $IMAGE_ID ls /app/postdeploy.test"
+  run /bin/bash -c "dokku run $TEST_APP ls /app/postdeploy.test"
   echo "output: $output"
   echo "status: $status"
-  assert_success
+  assert_failure
 }
 
 @test "(app-json) app.json scripts postdeploy" {
-  run deploy_app python dokku@dokku.me:$TEST_APP add_postdeploy_command
+  run /bin/bash -c "dokku app-json:set $TEST_APP appjson-path app-heroku-postdeploy.json"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run deploy_app python dokku@$DOKKU_DOMAIN:$TEST_APP
   echo "output: $output"
   echo "status: $status"
   assert_success
   assert_output_contains "touch /app/heroku-postdeploy.test"
-  assert_output_contains "python3 release.py"
+  assert_output_contains "python3 -u release.py"
 }
 
 @test "(app-json) app.json scripts missing" {
@@ -73,7 +78,7 @@ teardown() {
   echo "status: $status"
   assert_success
 
-  run deploy_app python dokku@dokku.me:$TEST_APP add_requirements_txt
+  run deploy_app python dokku@$DOKKU_DOMAIN:$TEST_APP add_requirements_txt
   echo "output: $output"
   echo "status: $status"
   assert_success
@@ -94,12 +99,17 @@ teardown() {
   echo "status: $status"
   assert_success
 
-  run /bin/bash -c "dokku config:set --no-restart $TEST_APP DOKKU_CNB_EXPERIMENTAL=1 SECRET_KEY=fjdkslafjdk"
+  run /bin/bash -c "dokku config:set --no-restart $TEST_APP SECRET_KEY=fjdkslafjdk"
   echo "output: $output"
   echo "status: $status"
   assert_success
 
-  run deploy_app python dokku@dokku.me:$TEST_APP add_requirements_txt
+  run /bin/bash -c "dokku builder:set $TEST_APP selected pack"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run deploy_app python dokku@$DOKKU_DOMAIN:$TEST_APP add_requirements_txt_cnb
   echo "output: $output"
   echo "status: $status"
   assert_success
@@ -129,12 +139,12 @@ teardown() {
     assert_success
   fi
 
-  run /bin/bash -c "dokku config:set $TEST_APP SECRET_KEY_BASE=derp OTP_SECRET=1234"
+  run /bin/bash -c "dokku config:set $TEST_APP SECRET_KEY_BASE=derp OTP_SECRET=1234 LOCAL_DOMAIN=dokku.me"
   echo "output: $output"
   echo "status: $status"
   assert_success
 
-  run /bin/bash -c "dokku postgres:create $TEST_APP $TEST_APP"
+  run /bin/bash -c "dokku postgres:create $TEST_APP"
   echo "output: $output"
   echo "status: $status"
   assert_success
@@ -144,7 +154,7 @@ teardown() {
   echo "status: $status"
   assert_success
 
-  run /bin/bash -c "dokku redis:create $TEST_APP $TEST_APP"
+  run /bin/bash -c "dokku redis:create $TEST_APP"
   echo "output: $output"
   echo "status: $status"
   assert_success
@@ -169,19 +179,19 @@ teardown() {
   echo "status: $status"
   assert_success
 
-  run /bin/bash -c "dokku --force postgres:destroy $TEST_APP"
+  run /bin/bash -c "dokku postgres:destroy $TEST_APP --force"
   echo "output: $output"
   echo "status: $status"
   assert_success
 
-  run /bin/bash -c "dokku --force redis:destroy $TEST_APP"
+  run /bin/bash -c "dokku redis:destroy $TEST_APP --force"
   echo "output: $output"
   echo "status: $status"
   assert_success
 }
 
 @test "(app-json:set)" {
-  run deploy_app python
+  run deploy_app python dokku@$DOKKU_DOMAIN:$TEST_APP copy_app_json_to_sub_app
   echo "output: $output"
   echo "status: $status"
   assert_success
@@ -219,4 +229,146 @@ teardown() {
   assert_success
   assert_output_contains "touch /app/predeploy.test"
   assert_output_contains "touch /app/predeploy2.test" 0
+
+  run /bin/bash -c "dokku builder:set $TEST_APP build-dir sub-app"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku ps:rebuild $TEST_APP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output_contains "touch /app/predeploy.test" 0
+  assert_output_contains "touch /app/predeploy2.test"
+
+  run /bin/bash -c "dokku app-json:set $TEST_APP appjson-path app3.json"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku ps:rebuild $TEST_APP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output_contains "touch /app/predeploy.test" 0
+  assert_output_contains "touch /app/predeploy2.test" 0
+  assert_output_contains "touch /app/predeploy3.test"
+}
+
+@test "(app-json:report) appjson-path round-trip" {
+  run /bin/bash -c "dokku app-json:set $TEST_APP appjson-path app2.json"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku app-json:report $TEST_APP --app-json-appjson-path"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "app2.json"
+
+  run /bin/bash -c "dokku app-json:report $TEST_APP --app-json-computed-appjson-path"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "app2.json"
+
+  run /bin/bash -c "dokku app-json:report $TEST_APP --app-json-global-appjson-path"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output ""
+
+  run /bin/bash -c "dokku app-json:report $TEST_APP --format json"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output_contains '"app-json-appjson-path":"app2.json"'
+  assert_output_contains '"app-json-computed-appjson-path":"app2.json"'
+  assert_output_contains '"app-json-global-appjson-path":""'
+  assert_output_contains '"appjson-path":"app2.json"'
+  assert_output_contains '"computed-appjson-path":"app2.json"'
+  assert_output_contains '"global-appjson-path":""'
+  assert_output_contains "app-json-selected" 0
+
+  run /bin/bash -c "dokku app-json:report $TEST_APP --app-json-selected"
+  echo "output: $output"
+  echo "status: $status"
+  assert_failure
+  assert_output_contains "Invalid flag passed"
+
+  run /bin/bash -c "dokku app-json:set $TEST_APP appjson-path"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku app-json:report $TEST_APP --app-json-appjson-path"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output ""
+
+  run /bin/bash -c "dokku app-json:report $TEST_APP --app-json-computed-appjson-path"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "app.json"
+}
+
+@test "(app-json:report) appjson-path raw vs computed vs global" {
+  run /bin/bash -c "dokku app-json:set --global appjson-path"
+  assert_success
+
+  run /bin/bash -c "dokku app-json:report $TEST_APP --app-json-appjson-path"
+  assert_success
+  assert_output_not_exists
+
+  run /bin/bash -c "dokku app-json:report $TEST_APP --app-json-global-appjson-path"
+  assert_success
+  assert_output_not_exists
+
+  run /bin/bash -c "dokku app-json:report $TEST_APP --app-json-computed-appjson-path"
+  assert_success
+  assert_output "app.json"
+
+  run /bin/bash -c "dokku app-json:set --global appjson-path app.global.json"
+  assert_success
+
+  run /bin/bash -c "dokku app-json:report $TEST_APP --app-json-global-appjson-path"
+  assert_success
+  assert_output "app.global.json"
+
+  run /bin/bash -c "dokku app-json:report $TEST_APP --app-json-computed-appjson-path"
+  assert_success
+  assert_output "app.global.json"
+
+  run /bin/bash -c "dokku app-json:set $TEST_APP appjson-path app.app.json"
+  assert_success
+
+  run /bin/bash -c "dokku app-json:report $TEST_APP --app-json-appjson-path"
+  assert_success
+  assert_output "app.app.json"
+
+  run /bin/bash -c "dokku app-json:report $TEST_APP --app-json-global-appjson-path"
+  assert_success
+  assert_output "app.global.json"
+
+  run /bin/bash -c "dokku app-json:report $TEST_APP --app-json-computed-appjson-path"
+  assert_success
+  assert_output "app.app.json"
+
+  run /bin/bash -c "dokku app-json:set $TEST_APP appjson-path"
+  assert_success
+
+  run /bin/bash -c "dokku app-json:set --global appjson-path"
+  assert_success
+}
+
+copy_app_json_to_sub_app() {
+  local APP="$1"
+  local APP_REPO_DIR="$2"
+  [[ -z "$APP" ]] && local APP="$TEST_APP"
+  cp "$APP_REPO_DIR/app2.json" "$APP_REPO_DIR/sub-app/app.json"
+  cp "$APP_REPO_DIR/app3.json" "$APP_REPO_DIR/sub-app/app3.json"
 }

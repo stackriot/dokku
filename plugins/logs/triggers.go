@@ -3,20 +3,18 @@ package logs
 import (
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 
 	"github.com/dokku/dokku/plugins/common"
 	dockeroptions "github.com/dokku/dokku/plugins/docker-options"
-
-	sh "github.com/codeskyblue/go-sh"
 )
 
 // TriggerDockerArgsProcessDeploy outputs the logs plugin docker options for an app
 func TriggerDockerArgsProcessDeploy(appName string) error {
-	stdin, err := ioutil.ReadAll(os.Stdin)
+	stdin, err := io.ReadAll(os.Stdin)
 	if err != nil {
 		return err
 	}
@@ -47,9 +45,12 @@ func TriggerDockerArgsProcessDeploy(appName string) error {
 	}
 
 	if !hasDriverOpt {
-		b, _ := sh.Command(common.DockerBin(), "system", "info", "--format", "{{ .LoggingDriver }}").Output()
-		output := strings.TrimSpace(string(b[:]))
-		if !allowedDrivers[output] {
+		result, _ := common.CallExecCommand(common.ExecCommandInput{
+			Command: common.DockerBin(),
+			Args:    []string{"system", "info", "--format", "{{ .LoggingDriver }}"},
+		})
+
+		if !allowedDrivers[result.StdoutContents()] {
 			ignoreMaxSize = true
 		}
 	}
@@ -69,18 +70,13 @@ func TriggerDockerArgsProcessDeploy(appName string) error {
 	return nil
 }
 
-// TriggerInstall initializes app restart policies
+// TriggerInstall initializes log configuration
 func TriggerInstall() error {
 	if err := common.PropertySetup("logs"); err != nil {
 		return fmt.Errorf("Unable to install the logs plugin: %s", err.Error())
 	}
 
-	directory := filepath.Join(common.MustGetEnv("DOKKU_LIB_ROOT"), "data", "logs")
-	if err := os.MkdirAll(directory, 0755); err != nil {
-		return err
-	}
-
-	if err := common.SetPermissions(directory, 0755); err != nil {
+	if err := common.SetupAppData("logs"); err != nil {
 		return err
 	}
 
@@ -89,11 +85,10 @@ func TriggerInstall() error {
 		return err
 	}
 
-	if err := common.SetPermissions(logDirectory, 0755); err != nil {
-		return err
-	}
-
-	return nil
+	return common.SetPermissions(common.SetPermissionInput{
+		Filename: logDirectory,
+		Mode:     os.FileMode(0755),
+	})
 }
 
 // TriggerLogsGetProperty writes the logs key to stdout for a given app container
@@ -111,17 +106,30 @@ func TriggerLogsGetProperty(appName string, key string) error {
 	return nil
 }
 
-// TriggerPostAppCloneSetup creates new logs files
+// TriggerPostAppCloneSetup creates new logs files and regenerates the vector
+// config so that the clone gets a source of its own for the sink it inherited
 func TriggerPostAppCloneSetup(oldAppName string, newAppName string) error {
 	err := common.PropertyClone("logs", oldAppName, newAppName)
 	if err != nil {
 		return err
 	}
 
+	if err := common.CloneAppData("logs", oldAppName, newAppName); err != nil {
+		return err
+	}
+
+	regenerateVectorConfig()
 	return nil
 }
 
-// TriggerPostAppRenameSetup renames logs files
+// TriggerPostAppRename removes the old app data
+func TriggerPostAppRename(oldAppName string, newAppName string) error {
+	return common.MigrateAppDataDirectory("logs", oldAppName, newAppName)
+}
+
+// TriggerPostAppRenameSetup renames logs files and regenerates the vector config.
+// Both app roots exist at this point, but the old app no longer has any logs
+// properties, so it drops out of the generated config.
 func TriggerPostAppRenameSetup(oldAppName string, newAppName string) error {
 	if err := common.PropertyClone("logs", oldAppName, newAppName); err != nil {
 		return err
@@ -131,10 +139,32 @@ func TriggerPostAppRenameSetup(oldAppName string, newAppName string) error {
 		return err
 	}
 
+	if err := common.CloneAppData("logs", oldAppName, newAppName); err != nil {
+		return err
+	}
+
+	regenerateVectorConfig()
 	return nil
 }
 
-// TriggerPostDelete destroys the logs property for a given app container
+// TriggerPostCreate ensures apps have the correct data directory structure
+func TriggerPostCreate(appName string) error {
+	return common.CreateAppDataDirectory("logs", appName)
+}
+
+// TriggerPostDelete destroys the logs property for a given app container and
+// regenerates the vector config. The regeneration runs after the properties are
+// destroyed so that the app drops out of the config even though its app root is
+// only removed later in the destroy flow.
 func TriggerPostDelete(appName string) error {
-	return common.PropertyDestroy("logs", appName)
+	dataErr := common.RemoveAppDataDirectory("logs", appName)
+	propertyErr := common.PropertyDestroy("logs", appName)
+
+	regenerateVectorConfig()
+
+	if dataErr != nil {
+		return dataErr
+	}
+
+	return propertyErr
 }

@@ -2,7 +2,7 @@ package resource
 
 import (
 	"fmt"
-	"io/ioutil"
+	"io"
 	"os"
 	"strings"
 
@@ -11,7 +11,7 @@ import (
 
 // TriggerDockerArgsProcessDeploy outputs the process-specific docker options
 func TriggerDockerArgsProcessDeploy(appName string, processType string) error {
-	stdin, err := ioutil.ReadAll(os.Stdin)
+	stdin, err := io.ReadAll(os.Stdin)
 	if err != nil {
 		return err
 	}
@@ -71,21 +71,114 @@ func TriggerDockerArgsProcessDeploy(appName string, processType string) error {
 		}
 	}
 
+	var args strings.Builder
 	for key, value := range limits {
 		if value == "" {
 			continue
 		}
-		fmt.Printf(" --%s=%s ", key, value)
+		value, err := formatResourceValueForDocker(key, value)
+		if err != nil {
+			return fmt.Errorf("Unable to apply resource limits for %s: %w", appName, err)
+		}
+		fmt.Fprintf(&args, " --%s=%s ", key, value)
 	}
 
 	for key, value := range reservations {
 		if value == "" {
 			continue
 		}
-		fmt.Printf(" --%s-reservation=%s ", key, value)
+		value, err := formatResourceValueForDocker(key, value)
+		if err != nil {
+			return fmt.Errorf("Unable to apply resource reservations for %s: %w", appName, err)
+		}
+		fmt.Fprintf(&args, " --%s-reservation=%s ", key, value)
 	}
 
+	fmt.Print(args.String())
 	fmt.Print(string(stdin))
+	return nil
+}
+
+// TriggerDockerArgsProcessBuild outputs build-phase docker options for a builder
+func TriggerDockerArgsProcessBuild(appName string, builderType string) error {
+	stdin, err := io.ReadAll(os.Stdin)
+	if err != nil {
+		return err
+	}
+
+	if os.Getenv("DOKKU_OMIT_RESOURCE_ARGS") == "1" {
+		fmt.Print(string(stdin))
+		return nil
+	}
+
+	allowed := validBuildLimitsForBuilder(builderType)
+	if len(allowed) == 0 {
+		fmt.Print(string(stdin))
+		return nil
+	}
+
+	resources, err := common.PropertyGetAll("resource", appName)
+	if err != nil {
+		fmt.Print(string(stdin))
+		return nil
+	}
+
+	limits := make(map[string]string)
+	prefix := "build.limit."
+	for key, value := range resources {
+		if !strings.HasPrefix(key, prefix) {
+			continue
+		}
+		resourceKey := strings.TrimPrefix(key, prefix)
+		if !allowed[resourceKey] {
+			continue
+		}
+
+		flagName := resourceKey
+		if resourceKey == "cpu" {
+			flagName = "cpus"
+		}
+		if resourceKey == "nvidia-gpu" {
+			flagName = "gpus"
+		}
+		limits[flagName] = value
+	}
+
+	var args strings.Builder
+	for key, value := range limits {
+		if value == "" {
+			continue
+		}
+		value, err := formatResourceValueForDocker(key, value)
+		if err != nil {
+			return fmt.Errorf("Unable to apply build resource limits for %s: %w", appName, err)
+		}
+		fmt.Fprintf(&args, " --%s=%s ", key, value)
+	}
+
+	fmt.Print(args.String())
+	fmt.Print(string(stdin))
+	return nil
+}
+
+// validBuildLimitsForBuilder returns the resource keys (in property-key form)
+// that the named builder can apply during the build phase. An empty map means
+// the builder does not support build-phase resource limits.
+func validBuildLimitsForBuilder(builderType string) map[string]bool {
+	switch builderType {
+	case "herokuish":
+		return map[string]bool{
+			"cpu":         true,
+			"memory":      true,
+			"memory-swap": true,
+			"nvidia-gpu":  true,
+		}
+	case "dockerfile":
+		return map[string]bool{
+			"memory":      true,
+			"memory-swap": true,
+		}
+	}
 	return nil
 }
 

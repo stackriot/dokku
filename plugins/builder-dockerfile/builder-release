@@ -12,20 +12,31 @@ trigger-builder-dockerfile-builder-release() {
     return
   fi
 
-  local DOCKER_BUILD_LABEL_ARGS="--label=org.label-schema.schema-version=1.0 --label=org.label-schema.vendor=dokku --label=com.dokku.app-name=$APP  --label=com.dokku.image-stage=release --label=dokku"
-
-  plugn trigger pre-release-dockerfile "$APP" "$IMAGE_TAG"
+  local IMAGE=$(get_app_image_name "$APP" "$IMAGE_TAG")
+  if fn-plugn-trigger-exists "pre-release-dockerfile"; then
+    dokku_log_warn "Deprecated: please upgrade plugin to use 'pre-release-builder' plugin trigger instead of pre-release-dockerfile"
+    plugn trigger pre-release-dockerfile "$APP" "$IMAGE_TAG"
+  fi
+  plugn trigger pre-release-builder "$BUILDER_TYPE" "$APP" "$IMAGE"
 
   TMP_WORK_DIR="$(mktemp -d "/tmp/dokku-${DOKKU_PID}-${FUNCNAME[0]}.XXXXXX")"
   trap "rm -rf '$TMP_WORK_DIR' >/dev/null" RETURN INT TERM EXIT
 
-  local IMAGE=$(get_app_image_name "$APP" "$IMAGE_TAG")
-  if ! suppress_output "$DOCKER_BIN" image build "${DOCKER_BUILD_LABEL_ARGS[@]}" $DOKKU_GLOBAL_BUILD_ARGS -f "$PLUGIN_AVAILABLE_PATH/builder-dockerfile/dockerfiles/builder-release.Dockerfile" --build-arg APP_IMAGE="$IMAGE" -t $IMAGE "$TMP_WORK_DIR"; then
+  local DOCKER_BUILD_ARGS=("--label=org.label-schema.schema-version=1.0" "--label=org.label-schema.vendor=dokku" "--label=com.dokku.app-name=$APP" "--label=com.dokku.image-stage=release" "--label=dokku")
+
+  if fn-force-arm64-image "$IMAGE"; then
+    dokku_log_warn "Detected linux/amd64 image, forcing --platform=linux/amd64"
+    DOCKER_BUILD_ARGS+=("--platform=linux/amd64")
+  fi
+
+  local DOCKER_CONFIG
+  DOCKER_CONFIG="$(fn-registry-docker-config-dir "$APP")"
+  [[ -n "$DOCKER_CONFIG" ]] && export DOCKER_CONFIG
+  if ! suppress_output "$DOCKER_BIN" image build "${DOCKER_BUILD_ARGS[@]}" $DOKKU_GLOBAL_BUILD_ARGS -f "$PLUGIN_AVAILABLE_PATH/builder-dockerfile/dockerfiles/builder-release.Dockerfile" --build-arg APP_IMAGE="$IMAGE" -t "$IMAGE" "$TMP_WORK_DIR"; then
     dokku_log_warn "Failure injecting docker labels on image"
     return 1
   fi
 
-  plugn trigger post-release-dockerfile "$APP" "$IMAGE_TAG"
   plugn trigger post-release-builder "$BUILDER_TYPE" "$APP" "$IMAGE"
 }
 

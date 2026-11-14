@@ -3,19 +3,28 @@ set -eo pipefail
 
 log-info() {
   declare desc="Log info formatter"
-  echo "    $*" 1>&2
+  echo "       $*" 1>&2
 }
 
 log-fail() {
   declare desc="Log fail formatter"
-  echo "!   $*" 1>&2
+  echo " !     $*" 1>&2
   exit 1
+}
+
+log-warn() {
+  declare desc="Log fail formatter"
+  echo " !     $*" 1>&2
 }
 
 support-userns() {
   chown 0:0 /usr/bin/sudo
   chmod 4755 /usr/bin/sudo
-  chown 0:0 /usr/lib/sudo/sudoers.so
+  if [[ -f /usr/lib/sudo/sudoers.so ]]; then
+    chown 0:0 /usr/lib/sudo/sudoers.so
+  elif [[ -f /usr/libexec/sudo/sudoers.so ]]; then
+    chown 0:0 /usr/libexec/sudo/sudoers.so
+  fi
   chown -R 0:0 /etc/sudoers
   chown -R 0:0 /etc/sudoers.d
   chown -R 0:0 /run/sshd
@@ -26,30 +35,61 @@ main() {
 
   support-userns
 
+  rm -f /var/run/dokku/ready
+  mkdir -p /var/run/dokku
+
   if [[ ! -d /mnt/dokku ]]; then
     log-info "Creating missing /mnt/dokku"
     mkdir -p /mnt/dokku
   fi
 
-  directories=("/etc/ssh" "/home/dokku" "/var/lib/dokku/config" "/var/lib/dokku/data")
+  directories=("/etc/ssh" "/home/dokku" "/var/lib/dokku/config" "/var/lib/dokku/data" "/var/lib/dokku/services")
   for dir in "${directories[@]}"; do
     if [[ ! -e "$dir" ]]; then
       log-info "Copying ${dir} skel into place"
       mkdir -p "/mnt/dokku${dir}"
-      rsync -a "/skel${dir}/" "${dir}/" || log-fail "Unable to copy ${dir} skel into place"
+      if [[ -d "/skel${dir}" ]]; then
+        rsync -a "/skel${dir}/" "${dir}/" || log-fail "Unable to copy ${dir} skel into place"
+      fi
     fi
 
     # chown mount directories to "dokku:dokku"
-    if [[ "$dir" != "/etc/ssh" ]]; then
+    if [[ "$dir" == "/var/lib/dokku/services" ]]; then
+      chown dokku:dokku /var/lib/dokku/services
+    elif [[ "$dir" != "/etc/ssh" ]]; then
       find "$dir" -print0 | xargs -0 chown -h dokku:dokku
     fi
   done
 
+  touch /etc/default/dokku
+  echo "export DOKKU_INIT_SYSTEM=sv" >>/etc/default/dokku
+  if [[ -x /usr/local/bin/docker ]]; then
+    echo "export DOCKER_BIN=/usr/local/bin/docker" >>/etc/default/dokku
+  fi
+
+  if [[ -n "$DOKKU_HOST_ROOT" ]]; then
+    echo "export DOKKU_HOST_ROOT=$DOKKU_HOST_ROOT" >>/etc/default/dokku
+    chown dokku:dokku /etc/default/dokku
+  fi
+
+  if [[ -n "$DOKKU_LIB_HOST_ROOT" ]]; then
+    echo "export DOKKU_LIB_HOST_ROOT=$DOKKU_LIB_HOST_ROOT" >>/etc/default/dokku
+    chown dokku:dokku /etc/default/dokku
+  fi
+
   if [[ -f /mnt/dokku/plugin-list ]]; then
     while read line; do
-      dokku plugin:install "$(echo "$line" | awk '{print $2}')" "$(echo "$line" | cut -d':' -f1)"
+      local plugin_name="$(echo "$line" | awk -F: '{print $1}')"
+      if dokku plugin:installed "$plugin_name"; then
+        log-warn "Skipping already installed plugin: $plugin_name"
+      else
+        dokku plugin:install "$(echo "$line" | awk -F': ' '{print $2}')" --name "$plugin_name"
+      fi
     done </mnt/dokku/plugin-list
   fi
+
+  # run core install triggers to force create any folders that may be missing
+  dokku plugin:install
 
   if [[ -n "$DOKKU_HOSTNAME" ]]; then
     echo "dokku dokku/hostname string $DOKKU_HOSTNAME" | debconf-set-selections
@@ -57,16 +97,8 @@ main() {
     dokku --quiet domains:set-global "$DOKKU_HOSTNAME"
   fi
 
-  if [[ -x /usr/local/bin/docker ]]; then
-    mkdir -p /home/dokku/.dokkurc
-    echo "export DOCKER_BIN=/usr/local/bin/docker" >"/home/dokku/.dokkurc/DOCKER_BIN"
-  fi
-
-  if [[ -n "$DOKKU_HOST_ROOT" ]]; then
-    touch /etc/default/dokku
-    echo "export DOKKU_HOST_ROOT=$DOKKU_HOST_ROOT" >>/etc/default/dokku
-    chown dokku:dokku /etc/default/dokku
-  fi
+  echo "dokku dokku/skip_key_file boolean true" | debconf-set-selections
+  echo "dokku dokku/key_file string /root/.ssh/id_rsa.pub" | debconf-set-selections
 
   NGINX_ROOT="/etc/nginx"
   if [[ -x /usr/bin/openresty ]]; then

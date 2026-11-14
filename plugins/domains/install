@@ -8,9 +8,9 @@ trigger-domains-install() {
   declare trigger="install"
 
   shopt -s nullglob
-  for app in $DOKKU_ROOT/*/CONTAINER; do
-    APP=$(basename "$(dirname "$app")")
-    domains_setup "$APP"
+  for app in $(dokku_apps "false" 2>/dev/null); do
+    domains_setup "$app"
+    rm -f "$DOKKU_ROOT/$APP/URLS"
   done
 }
 

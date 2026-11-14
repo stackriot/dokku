@@ -16,8 +16,13 @@ main() {
     exit 1
   fi
 
-  if [[ "$CHOWN_ID" != "32767" ]] && [[ "$CHOWN_ID" != "1000" ]] && [[ "$CHOWN_ID" != "2000" ]]; then
-    echo " !     Unsupported chown permissions. Supported values: 32767, 1000, 2000"
+  if [[ ! "$CHOWN_ID" =~ ^[0-9]+$ ]]; then
+    echo " !     Unsupported chown permissions. Value must be a non-negative integer." 1>&2
+    exit 1
+  fi
+
+  if ((CHOWN_ID > 65535 && (CHOWN_ID < 165536 || CHOWN_ID > 231071))); then
+    echo " !     Unsupported chown permissions. Supported values: 0-65535 (and user namespace offset variants, 165536-231071)" 1>&2
     exit 1
   fi
 

@@ -15,32 +15,47 @@ teardown() {
 @test "(init) buildpack" {
   source "$PLUGIN_CORE_AVAILABLE_PATH/common/functions"
   local APP="zombies-buildpack"
-  deploy_app "$APP"
+  run deploy_app "$APP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
   local CIDS=$(get_app_container_ids "$APP")
 
-  run "$DOCKER_BIN" container top "$CIDS"
+  run /bin/bash -c "$DOCKER_BIN container top $CIDS"
   echo "output: $output"
-  assert_output_contains "<defunct>" "0"
+  echo "status: $status"
+  assert_output_not_contains "<defunct>"
 }
 
 @test "(init) dockerfile no tini" {
   source "$PLUGIN_CORE_AVAILABLE_PATH/common/functions"
   local APP="zombies-dockerfile-no-tini"
-  deploy_app "$APP"
+  run deploy_app "$APP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
   local CIDS=$(get_app_container_ids "$APP")
 
-  run "$DOCKER_BIN" container top "$CIDS"
+  run /bin/bash -c "$DOCKER_BIN container top $CIDS"
   echo "output: $output"
-  assert_output_contains "<defunct>" "0"
+  echo "status: $status"
+  assert_output_not_contains "<defunct>"
 }
 
 @test "(init) dockerfile with tini" {
   source "$PLUGIN_CORE_AVAILABLE_PATH/common/functions"
   local APP="zombies-dockerfile-tini"
-  deploy_app "$APP"
+  run deploy_app "$APP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
   local CIDS=$(get_app_container_ids "$APP")
 
-  run "$DOCKER_BIN" container top "$CIDS"
+  run /bin/bash -c "$DOCKER_BIN container top $CIDS"
   echo "output: $output"
-  assert_output_contains "<defunct>" "0"
+  echo "status: $status"
+  assert_output_not_contains "<defunct>"
 }

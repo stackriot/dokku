@@ -1,6 +1,7 @@
 # DNS Configuration
 
-> Note: This is a work in progress.
+> [!NOTE]
+> This is a work in progress.
 
 ## DNS Versions
 
@@ -65,7 +66,7 @@ If everything is working correctly, you should also be able to query for any oth
 
 If they all return your IP address, you have set DNS up properly for dokku.  You should also be able to `ssh root@myserver.example.tld` and access your server.
 
-Proceed with the setup instructions in the [installation documentation](/docs/getting-started/installation.md)
+Proceed with the setup instructions in the [installation documentation](/docs/getting-started/installation/index.md)
 
 ### Using the root of your domain (node-js-app.example.tld)
 
@@ -74,4 +75,4 @@ This section is a work in progress.  It is incomplete.
 Using the 'root' of your domain is nearly identical to the previous example.
 
 * hostname is under `example.tld`, still needs `A` record.
-* Update your global domain using the [domains plugin](docs/configuration/domains.md).
+* Update your global domain using the [domains plugin](/docs/configuration/domains.md).

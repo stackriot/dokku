@@ -36,17 +36,21 @@ func main() {
 		err = network.CommandExists(networkName)
 	case "info":
 		args := flag.NewFlagSet("network:info", flag.ExitOnError)
+		format := args.String("format", "text", "format: [ text | json ]")
 		args.Parse(os.Args[2:])
-		err = network.CommandInfo()
+		networkName := args.Arg(0)
+		err = network.CommandInfo(networkName, *format)
 	case "list":
 		args := flag.NewFlagSet("network:list", flag.ExitOnError)
+		format := args.String("format", "text", "format: [ text | json ]")
+		dokkuManaged := args.Bool("dokku-managed", false, "show only dokku-managed networks")
 		args.Parse(os.Args[2:])
-		err = network.CommandList()
+		err = network.CommandList(*format, *dokkuManaged)
 	case "rebuild":
 		args := flag.NewFlagSet("network:rebuild", flag.ExitOnError)
 		args.Parse(os.Args[2:])
 		appName := args.Arg(0)
-		err = network.BuildConfig(appName)
+		err = network.CommandRebuild(appName)
 	case "rebuildall":
 		args := flag.NewFlagSet("network:rebuildall", flag.ExitOnError)
 		args.Parse(os.Args[2:])
@@ -54,11 +58,14 @@ func main() {
 	case "report":
 		args := flag.NewFlagSet("network:report", flag.ExitOnError)
 		format := args.String("format", "stdout", "format: [ stdout | json ]")
-		osArgs, infoFlag, flagErr := common.ParseReportArgs("network", os.Args[2:])
+		reportArgs, flagErr := common.ParseReportArgs("network", os.Args[2:])
 		if flagErr == nil {
-			args.Parse(osArgs)
+			args.Parse(reportArgs.OSArgs)
 			appName := args.Arg(0)
-			err = network.CommandReport(appName, *format, infoFlag)
+			if reportArgs.IsGlobal {
+				appName = "--global"
+			}
+			err = network.CommandReport(appName, *format, reportArgs.InfoFlag)
 		}
 	case "set":
 		args := flag.NewFlagSet("network:set", flag.ExitOnError)
@@ -67,12 +74,14 @@ func main() {
 		appName := args.Arg(0)
 		property := args.Arg(1)
 		value := args.Arg(2)
+		values := common.VarArgs(args.Args(), 2)
 		if *global {
 			appName = "--global"
 			property = args.Arg(0)
 			value = args.Arg(1)
+			values = common.VarArgs(args.Args(), 1)
 		}
-		err = network.CommandSet(appName, property, value)
+		err = network.CommandSet(appName, property, value, values)
 	default:
 		err = fmt.Errorf("Invalid plugin subcommand call: %s", subcommand)
 	}

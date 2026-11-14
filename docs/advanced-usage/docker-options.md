@@ -1,57 +1,128 @@
 # Docker Container Options
 
+> [!IMPORTANT]
 > New as of 0.3.17
 
-Pass [container options](https://docs.docker.com/engine/reference/run/) to the `docker run` command  during Dokku's `build`, `deploy` and `run` phases
-
 ```
-docker-options:add <app> <phase(s)> OPTION    # Add Docker option to app for phase (comma-separated phase list)
-docker-options:clear <app> [<phase(s)>...]    # Clear a docker options from application
-docker-options:remove <app> <phase(s)> OPTION # Remove Docker option from app for phase (comma-separated phase list)
-docker-options:report [<app>] [<flag>]        # Displays a docker options report for one or more apps
+docker-options:add [--process PROC...] <app> <phase(s)> OPTION    # Add Docker option to app for phase
+docker-options:clear [--process PROC...] <app> [<phase(s)>...]    # Clear docker options from app
+docker-options:list <app> [--process PROC] --phase PHASE          # List docker options for one process+phase pair
+docker-options:remove [--process PROC...] <app> <phase(s)> OPTION # Remove Docker option from app for phase
+docker-options:report [<app>] [<flag>] [--format json|stdout]     # Displays a docker options report for one or more apps
 ```
 
-> When specifying multiple phases, they **must** be comma-separated _without_ spaces in between each phase, like so:
->
-> ```shell
-> dokku docker-options:add node-js-app deploy,run "-v /var/log/node-js-app:/app/logs"
-> ```
+The `docker-options` plugin allows users to specify custom [container options](https://docs.docker.com/engine/reference/run/) for containers created by Dokku at various phases.
 
-## About Dokku phases
+## Usage
 
-Dokku deploys your application in multiple "phases" and the `docker-options` plugin allows you to pass arguments to their underlying docker container:
+### Background
 
-- `build`: the container that executes the appropriate buildpack
-- `deploy`: the container that executes your running/deployed application
-- `run`: the container that executes any arbitrary command via `dokku run`
+#### Phases
 
-Manipulation of docker options will not restart running containers. This enables multiple options to be set/unset before final application. As such, changing an app's docker options must be followed by a `dokku ps:rebuild` in order to take effect.
+Dokku deploys your app in multiple "phases" and the `docker-options` plugin allows you to pass arguments to their underlying docker container:
 
-More information on supported Docker options can be found here: https://docs.docker.com/engine/reference/commandline/run/.
+- `build`: The `build` phase is used to provide container options that are available during the build process for use by the various builders.
+    - A given builder may strip out or ignore options that are unsupported by the builder in question - as an example, the `dockerfile` builder does not support mounted volumes.
+- `deploy`: The `deploy` phase is used to provide container options that are set on _deployed_ process types. This covers every process type specified in an app `Procfile` as well as any default processes your app may deploy.
+    - The `deploy` phase is usually the correct phase to add options for running containers.
+- `run`: The `run` phase is used to provide container options to one-off containers created by `dokku run`, `dokku run:detached`, and any cron tasks specified in your `app.json`.
+
+> [!IMPORTANT]
+> The `run` phase does _not_ correspond 1-to-1 to `docker run` or `docker container run` commands. Specifying a container option at the `run` phase will only be invoked on containers created by the `run` plugin and cron tasks. Please be sure to specify options at the correct phase for your use-case.
+
+Adding or removing docker-options will not apply to any running containers, and only applies to containers created _after_ the options have been modified. As such, changing an app's docker options must be followed by a `dokku ps:rebuild` or a deploy in order to take effect.
+
+#### Supported Docker Options
+
+More information on supported Docker options can be found in the [docker run reference](https://docs.docker.com/engine/reference/commandline/run/).
 
 Container options configured via the `docker-options` plugin are not used to modify the process a container runs. Container options are the `[OPTIONS]` portion of the following, where `[CONTAINER_COMMAND]` and `[ARG]` are the process and the arguments passed to it that are launched in the created container: `docker run [OPTIONS] [CONTAINER_COMMAND] [ARG...]`. Please see the documentation for [customizing the run command](/docs/deployment/builders/dockerfiles.md#customizing-the-run-command) or use a [Procfile](/docs/deployment/builders/dockerfiles.md#procfiles-and-multiple-processes) to modify the command used by a Dockerfile-based container.
 
-## Examples
+#### Scheduler support
 
-### Add Docker options
+Docker options are written in Docker's own vocabulary and are passed verbatim to `docker run` by the `docker-local` scheduler. Other schedulers translate only the subset that has an equivalent in their own runtime, and ignore the rest.
 
-Add some options for the deployed/running app and when executing [`dokku run`](/docs/processes/one-off-tasks.md):
-
-```shell
-# Mount a host volume in a Docker container: "-v /host/path:/container/path"
-dokku docker-options:add node-js-app deploy "-v /var/log/node-js-app:/app/logs"
-dokku docker-options:add node-js-app run "-v /var/log/node-js-app:/app/logs"
-```
-
-> Note: When [mounting a host directory](https://docs.docker.com/engine/reference/run/#volume-shared-filesystems) in a Dokku app you should first create that directory as user `dokku` and then mount the directory under `/app` in the container using `docker-options` as above. Otherwise the app will lack write permission in the directory.
-
-### Remove a Docker option
+The `k3s` scheduler translates `--cap-add`, `--cap-drop`, `--privileged`, and `--sysctl` into their Kubernetes equivalents. See the [k3s scheduler documentation](/docs/deployment/schedulers/k3s.md) for details, including the restriction that only namespaced sysctls can be set on a pod.
 
 ```shell
-dokku docker-options:remove node-js-app run "-v /var/log/node-js-app:/app/logs"
+dokku docker-options:add node-js-app deploy "--sysctl net.ipv4.ip_unprivileged_port_start=1024"
 ```
 
-### Clear all Docker options for an app
+#### Mounting volumes and host directories
+
+Docker supports volume and host directory mounting via the `-v` or `--volume` flags. In order to simplify usage, Dokku provides a `storage` plugin as an abstraction to interact with persistent storage. In most cases, the Dokku project recommends using the persistent storage plugin over directly manipulating docker options at different phases. See the [persistent storage documentation](/docs/advanced-usage/persistent-storage.md) for more information on how to attach persistent storage to your app.
+
+### Commands
+
+#### Add Docker options
+
+To add a docker option to an app, use the `docker-options:add` command. This takes an app name, a comma-separated list of phases, and the docker-option to add.
+
+```shell
+dokku docker-options:add node-js-app deploy "--ulimit nofile=12"
+```
+
+Multiple phases can be specified by using a comma when specifying phases:
+
+```shell
+dokku docker-options:add node-js-app deploy,run "--ulimit nofile=12"
+```
+
+Multiple docker options can also be specified in a single call. Each `--flag [value]` group is detected on flag boundaries, shell-tokenized for quoting safety, and stored as its own entry so it round-trips through `docker-options:report` and `docker-options:list`:
+
+```shell
+dokku docker-options:add node-js-app deploy "--ulimit nofile=12" "--shm-size 256m"
+```
+
+Option values are stored and passed to the container verbatim. Quoting only controls how a value is split into words - no shell expansion is performed, so `$(...)`, backticks, `$VAR`, and globs are treated literally rather than being interpreted by the shell. This is what lets values such as a Traefik router rule be applied as-is:
+
+```shell
+dokku docker-options:add node-js-app deploy '--label "traefik.http.routers.web.rule=Host(`node-js-app.example.com`) && PathPrefix(`/api`)"'
+```
+
+> [!WARNING]
+> Options added before 0.38.25 were expanded by the shell when a container was created. Any such option that relied on shell expansion - `$(...)`, backticks, or `$VAR` - is treated as a literal string after upgrading and must be re-added with the value already resolved:
+>
+> ```shell
+> dokku docker-options:remove node-js-app deploy "--group-add \$(getent group docker | cut -d: -f3)"
+> dokku docker-options:add node-js-app deploy "--group-add $(getent group docker | cut -d: -f3)"
+> ```
+
+A misplaced `--process PROC` (i.e. one specified after the app name instead of before it) is honored as a subcommand flag rather than stored as a docker option, so the two invocations below behave identically:
+
+```shell
+dokku docker-options:add --process web node-js-app deploy "--ulimit nofile=12" "--shm-size 256m"
+dokku docker-options:add node-js-app deploy "--ulimit nofile=12" "--shm-size 256m" --process web
+```
+
+#### Remove a Docker option
+
+To remove docker options from an app, use the `docker-options:remove` command. This takes an app name, a comma-separated list of phases, and the docker-option to remove.
+
+```shell
+dokku docker-options:remove node-js-app run "--ulimit nofile=12"
+```
+
+Multiple phases can be specified by using a comma when specifying phases:
+
+```shell
+dokku docker-options:remove node-js-app deploy,run "--ulimit nofile=12"
+```
+
+Multiple docker options can also be removed in a single call, mirroring the splitting that `docker-options:add` performs:
+
+```shell
+dokku docker-options:remove node-js-app deploy "--ulimit nofile=12" "--shm-size 256m"
+```
+
+A stored option is matched by shell word rather than by exact string, so the value only has to be equivalent to the stored one, not byte-identical. Quoting an option one way removes an option that was stored quoted another way:
+
+```shell
+dokku docker-options:add node-js-app deploy "--label 'com.example.owner=platform team'"
+dokku docker-options:remove node-js-app deploy '--label "com.example.owner=platform team"'
+```
+
+#### Clear all Docker options for an app
 
 Docker options can be removed for a specific app using the `docker-options:clear` command.
 
@@ -82,8 +153,9 @@ dokku docker-options:clear node-js-app build,run
 -----> Clearing docker-options for node-js-app on phase run
 ```
 
-### Displaying docker-options reports for an app
+#### Displaying docker-options reports for an app
 
+> [!IMPORTANT]
 > New as of 0.8.1
 
 You can get a report about the app's docker-options status using the `docker-options:report` command:
@@ -95,8 +167,8 @@ dokku docker-options:report
 ```
 =====> node-js-app docker options information
        Docker options build:
-       Docker options deploy: -v /var/log/node-js-app:/app/logs
-       Docker options run:  -v /var/log/node-js-app:/app/logs
+       Docker options deploy: --ulimit nofile=12 --shm-size 256m
+       Docker options run:  --ulimit nofile=12 --shm-size 256m
 =====> python-sample docker options information
        Docker options build:
        Docker options deploy:
@@ -125,3 +197,101 @@ You can pass flags which will output only the value of the specific information 
 ```shell
 dokku docker-options:report node-js-app --docker-options-build
 ```
+
+When process-specific options are configured (see below), the report exposes one additional dynamic flag per configured `process.deploy` pair, named `--docker-options-deploy.<process>`:
+
+```shell
+dokku docker-options:report node-js-app --docker-options-deploy.web
+```
+
+A machine-readable JSON view is available via `--format json`:
+
+```shell
+dokku docker-options:report node-js-app --format json
+```
+
+The JSON report includes the existing string keys (`build`, `deploy`, `run`, and `deploy.<process>` when configured) plus parallel `-list` keys for the same shorthand keys. Each `-list` value is a JSON array with one element per option as originally stored via `docker-options:add`, which allows export tooling to round-trip options that contain spaces without splitting the legacy space-joined strings. Empty phases emit an empty array (`[]`). The deprecated `docker-options-*` prefixed keys are unchanged and do not gain `-list` companions.
+
+```json
+{
+  "build": "",
+  "build-list": [],
+  "deploy": "-v /logs:/logs --memory=512m",
+  "deploy-list": ["-v /logs:/logs", "--memory=512m"],
+  "run": "",
+  "run-list": [],
+  "deploy.web": "-p 8080:5000",
+  "deploy.web-list": ["-p 8080:5000"],
+  "docker-options-build": "",
+  "docker-options-deploy": "-v /logs:/logs --memory=512m",
+  "docker-options-run": "",
+  "docker-options-deploy.web": "-p 8080:5000"
+}
+```
+
+### Process-Specific Options
+
+> [!IMPORTANT]
+> New as of 0.38.0
+
+Docker options can be scoped to specific process types declared in the app's `Procfile` by passing one or more `--process` flags. This is useful when a deploy-phase option (for example a port mapping) makes sense for one process type but would conflict with another - the canonical case being a `web` process that needs `-p 6789:5000` published while the `worker` process must not bind that port.
+
+Process scoping is supported only for the `deploy` phase. The `build` phase runs once per app and the `run` phase covers ad-hoc commands and cron tasks where no Procfile process type is in play; both reject `--process`.
+
+There is no `--global` flag. Omitting `--process` keeps the historical behavior of applying the option to every container in the app. Avoiding a `--global` flag here is intentional: elsewhere in Dokku `--global` means "across all apps" (e.g. `dokku config:set --global`), which would be misleading in this plugin where the scope is always one app.
+
+#### Setting process-specific options
+
+```shell
+# Add a port mapping only to the web process
+dokku docker-options:add --process web node-js-app deploy "-p 6789:5000"
+
+# Add a GPU mount only to the worker process
+dokku docker-options:add --process worker node-js-app deploy "--gpus all"
+```
+
+Multiple `--process` flags can be combined to apply the same option to several process types in one call:
+
+```shell
+dokku docker-options:add --process web --process api node-js-app deploy "-v /shared:/shared"
+```
+
+If `--process` names a process type that is not currently declared in the app's `Procfile`, the command succeeds but emits a warning. This allows configuring options ahead of a deploy that adds the new process type.
+
+The `_default_` value is reserved internally and cannot be passed to `--process`.
+
+#### Removing and clearing process-specific options
+
+```shell
+# Remove a single option from one process
+dokku docker-options:remove --process web node-js-app deploy "-p 6789:5000"
+
+# Clear every option for a process+phase
+dokku docker-options:clear --process worker node-js-app deploy
+```
+
+Without `--process`, `:remove` and `:clear` operate on the default scope only - per-process lists are left untouched.
+
+#### Listing options for a process and phase
+
+The `docker-options:list` command prints the options stored for a single process+phase pair, one option per line. Omitting `--process` lists the default scope.
+
+```shell
+dokku docker-options:list node-js-app --process web --phase deploy
+dokku docker-options:list node-js-app --phase deploy
+```
+
+## Properties
+
+### Internal properties
+
+The following properties are recorded internally by the docker-options plugin and are not exposed via `docker-options:report`:
+
+| Property | Scope | Description | Source |
+| --- | --- | --- | --- |
+| `migrated-from-files` | global | Global migration sentinel that records that the legacy `DOCKER_OPTIONS_<PHASE>` flat-file store has been drained into plugin properties | `plugins/docker-options/functions.go` writes `"true"` once the install-time migration runs |
+| `migrated-build` | per-app | Per-app marker recording that the app's legacy `DOCKER_OPTIONS_BUILD` file was drained into the `_default_.build` property list. Only set when the legacy file contained non-empty content | `plugins/docker-options/functions.go` writes `"true"` after the per-phase drain |
+| `migrated-deploy` | per-app | Per-app marker recording that the app's legacy `DOCKER_OPTIONS_DEPLOY` file was drained into the `_default_.deploy` property list. Only set when the legacy file contained non-empty content | `plugins/docker-options/functions.go` writes `"true"` after the per-phase drain |
+| `migrated-run` | per-app | Per-app marker recording that the app's legacy `DOCKER_OPTIONS_RUN` file was drained into the `_default_.run` property list. Only set when the legacy file contained non-empty content | `plugins/docker-options/functions.go` writes `"true"` after the per-phase drain |
+| `migrated-traefik-backticks` | global | Global sentinel recording that stored Traefik labels whose backticks carried a stray backslash have been repaired | `plugins/docker-options/functions.go` writes `"true"` once the install-time repair runs |
+| `migrated-canonical-options` | global | Global sentinel recording that stored options have been rewritten into the canonical form, quoting values whose shell metacharacters were left bare by an older legacy-file drain and splitting entries that carried several flags | `plugins/docker-options/functions.go` writes `"true"` once the install-time rewrite runs |

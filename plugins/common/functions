@@ -2,8 +2,16 @@
 set -eo pipefail
 [[ $DOKKU_TRACE ]] && set -x
 
+if [[ -f "${PLUGIN_CORE_AVAILABLE_PATH:-/var/lib/dokku/core-plugins/available}/common/archive-functions" ]]; then
+  source "${PLUGIN_CORE_AVAILABLE_PATH:-/var/lib/dokku/core-plugins/available}/common/archive-functions"
+fi
+
 has_tty() {
   declare desc="return 0 if we have a tty"
+  if [[ "$DOKKU_FORCE_TTY" == "true" ]]; then
+    return 0
+  fi
+
   if [[ "$DOKKU_DISABLE_TTY" == "true" ]]; then
     return 1
   fi
@@ -17,8 +25,12 @@ has_tty() {
 
 dokku_apps() {
   declare desc="prints list of all local apps"
-  local INSTALLED_APPS=$(find "$DOKKU_ROOT" -follow -maxdepth 1 -mindepth 1 -type d ! -name '.*' -printf "%f\n" 2>/dev/null | sort) || (dokku_log_fail "You haven't deployed any applications yet")
-  [[ $INSTALLED_APPS ]] && echo "$INSTALLED_APPS"
+  declare FILTER="$1"
+  local INSTALLED_APPS="$(plugn trigger app-list "$FILTER")"
+  if [[ -z "$INSTALLED_APPS" ]]; then
+    dokku_log_fail "You haven't deployed any applications yet"
+  fi
+  echo "$INSTALLED_APPS"
 }
 
 dokku_version() {
@@ -154,13 +166,13 @@ dokku_log_fail_quiet() {
   if [[ -z "$DOKKU_QUIET_OUTPUT" ]]; then
     echo " !     $*" 1>&2
   fi
-  exit ${DOKKU_FAIL_EXIT_CODE:=1}
+  exit "${DOKKU_FAIL_EXIT_CODE:=1}"
 }
 
 dokku_log_fail() {
   declare desc="log fail formatter"
   echo " !     $*" 1>&2
-  exit ${DOKKU_FAIL_EXIT_CODE:=1}
+  exit "${DOKKU_FAIL_EXIT_CODE:=1}"
 }
 
 dokku_log_stderr() {
@@ -195,30 +207,54 @@ dokku_container_log_verbose_quiet() {
   IFS=$OIFS
 }
 
+fn-force-arm64-image() {
+  declare IMAGE="$1"
+  local image_architecture="$("$DOCKER_BIN" image inspect --format '{{.Architecture}}' "$IMAGE")"
+
+  if [[ "$image_architecture" == "amd64" ]] && [[ "$(dpkg --print-architecture 2>/dev/null || true)" != "amd64" ]]; then
+    return 0
+  fi
+
+  return 1
+}
+
 fn-is-valid-app-name() {
   declare desc="verify that the app name matches naming restrictions"
   local APP="$1"
   [[ -z "$APP" ]] && dokku_log_fail "Please specify an app to run the command on"
-  if [[ "$APP" =~ ^[a-z].* ]] || [[ "$APP" =~ ^[0-9].* ]]; then
-    if [[ ! $APP =~ [A-Z] ]] && [[ ! $APP =~ [:] ]] && [[ ! $APP =~ [_] ]]; then
-      return 0
-    fi
-  fi
-
-  return 1
+  "$PLUGIN_CORE_AVAILABLE_PATH/common/common" --quiet is-valid-app-name "$APP"
 }
 
 fn-is-valid-app-name-old() {
   declare desc="verify that the app name matches the old naming restrictions"
   local APP="$1"
   [[ -z "$APP" ]] && dokku_log_fail "Please specify an app to run the command on"
-  if [[ "$APP" =~ ^[a-z].* ]] || [[ "$APP" =~ ^[0-9].* ]]; then
-    if [[ ! $APP =~ [A-Z] ]] && [[ ! $APP =~ [:] ]]; then
-      return 0
-    fi
+  "$PLUGIN_CORE_AVAILABLE_PATH/common/common" --quiet is-valid-app-name-old "$APP"
+}
+
+fn-plugn-trigger-exists() {
+  declare desc="checks if a plugn trigger exists"
+  declare TRIGGER_NAME="$1"
+  local exists
+
+  exists="$("$PLUGIN_CORE_AVAILABLE_PATH/common/common" --quiet plugn-trigger-exists "$TRIGGER_NAME" || true)"
+  if [[ "$exists" == "true" ]]; then
+    return
   fi
 
   return 1
+}
+
+fn-docker-args-split() {
+  declare desc="tokenizes a docker args string into NUL-delimited fields without shell expansion"
+  declare DOCKER_ARGS="$1"
+  printf "%s" "$DOCKER_ARGS" | xargs -r printf "%s\0"
+}
+
+fn-split-command() {
+  declare desc="tokenizes a command string into NUL-delimited fields using shell quoting rules without shell expansion"
+  declare COMMAND="$1"
+  "$PLUGIN_CORE_AVAILABLE_PATH/common/common" split-command -- "$COMMAND"
 }
 
 is_valid_app_name() {
@@ -229,7 +265,7 @@ is_valid_app_name() {
     return
   fi
 
-  dokku_log_fail "App name must begin with lowercase alphanumeric character, and cannot include uppercase characters, colons, or underscores"
+  dokku_log_fail "App name must begin with lowercase alphanumeric character, and may only contain lowercase alphanumerics, dots, and hyphens"
 }
 
 is_valid_app_name_old() {
@@ -240,39 +276,69 @@ is_valid_app_name_old() {
     return
   fi
 
-  dokku_log_fail "App name must begin with lowercase alphanumeric character, and cannot include uppercase characters, or colons"
+  dokku_log_fail "App name must begin with lowercase alphanumeric character, and may only contain lowercase alphanumerics, dots, and hyphens"
 }
 
 verify_app_name() {
   declare desc="verify app name format and app existence"
   declare APP="$1"
-  local VALID_NEW=false
-  local VALID_OLD=false
-  if fn-is-valid-app-name "$APP" 2>/dev/null; then
-    VALID_NEW=true
+
+  if "$PLUGIN_CORE_AVAILABLE_PATH/common/common" --quiet verify-app-name "$APP"; then
+    return 0
   fi
 
-  if fn-is-valid-app-name-old "$APP" 2>/dev/null; then
-    VALID_OLD=true
-  fi
-
-  if [[ "$VALID_NEW" == "false" ]] && [[ "$VALID_OLD" == "false" ]]; then
-    dokku_log_fail "App name must begin with lowercase alphanumeric character, and cannot include uppercase characters, colons, or underscores"
-  fi
-
-  [[ ! -d "$DOKKU_ROOT/$APP" ]] && DOKKU_FAIL_EXIT_CODE=20 dokku_log_fail "App $APP does not exist"
-
-  return 0
+  DOKKU_FAIL_EXIT_CODE=20 dokku_log_fail "App $APP does not exist"
 }
 
 verify_image() {
-  declare desc="verify image existence"
+  declare desc="[deprecated] verify image existence. Use 'fn-verify-app-image' instead."
   local IMAGE="$1"
+  dokku_log_warn "Deprecated: please use 'fn-verify-app-image' instead of 'verify_image'"
   if "$DOCKER_BIN" image inspect "$IMAGE" &>/dev/null; then
     return 0
   else
     return 1
   fi
+}
+
+fn-verify-app-image() {
+  declare desc="verify image existence, pulling from the registry when push-on-release is enabled"
+  declare APP="$1" IMAGE="$2"
+
+  if "$DOCKER_BIN" image inspect "$IMAGE" &>/dev/null; then
+    return 0
+  fi
+
+  if [[ "$IMAGE" == *:latest ]]; then
+    return 1
+  fi
+
+  local DEPLOYED_TAG
+  DEPLOYED_TAG="$(plugn trigger deployed-app-image-tag "$APP")"
+  if [[ -z "$DEPLOYED_TAG" ]]; then
+    return 1
+  fi
+
+  local DOCKER_CONFIG
+  DOCKER_CONFIG="$(fn-registry-docker-config-dir "$APP")"
+  [[ -n "$DOCKER_CONFIG" ]] && export DOCKER_CONFIG
+
+  local REMOTE_REPO DEPLOYED_REPO TAG
+  REMOTE_REPO="$(plugn trigger deployed-app-repository "$APP")"
+  DEPLOYED_REPO="$(plugn trigger deployed-app-image-repo "$APP")"
+  TAG="${IMAGE##*:}"
+
+  dokku_log_info1 "Image $IMAGE not found locally, pulling from registry" 1>&2
+  if [[ -n "$DEPLOYED_REPO" ]] && [[ "$IMAGE" == "${REMOTE_REPO}${DEPLOYED_REPO}:"* ]]; then
+    "$DOCKER_BIN" image pull "$IMAGE" 1>&2 && return 0
+    return 1
+  fi
+
+  local REMOTE_IMAGE="${REMOTE_REPO}${DEPLOYED_REPO:-${IMAGE%:*}}:${TAG}"
+  if "$DOCKER_BIN" image pull "$REMOTE_IMAGE" 1>&2; then
+    "$DOCKER_BIN" image tag "$REMOTE_IMAGE" "$IMAGE" 1>&2 && return 0
+  fi
+  return 1
 }
 
 get_app_image_repo() {
@@ -296,7 +362,7 @@ get_deploying_app_image_name() {
   [[ -z "$IMAGE_REPO" ]] && IMAGE_REPO=$(get_app_image_repo "$APP")
 
   local IMAGE="${IMAGE_REMOTE_REPOSITORY}${IMAGE_REPO}:${IMAGE_TAG}"
-  verify_image "$IMAGE" || dokku_log_fail "App image ($IMAGE) not found"
+  fn-verify-app-image "$APP" "$IMAGE" || dokku_log_fail "App image ($IMAGE) not found"
   echo "$IMAGE"
 }
 
@@ -312,7 +378,7 @@ get_app_image_name() {
 
   if [[ -n "$IMAGE_TAG" ]]; then
     local IMAGE="$IMAGE_REPO:$IMAGE_TAG"
-    verify_image "$IMAGE" || dokku_log_fail "App image ($IMAGE) not found"
+    fn-verify-app-image "$APP" "$IMAGE" || dokku_log_fail "App image ($IMAGE) not found"
   else
     local IMAGE="$IMAGE_REPO:latest"
   fi
@@ -337,50 +403,62 @@ get_running_image_tag() {
   echo "$IMAGE_TAG"
 }
 
+get_image_builder_type() {
+  declare desc="returns the image builder_type"
+  declare IMAGE="$1" APP="$2"
+
+  if [[ -z "$IMAGE" ]]; then
+    echo "dockerfile"
+    return
+  fi
+
+  BUILDER_TYPE="$("$DOCKER_BIN" image inspect --format '{{ index .Config.Labels "com.dokku.builder-type" }}' "$IMAGE")"
+  if [[ -n "$BUILDER_TYPE" ]]; then
+    echo "$BUILDER_TYPE"
+    return
+  fi
+
+  if is_image_herokuish_based "$IMAGE" "$APP"; then
+    echo "herokuish"
+    return
+  fi
+
+  echo "dockerfile"
+}
+
 is_image_cnb_based() {
   declare desc="returns true if app image is based on cnb"
   declare IMAGE="$1"
 
-  if [[ -z "$IMAGE" ]]; then
+  if [[ "$("$PLUGIN_CORE_AVAILABLE_PATH/common/common" --quiet image-is-cnb-based "$IMAGE")" != "true" ]]; then
     return 1
   fi
-
-  CNB_STACK_ID="$("$DOCKER_BIN" image inspect --format '{{ index .Config.Labels "io.buildpacks.stack.id" }}' "$IMAGE")"
-  if [[ -n "$CNB_STACK_ID" ]]; then
-    return 0
-  fi
-
-  return 1
 }
 
 is_image_herokuish_based() {
   declare desc="returns true if app image is based on herokuish or a buildpack-like env"
   declare IMAGE="$1" APP="$2"
-  local DOKKU_APP_USER
-  local USER_VALUE
 
-  if [[ -z "$IMAGE" ]]; then
+  if [[ "$("$PLUGIN_CORE_AVAILABLE_PATH/common/common" --quiet image-is-herokuish-based "$IMAGE" "$APP")" != "true" ]]; then
     return 1
   fi
-
-  if is_image_cnb_based "$IMAGE"; then
-    return 0
-  fi
-
-  if [[ -n "$APP" ]]; then
-    DOKKU_APP_USER=$(config_get "$APP" DOKKU_APP_USER || true)
-  fi
-  DOKKU_APP_USER=${DOKKU_APP_USER:="herokuishuser"}
-
-  # due to how the build process works, all herokuish images have the Environment variable USER=$DOKKU_APP_USER
-  USER_VALUE="$("$DOCKER_BIN" image inspect --format '{{range .Config.Env}}{{if eq . "USER='"$DOKKU_APP_USER"'"}}{{println .}}{{end}}{{end}}' "$IMAGE")"
-  [[ "$USER_VALUE" == "" ]] && return 1
-  return 0
 }
 
 get_docker_version() {
   CLIENT_VERSION_STRING="$("$DOCKER_BIN" version --format "{{ .Client.Version }}")"
   echo "$CLIENT_VERSION_STRING"
+}
+
+fn-is-compose-installed() {
+  declare desc="check if the compose docker plugin is installed"
+  local COMPOSE_INSTALLED
+  COMPOSE_INSTALLED="$(docker info -f '{{range .ClientInfo.Plugins}}{{if eq .Name "compose"}}true{{end}}{{end}}')"
+
+  if [[ "$COMPOSE_INSTALLED" == "true" ]]; then
+    return 0
+  fi
+
+  return 1
 }
 
 is_number() {
@@ -404,6 +482,56 @@ is_abs_path() {
   fi
 }
 
+fn-cli-preserved-env-names() {
+  declare desc="names the environment variables the re-exec as the dokku user must carry"
+
+  # every variable dokku honours from the environment has to be listed, or the child
+  # derives different values than the parent - during the docker image build these only
+  # ever exist in the environment. DOKKU_PID is the one exclusion: it is unset above so
+  # the child gets its own. DOKKU_PRESERVE_ENV carries anything else
+  echo "DOKKU_APP_NAME DOKKU_APPS_FORCE_DELETE DOKKU_DISABLE_TTY DOKKU_FORCE_TTY" \
+    "DOKKU_GLOBAL_FLAGS DOKKU_PRESERVE_ENV DOKKU_QUIET_OUTPUT DOKKU_TRACE" \
+    "FINGERPRINT NAME SSH_NAME SSH_ORIGINAL_COMMAND SSH_USER" \
+    "DOCKER_BIN DOKKU_CNB_BUILDER DOKKU_EVENTS_LOGFILE DOKKU_HOST_ROOT DOKKU_IMAGE" \
+    "DOKKU_INIT_SYSTEM DOKKU_LIB_HOST_ROOT DOKKU_LIB_PATH DOKKU_LOGS_DIR" \
+    "DOKKU_LOGS_HOST_DIR DOKKU_ROOT DOKKU_SYSTEM_GROUP DOKKU_SYSTEM_USER" \
+    "PLUGIN_AVAILABLE_PATH PLUGIN_CORE_AVAILABLE_PATH PLUGIN_CORE_ENABLED_PATH" \
+    "PLUGIN_CORE_PATH PLUGIN_ENABLED_PATH PLUGIN_PATH"
+}
+
+fn-sudo-preserve-env-flag() {
+  declare desc="prints the sudo flag that carries environment variables across a privilege drop"
+  local names=("$@")
+  local extra_names=()
+  local joined name
+
+  # sudo-rs, the default sudo on ubuntu 25.10 and later, ignores -E and bare
+  # --preserve-env, so every variable that has to survive must be named
+  if [[ "${#names[@]}" -eq 0 ]]; then
+    for name in $(compgen -e); do
+      # preserving these would defeat -H and override the sudoers secure_path
+      case "$name" in
+        HOME | LOGNAME | MAIL | PATH | SHELL | USER | _ | SUDO_*)
+          continue
+          ;;
+      esac
+      names+=("$name")
+    done
+  fi
+
+  if [[ -n "$DOKKU_PRESERVE_ENV" ]]; then
+    read -ra extra_names <<<"${DOKKU_PRESERVE_ENV//,/ }"
+    names+=("${extra_names[@]}")
+  fi
+
+  if [[ "${#names[@]}" -eq 0 ]]; then
+    return 0
+  fi
+
+  printf -v joined "%s," "${names[@]}"
+  echo "--preserve-env=${joined%,}"
+}
+
 parse_args() {
   declare desc="top-level cli arg parser"
   local next_index=1
@@ -422,15 +550,8 @@ parse_args() {
       --quiet)
         export DOKKU_QUIET_OUTPUT=1
         ;;
-      --detach)
-        dokku_log_warn_quiet "Deprecated: use run:detached instead of using the --detach flag"
-        export DOKKU_DETACH_CONTAINER=1
-        ;;
       --trace)
         export DOKKU_TRACE=1
-        ;;
-      --rm-container | --rm)
-        dokku_log_warn_quiet "Deprecated: all run containers are now removed on exit by default"
         ;;
       --force)
         export DOKKU_APPS_FORCE_DELETE=1
@@ -462,48 +583,17 @@ parse_args() {
 copy_from_image() {
   declare desc="copy file from named image to destination"
   declare IMAGE="$1" SRC_FILE="$2" DST_FILE="$3"
-  local WORK_DIR=""
 
-  local DOCKER_CREATE_LABEL_ARGS="--label=com.dokku.app-name=$APP"
+  if ! "$PLUGIN_CORE_AVAILABLE_PATH/common/common" copy-from-image "$APP" "$IMAGE" "$SRC_FILE" "$DST_FILE"; then
+    return 1
+  fi
+}
 
-  if verify_image "$IMAGE"; then
-    if ! is_abs_path "$SRC_FILE"; then
-      if is_image_cnb_based "$IMAGE"; then
-        WORKDIR="/workspace"
-      elif is_image_herokuish_based "$IMAGE" "$APP"; then
-        WORKDIR="/app"
-      else
-        WORKDIR="$("$DOCKER_BIN" image inspect --format '{{.Config.WorkingDir}}' "$IMAGE")"
-      fi
+copy_dir_from_image() {
+  declare desc="copy a directory from named image to destination"
+  declare IMAGE="$1" SRC_DIR="$2" DST_DIR="$3"
 
-      if [[ -n "$WORKDIR" ]]; then
-        SRC_FILE="${WORKDIR}/${SRC_FILE}"
-      fi
-    fi
-
-    TMP_FILE_COMMAND_OUTPUT=$(mktemp "/tmp/dokku-${DOKKU_PID}-${FUNCNAME[0]}.XXXXXX")
-    trap "rm -rf '$TMP_FILE_COMMAND_OUTPUT' >/dev/null 2>&1 || true" RETURN
-
-    local CID=$("$DOCKER_BIN" container create "${DOCKER_CREATE_LABEL_ARGS[@]}" $DOKKU_GLOBAL_RUN_ARGS "$IMAGE")
-    "$DOCKER_BIN" container cp "$CID:$SRC_FILE" "$TMP_FILE_COMMAND_OUTPUT" 2>/dev/null || true
-    "$DOCKER_BIN" container rm --force "$CID" &>/dev/null
-    plugn trigger scheduler-register-retired "$APP" "$CID"
-
-    # docker cp exits with status 1 when run as non-root user when it tries to chown the file
-    # after successfully copying the file. Thus, we suppress stderr.
-    # ref: https://github.com/dotcloud/docker/issues/3986
-    if [[ ! -s "$TMP_FILE_COMMAND_OUTPUT" ]]; then
-      return 1
-    fi
-
-    # workaround for CHECKS file when owner is root. seems to only happen when running inside docker
-    dos2unix -l <"$TMP_FILE_COMMAND_OUTPUT" >"$DST_FILE"
-
-    # add trailing newline for certain places where file parsing depends on it
-    if [[ "$(tail -c1 "$DST_FILE")" != "" ]]; then
-      echo "" >>"$DST_FILE"
-    fi
-  else
+  if ! "$PLUGIN_CORE_AVAILABLE_PATH/common/common" copy-dir-from-image "$APP" "$IMAGE" "$SRC_DIR" "$DST_DIR"; then
     return 1
   fi
 }
@@ -572,22 +662,6 @@ is_deployed() {
   "$PLUGIN_CORE_AVAILABLE_PATH/common/common" --quiet is-deployed "$APP"
 }
 
-is_container_running() {
-  declare desc="return 0 if given docker container id is in running state"
-  declare deprecated=true
-  declare CID="$1"
-  local CONTAINER_STATUS
-
-  dokku_log_warn "Deprecated: common#is_container_status"
-  CONTAINER_STATUS=$("$DOCKER_BIN" container inspect --format '{{.State.Running}}' "$CID" || true)
-
-  if [[ "$CONTAINER_STATUS" == "true" ]]; then
-    return 0
-  fi
-
-  return 1
-}
-
 is_container_status() {
   declare desc="return 0 if given docker container id is in given state"
   local CID=$1
@@ -601,27 +675,98 @@ is_container_status() {
   return 1
 }
 
-is_app_running() {
-  declare desc="return 0 if given app has a running container"
-  declare deprecated=true
-  local APP="$1"
+fn-app-previous-image-id() {
+  declare desc="returns the image id the app is currently running, if it can be unambiguously determined"
+  declare APP="$1"
+  local CID IMAGE_ID
+  local -a IMAGE_IDS=()
 
-  dokku_log_warn "Deprecated: ps#fn-ps-is-app-running"
+  for CID in $(get_app_container_ids "$APP"); do
+    IMAGE_ID="$("$DOCKER_BIN" container inspect --format "{{.Image}}" "$CID" 2>/dev/null || true)"
+    [[ -z "$IMAGE_ID" ]] && continue
+    fn-in-array "$IMAGE_ID" "${IMAGE_IDS[@]}" && continue
+    IMAGE_IDS+=("$IMAGE_ID")
+  done
 
-  local APP_RUNNING_CONTAINER_IDS=$(get_app_running_container_ids "$APP" 2>/dev/null)
+  if [[ "${#IMAGE_IDS[@]}" -eq 0 ]]; then
+    while read -r IMAGE_ID; do
+      [[ -z "$IMAGE_ID" ]] && continue
+      fn-in-array "$IMAGE_ID" "${IMAGE_IDS[@]}" && continue
+      IMAGE_IDS+=("$IMAGE_ID")
+    done < <("$DOCKER_BIN" image ls --no-trunc --filter "label=com.dokku.image-stage=release" --filter "label=com.dokku.app-name=$APP" --format "{{.ID}}" 2>/dev/null || true)
+  fi
 
-  if [[ -n "$APP_RUNNING_CONTAINER_IDS" ]]; then
-    return 0
-  else
+  if [[ "${#IMAGE_IDS[@]}" -eq 1 ]]; then
+    echo "${IMAGE_IDS[0]}"
+  fi
+}
+
+fn-app-previous-image-pin() {
+  declare desc="returns the image tag used to keep the previous app image available during a build and deploy"
+  declare APP="$1"
+
+  echo "$(get_app_image_repo "$APP"):dokku-previous"
+}
+
+fn-app-pin-previous-image() {
+  declare desc="tags the image the app is currently running so it survives the build moving the latest tag"
+  declare APP="$1"
+  local PREVIOUS_IMAGE_ID
+
+  fn-app-unpin-previous-image "$APP"
+  PREVIOUS_IMAGE_ID="$(fn-app-previous-image-id "$APP")"
+  if [[ -z "$PREVIOUS_IMAGE_ID" ]]; then
+    return
+  fi
+
+  "$DOCKER_BIN" image tag "$PREVIOUS_IMAGE_ID" "$(fn-app-previous-image-pin "$APP")" &>/dev/null || true
+}
+
+fn-app-unpin-previous-image() {
+  declare desc="removes the tag keeping the previous app image available"
+  declare APP="$1"
+
+  "$DOCKER_BIN" image remove --force --no-prune "$(fn-app-previous-image-pin "$APP")" &>/dev/null || true
+}
+
+fn-app-restore-previous-image() {
+  declare desc="retags the app image to the pinned previous image, returning 1 if there is no pinned image"
+  declare APP="$1"
+  local IMAGE PIN_IMAGE PREVIOUS_IMAGE_ID CURRENT_IMAGE_ID
+
+  IMAGE="$(get_app_image_repo "$APP"):latest"
+  PIN_IMAGE="$(fn-app-previous-image-pin "$APP")"
+  PREVIOUS_IMAGE_ID="$("$DOCKER_BIN" image inspect --format "{{.Id}}" "$PIN_IMAGE" 2>/dev/null || true)"
+  if [[ -z "$PREVIOUS_IMAGE_ID" ]]; then
     return 1
   fi
+
+  CURRENT_IMAGE_ID="$("$DOCKER_BIN" image inspect --format "{{.Id}}" "$IMAGE" 2>/dev/null || true)"
+  if [[ "$CURRENT_IMAGE_ID" == "$PREVIOUS_IMAGE_ID" ]]; then
+    return 0
+  fi
+
+  dokku_log_warn "Retagging old image $PREVIOUS_IMAGE_ID as $IMAGE"
+  "$DOCKER_BIN" image tag "$PIN_IMAGE" "$IMAGE" 2>/dev/null
 }
 
 dokku_build() {
   declare desc="build phase"
   declare APP="$1" IMAGE_SOURCE_TYPE="$2" SOURCECODE_WORK_DIR="$3"
 
-  plugn trigger builder-build "$IMAGE_SOURCE_TYPE" "$APP" "$SOURCECODE_WORK_DIR"
+  local IMAGE=$(get_app_image_name "$APP")
+  fn-app-pin-previous-image "$APP"
+  if plugn trigger builder-build "$IMAGE_SOURCE_TYPE" "$APP" "$SOURCECODE_WORK_DIR"; then
+    return
+  fi
+
+  if ! fn-app-restore-previous-image "$APP"; then
+    dokku_log_warn "Removing invalid image tag $IMAGE"
+    "$DOCKER_BIN" image remove --force --no-prune "$IMAGE" &>/dev/null || true
+  fi
+
+  fn-app-unpin-previous-image "$APP"
+  dokku_log_fail "App build failed"
 }
 
 dokku_release() {
@@ -651,41 +796,47 @@ release_and_deploy() {
 
   local APP="$1"
   local IMAGE_TAG="${2:-latest}"
-  local IMAGE=$(get_app_image_name "$APP" "$IMAGE_TAG")
-  local DOKKU_DOCKERFILE_PORTS
+  local SOURCE="${3:-deploy}"
 
-  if verify_image "$IMAGE"; then
-    if is_image_herokuish_based "$IMAGE" "$APP"; then
-      local IMAGE_SOURCE_TYPE="herokuish"
-    else
-      local IMAGE_SOURCE_TYPE="dockerfile"
-      DOKKU_DOCKERFILE_PORTS=$(config_get "$APP" DOKKU_DOCKERFILE_PORTS || true)
-      if [[ -z "$DOKKU_DOCKERFILE_PORTS" ]]; then
-        local DOCKER_IMAGE_PORTS=$(get_exposed_ports_from_image "$IMAGE")
-        [[ -n "$DOCKER_IMAGE_PORTS" ]] && config_set --no-restart "$APP" DOKKU_DOCKERFILE_PORTS="$DOCKER_IMAGE_PORTS"
-      fi
+  dokku_setup_build_capture "$APP" "$SOURCE"
+
+  local IMAGE=$(get_app_image_name "$APP" "$IMAGE_TAG")
+  local exit_code=0
+
+  if fn-verify-app-image "$APP" "$IMAGE"; then
+    if ! declare -f -F fn-plugin-property-get-default >/dev/null; then
+      source "$PLUGIN_CORE_AVAILABLE_PATH/common/property-functions"
     fi
 
-    local DOKKU_APP_SKIP_DEPLOY="$(config_get "$APP" DOKKU_SKIP_DEPLOY || true)"
-    local DOKKU_GLOBAL_SKIP_DEPLOY="$(config_get --global DOKKU_SKIP_DEPLOY || true)"
+    IMAGE_SOURCE_TYPE="$(get_image_builder_type "$IMAGE" "$APP")"
+    local DOKKU_APP_SKIP_DEPLOY="$(fn-plugin-property-get-default "ps" "$APP" "skip-deploy" "")"
+    local DOKKU_GLOBAL_SKIP_DEPLOY="$(fn-plugin-property-get-default "ps" "--global" "skip-deploy" "")"
 
     local DOKKU_SKIP_DEPLOY=${DOKKU_APP_SKIP_DEPLOY:="$DOKKU_GLOBAL_SKIP_DEPLOY"}
 
     dokku_log_info1 "Releasing $APP..."
-    dokku_release "$APP" "$IMAGE_SOURCE_TYPE" "$IMAGE_TAG"
+    dokku_release "$APP" "$IMAGE_SOURCE_TYPE" "$IMAGE_TAG" || exit_code="$?"
 
-    if [[ "$DOKKU_SKIP_DEPLOY" != "true" ]]; then
+    if [[ "$exit_code" -eq 0 ]] && [[ "$DOKKU_SKIP_DEPLOY" != "true" ]]; then
       local DOKKU_SCHEDULER=$(get_app_scheduler "$APP")
       dokku_log_info1 "Deploying $APP via the $DOKKU_SCHEDULER scheduler..."
-      cmd-deploy "$APP" "$IMAGE_TAG"
-      dokku_log_info2 "Application deployed:"
-      get_app_urls urls "$APP" | sed "s/^/       /"
-    else
+      cmd-deploy "$APP" "$IMAGE_TAG" || exit_code="$?"
+      if [[ "$exit_code" -eq 0 ]]; then
+        dokku_log_info2 "Application deployed:"
+        plugn trigger domains-urls "$APP" urls | sed "s/^/       /"
+      fi
+    elif [[ "$exit_code" -eq 0 ]]; then
       dokku_log_info1 "Skipping deployment"
     fi
 
     echo
   fi
+
+  if [[ -n "$DOKKU_BUILD_ID" ]]; then
+    plugn trigger builds-record-finalize "$APP" "$DOKKU_BUILD_ID" "$exit_code" || true
+  fi
+
+  return "$exit_code"
 }
 
 dokku_receive() {
@@ -699,14 +850,18 @@ dokku_receive() {
 
   docker_cleanup "$APP"
 
-  local DOKKU_CNB_EXPERIMENTAL="$(config_get "$APP" DOKKU_CNB_EXPERIMENTAL || true)"
-  if [[ "$DOKKU_CNB_EXPERIMENTAL" == "1" ]]; then
-    IMAGE_SOURCE_TYPE="pack"
+  plugn trigger builder-set-property "$APP" "detected" "$IMAGE_SOURCE_TYPE"
+  if ! dokku_build "$APP" "$IMAGE_SOURCE_TYPE" "$TMP_WORK_DIR"; then
+    return 1
   fi
 
-  DOKKU_QUIET_OUTPUT=1 config_set --no-restart "$APP" DOKKU_APP_TYPE="$IMAGE_SOURCE_TYPE"
-  dokku_build "$APP" "$IMAGE_SOURCE_TYPE" "$TMP_WORK_DIR"
-  plugn trigger release-and-deploy "$APP"
+  if ! plugn trigger release-and-deploy "$APP"; then
+    fn-app-restore-previous-image "$APP" || true
+    fn-app-unpin-previous-image "$APP"
+    return 1
+  fi
+
+  fn-app-unpin-previous-image "$APP"
 }
 
 docker_cleanup() {
@@ -714,26 +869,14 @@ docker_cleanup() {
   declare APP="$1" FORCE_CLEANUP="$2"
   local DOKKU_APP_SKIP_CLEANUP
 
-  "$PLUGIN_CORE_AVAILABLE_PATH/common/common" --quiet docker-cleanup "$APP"
-}
-
-get_available_port() {
-  declare desc="returns first currently unused port > 1024"
-  while true; do
-    local port=$(shuf -i 1025-65535 -n 1)
-    if ! nc -z 0.0.0.0 "$port"; then
-      echo "$port"
-      return 0
-    else
-      continue
-    fi
-  done
+  "$PLUGIN_CORE_AVAILABLE_PATH/common/common" --quiet docker-cleanup "$APP" "$FORCE_CLEANUP"
 }
 
 dokku_auth() {
   declare desc="calls user-auth plugin trigger"
   export SSH_USER=${SSH_USER:=$USER}
   export SSH_NAME=${NAME:="default"}
+  export DOKKU_COMMAND="$1"
 
   local user_auth_count=$(find "$PLUGIN_PATH"/enabled/*/user-auth 2>/dev/null | wc -l)
 
@@ -792,60 +935,12 @@ get_ipv6_regex() {
   echo "${RE_IPV6}\$"
 }
 
-get_dockerfile_exposed_ports() {
-  declare desc="return all exposed ports from passed file path"
-  local DOCKERFILE_PORTS=$(grep -E "^EXPOSE " "$1" | awk '{ print $2 }' | xargs) || true
-  echo "$DOCKERFILE_PORTS"
-}
-
-get_exposed_ports_from_image() {
-  declare desc="return all exposed ports from passed image name"
-  local IMAGE="$1"
-  verify_image "$IMAGE"
-  # shellcheck disable=SC2016
-  local DOCKER_IMAGE_EXPOSED_PORTS="$("$DOCKER_BIN" image inspect --format '{{range $key, $value := .Config.ExposedPorts}}{{$key}} {{end}}' "$IMAGE")"
-  echo "$DOCKER_IMAGE_EXPOSED_PORTS"
-}
-
-get_entrypoint_from_image() {
-  declare desc="return .Config.Entrypoint from passed image name"
-  local IMAGE="$1"
-  verify_image "$IMAGE"
-  local DOCKER_IMAGE_ENTRYPOINT="$("$DOCKER_BIN" image inspect --format '{{range .Config.Entrypoint}}{{.}} {{end}}' "$IMAGE")"
-  echo "ENTRYPOINT $DOCKER_IMAGE_ENTRYPOINT"
-}
-
-get_cmd_from_image() {
-  declare desc="return .Config.Cmd from passed image name"
-  local IMAGE="$1"
-  verify_image "$IMAGE"
-  local DOCKER_IMAGE_CMD="$("$DOCKER_BIN" image inspect --format '{{range .Config.Cmd}}{{.}} {{end}}' "$IMAGE")"
-  DOCKER_IMAGE_CMD="${DOCKER_IMAGE_CMD/\/bin\/sh -c/}"
-  echo "CMD $DOCKER_IMAGE_CMD"
-}
-
 extract_directive_from_dockerfile() {
   declare desc="return requested directive from passed file path"
   local FILE_PATH="$1"
   local SEARCH_STRING="$2"
   local FOUND_LINE=$(grep -E "^${SEARCH_STRING} " "$FILE_PATH" | tail -n1) || true
   echo "$FOUND_LINE"
-}
-
-get_app_raw_tcp_ports() {
-  declare desc="extracts raw tcp port numbers from DOCKERFILE_PORTS config variable"
-  source "$PLUGIN_AVAILABLE_PATH/config/functions"
-
-  local APP="$1"
-  local DOCKERFILE_PORTS="$(config_get "$APP" DOKKU_DOCKERFILE_PORTS)"
-  for p in $DOCKERFILE_PORTS; do
-    if [[ ! "$p" =~ .*udp.* ]]; then
-      p=${p//\/tcp/}
-      raw_tcp_ports+="$p "
-    fi
-  done
-  local raw_tcp_ports="$(echo "$raw_tcp_ports" | xargs)"
-  echo "$raw_tcp_ports"
 }
 
 get_container_ports() {
@@ -859,113 +954,6 @@ get_container_ports() {
   done
 
   echo "$container_ports"
-}
-
-get_app_urls() {
-  declare desc="print an app's available urls"
-  declare URL_TYPE="$1" APP="$2"
-  local urls
-
-  urls=$(plugn trigger app-urls "$APP" "$URL_TYPE")
-  if [[ -n "$urls" ]]; then
-    echo "$urls" | sort
-  else
-    internal_get_app_urls "$URL_TYPE" "$APP" | sort
-  fi
-}
-
-internal_get_app_urls() {
-  declare desc="print an app's available urls"
-  source "$PLUGIN_AVAILABLE_PATH/certs/functions"
-  source "$PLUGIN_AVAILABLE_PATH/config/functions"
-
-  local APP="$2"
-  local URLS_FILE="$DOKKU_ROOT/$APP/URLS"
-  local DOKKU_PROXY_PORT_MAP=$(config_get "$APP" DOKKU_PROXY_PORT_MAP || true)
-
-  if [[ -s "$URLS_FILE" ]]; then
-    local app_urls="$(grep -v -E "^#" "$URLS_FILE")"
-    if [[ -n "$DOKKU_PROXY_PORT_MAP" ]]; then
-      local port_map app_vhost
-      local app_vhosts=$(plugn trigger domains-list "$APP")
-      for port_map in $DOKKU_PROXY_PORT_MAP; do
-        local scheme="$(awk -F ':' '{ print $1 }' <<<"$port_map")"
-        local listen_port="$(awk -F ':' '{ print $2 }' <<<"$port_map")"
-        for app_vhost in $app_vhosts; do
-          if [[ "$listen_port" != "80" ]] && [[ "$listen_port" != "443" ]]; then
-            port_urls+=" $scheme://$app_vhost:$listen_port "
-          else
-            port_urls+=" $scheme://$app_vhost "
-          fi
-        done
-      done
-    fi
-    local port_urls="$(echo "$port_urls" | xargs)"
-    local URLS="$(merge_dedupe_list "$port_urls $app_urls" " ")"
-    case "$1" in
-      url)
-        if is_ssl_enabled "$APP"; then
-          echo "$URLS" | tr ' ' '\n' | grep https | head -n1
-        else
-          echo "$URLS" | tr ' ' '\n' | head -n1
-        fi
-        ;;
-      urls)
-        echo "$URLS" | tr ' ' '\n' | sort
-        ;;
-    esac
-  else
-    if [[ -s "$DOKKU_ROOT/VHOST" ]]; then
-      while read -r VHOST || [[ -n "$VHOST" ]]; do
-        internal_get_app_url_with_vhost "$APP" "$VHOST"
-      done <"$DOKKU_ROOT/VHOST"
-    else
-      internal_get_app_url_with_vhost "$APP" "$(hostname -f)"
-    fi
-  fi
-}
-
-internal_get_app_url_with_vhost() {
-  declare APP="$1" VHOST="$2"
-
-  local RAW_TCP_PORTS="$(get_app_raw_tcp_ports "$APP")"
-  local DOKKU_PROXY_PORT_MAP=$(config_get "$APP" DOKKU_PROXY_PORT_MAP || true)
-  local SCHEME="http"
-  local SSL="$DOKKU_ROOT/$APP/tls"
-  if [[ -e "$SSL/server.crt" && -e "$SSL/server.key" ]]; then
-    local SCHEME="https"
-  fi
-
-  if [[ "$(plugn trigger proxy-is-enabled "$APP")" == "false" ]]; then
-    if [[ -n "$RAW_TCP_PORTS" ]]; then
-      local APP_CONTAINER_PORTS="$(get_container_ports "$APP")"
-      local app_port
-      for app_port in $APP_CONTAINER_PORTS; do
-        echo "$VHOST:$app_port (container)"
-      done
-    else
-      local DOKKU_APP_WEB_LISTENERS PORT
-      DOKKU_APP_WEB_LISTENERS="$(plugn trigger network-get-listeners "$APP" "web" | xargs)"
-      for DOKKU_APP_WEB_LISTENER in $DOKKU_APP_WEB_LISTENERS; do
-        PORT="$(echo "$DOKKU_APP_WEB_LISTENER" | cut -d ':' -f2)"
-        echo "$SCHEME://$VHOST:$PORT (container)"
-      done
-      shopt -u nullglob
-    fi
-  elif [[ -n "$DOKKU_PROXY_PORT_MAP" ]]; then
-    local port_map
-    for port_map in $DOKKU_PROXY_PORT_MAP; do
-      local scheme="$(awk -F ':' '{ print $1 }' <<<"$port_map")"
-      local listen_port="$(awk -F ':' '{ print $2 }' <<<"$port_map")"
-      echo "$scheme://$VHOST:$listen_port"
-    done
-  elif [[ -n "$RAW_TCP_PORTS" ]]; then
-    for p in $RAW_TCP_PORTS; do
-      echo "http://$VHOST:$p"
-    done
-  else
-    echo "$SCHEME://$VHOST"
-  fi
 }
 
 get_json_value() {
@@ -1034,21 +1022,124 @@ merge_dedupe_list() {
   echo "$merged_list"
 }
 
-acquire_app_deploy_lock() {
-  declare desc="acquire advisory lock for use in deploys"
-  local APP="$1"
-  local LOCK_TYPE="${2:-waiting}"
-  local APP_DEPLOY_LOCK_FILE="$DOKKU_ROOT/$APP/.deploy.lock"
+fn-build-capture-app-name() {
+  declare desc="outputs the app name from the arguments of a build-capturing command, skipping any flags"
+  shift 1
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --all)
+        return 0
+        ;;
+      --parallel)
+        shift 1
+        [[ $# -gt 0 ]] && shift 1
+        ;;
+      -*)
+        shift 1
+        ;;
+      *)
+        echo "$1"
+        return 0
+        ;;
+    esac
+  done
+}
+
+dokku_setup_build_capture() {
+  declare desc="generate a build-id, write a record, and redirect output to log + journald"
+  declare APP="$1" SOURCE="${2:-unknown}"
+  [[ "$DOKKU_REDIRECT_OUTPUT" == "true" ]] && return 0
+  if [[ -z "$APP" ]]; then
+    return 0
+  fi
+  export DOKKU_REDIRECT_OUTPUT=true
+  if [[ -z "$DOKKU_BUILD_ID" ]]; then
+    DOKKU_BUILD_ID="$(plugn trigger builds-generate-id 2>/dev/null)"
+    if [[ -z "$DOKKU_BUILD_ID" ]]; then
+      DOKKU_BUILD_ID="pid-${DOKKU_PID}"
+    fi
+    export DOKKU_BUILD_ID
+  fi
+  export DOKKU_BUILD_SOURCE="$SOURCE"
+  local DIR="$DOKKU_LIB_ROOT/data/builds/$APP"
+  local LOG="$DIR/${DOKKU_BUILD_ID}.log"
+  mkdir -p "$DIR" && : >"$LOG"
+  export DOKKU_BUILD_LOG_FILE="$LOG"
+  plugn trigger builds-record-start "$APP" "$DOKKU_BUILD_ID" "$$" "$SOURCE" || true
+  exec &> >(tee -a "$LOG" >(logger -i -t "dokku-${DOKKU_BUILD_ID}"))
+}
+
+dokku_discard_build_capture() {
+  declare desc="drop the build record started by dokku_setup_build_capture when nothing ended up being built"
+  declare APP="$1"
+  if [[ -z "$APP" ]] || [[ -z "$DOKKU_BUILD_ID" ]]; then
+    return 0
+  fi
+
+  plugn trigger builds-record-discard "$APP" "$DOKKU_BUILD_ID" || true
+  # forget the id so a later finalize does not warn about the missing record.
+  # output stays redirected: the tee keeps the now-unlinked log open until the
+  # process exits, and stdout still reaches the operator.
+  unset DOKKU_BUILD_ID DOKKU_BUILD_LOG_FILE DOKKU_BUILD_SOURCE
+}
+
+app_deploy_lock_file() {
+  declare desc="outputs the path to the deploy lock file for an app"
+  declare APP="$1"
+  echo "$DOKKU_LIB_ROOT/data/apps/$APP/.deploy.lock"
+}
+
+app_manual_lock_file() {
+  declare desc="outputs the path to the manual lock file created by apps:lock for an app"
+  declare APP="$1"
+  echo "$DOKKU_LIB_ROOT/data/apps/$APP/.manual-deploy.lock"
+}
+
+acquire_app_advisory_lock() {
+  declare desc="acquire the advisory lock for an app's deploys, failing if the app was locked via apps:lock"
+  declare APP="$1" LOCK_TYPE="${2:-waiting}"
+  local APP_DEPLOY_LOCK_FILE="$(app_deploy_lock_file "$APP")"
   local LOCK_WAITING_MSG="$APP currently has a deploy lock in place. Waiting..."
   local LOCK_FAILED_MSG="$APP currently has a deploy lock in place. Exiting..."
 
   acquire_advisory_lock "$APP_DEPLOY_LOCK_FILE" "$LOCK_TYPE" "$LOCK_WAITING_MSG" "$LOCK_FAILED_MSG"
+  if [[ ! -f "$(app_manual_lock_file "$APP")" ]]; then
+    return 0
+  fi
+
+  release_advisory_lock "$APP_DEPLOY_LOCK_FILE"
+  dokku_discard_build_capture "$APP"
+  dokku_log_warn "$APP has been locked via apps:lock"
+  dokku_log_fail "Run 'apps:unlock' to allow deploys"
+}
+
+acquire_app_deploy_lock() {
+  declare desc="acquire advisory lock for use in deploys, releasing it and finalizing the build record when the shell exits"
+  local APP="$1"
+  local LOCK_TYPE="${2:-waiting}"
+
+  if [[ -z "$DOKKU_BUILD_ID" ]]; then
+    DOKKU_BUILD_ID="$(plugn trigger builds-generate-id 2>/dev/null)"
+    if [[ -z "$DOKKU_BUILD_ID" ]]; then
+      DOKKU_BUILD_ID="pid-${DOKKU_PID}"
+    fi
+    export DOKKU_BUILD_ID
+  fi
+
+  acquire_app_advisory_lock "$APP" "$LOCK_TYPE"
+  trap "release_app_deploy_lock '$APP' \"\$?\"" EXIT
 }
 
 release_app_deploy_lock() {
   declare desc="release advisory lock used in deploys"
   local APP="$1"
-  local APP_DEPLOY_LOCK_FILE="$DOKKU_ROOT/$APP/.deploy.lock"
+  local EXIT_CODE="${2:-0}"
+  local APP_DEPLOY_LOCK_FILE="$(app_deploy_lock_file "$APP")"
+
+  if [[ -n "$DOKKU_BUILD_ID" ]]; then
+    plugn trigger builds-record-finalize "$APP" "$DOKKU_BUILD_ID" "$EXIT_CODE" || true
+  fi
 
   release_advisory_lock "$APP_DEPLOY_LOCK_FILE"
 }
@@ -1059,24 +1150,39 @@ acquire_advisory_lock() {
   local LOCK_FD="200"
   local SHOW_MSG=true
 
-  eval "exec $LOCK_FD>$LOCK_FILE"
-  if [[ "$LOCK_TYPE" == "waiting" ]]; then
-    while [[ $(
-      flock -n "$LOCK_FD" &>/dev/null
-      echo $?
-    ) -ne 0 ]]; do
-      if [[ "$SHOW_MSG" == "true" ]]; then
-        echo "$LOCK_WAITING_MSG"
-        SHOW_MSG=false
+  while true; do
+    # opened for appending so a failed attempt does not truncate the build id
+    # written by the current lock holder
+    eval "exec $LOCK_FD>>$LOCK_FILE"
+    if [[ "$LOCK_TYPE" == "waiting" ]]; then
+      while [[ $(
+        flock -n "$LOCK_FD" &>/dev/null
+        echo $?
+      ) -ne 0 ]]; do
+        if [[ "$SHOW_MSG" == "true" ]]; then
+          echo "$LOCK_WAITING_MSG"
+          SHOW_MSG=false
+        fi
+        sleep 1
+      done
+    else
+      # the short wait lets an apps:locked check that briefly takes the lock
+      # finish instead of failing the deploy
+      if ! flock -w 1 "$LOCK_FD" &>/dev/null; then
+        dokku_log_warn "$LOCK_FAILED_MSG"
+        dokku_log_fail "Run 'apps:unlock' to release the existing deploy lock"
       fi
-      sleep 1
-    done
-  else
-    if ! flock -n "$LOCK_FD" &>/dev/null; then
-      dokku_log_warn "$LOCK_FAILED_MSG"
-      dokku_log_fail "Run 'apps:unlock' to release the existing deploy lock"
     fi
-  fi
+
+    # the previous holder removes the lock file on release, so the file locked
+    # above may no longer be the one at the lock path
+    if [[ "/proc/self/fd/$LOCK_FD" -ef "$LOCK_FILE" ]]; then
+      break
+    fi
+    eval "exec $LOCK_FD>&-"
+  done
+  echo "${DOKKU_BUILD_ID:-$DOKKU_PID}" >"$LOCK_FILE"
+  trap "release_advisory_lock '$LOCK_FILE'" EXIT
 }
 
 release_advisory_lock() {
@@ -1084,19 +1190,71 @@ release_advisory_lock() {
   local LOCK_FILE="$1"
   local LOCK_FD="200"
 
-  flock -u "$LOCK_FD" && rm -f "$LOCK_FILE" &>/dev/null
+  trap - EXIT
+
+  # the file is removed before unlocking so a waiter that locks it afterwards
+  # can tell that its lock is stale. It is only removed if it is still the file
+  # this process locked, as apps:unlock may have handed the path to another deploy
+  if [[ "/proc/self/fd/$LOCK_FD" -ef "$LOCK_FILE" ]]; then
+    rm -f "$LOCK_FILE" &>/dev/null
+  fi
+  flock -u "$LOCK_FD"
 }
 
 suppress_output() {
   declare desc="suppress all output from a given command unless there is an error"
   local TMP_COMMAND_OUTPUT
   TMP_COMMAND_OUTPUT=$(mktemp "/tmp/dokku-${DOKKU_PID}-${FUNCNAME[0]}.XXXXXX")
-  trap "rm -rf '$TMP_COMMAND_OUTPUT' >/dev/null" RETURN
 
   "$@" >"$TMP_COMMAND_OUTPUT" 2>&1 || {
     local exit_code="$?"
     cat "$TMP_COMMAND_OUTPUT"
+    rm -rf "$TMP_COMMAND_OUTPUT" >/dev/null
     return "$exit_code"
   }
+  rm -rf "$TMP_COMMAND_OUTPUT" >/dev/null
   return 0
+}
+
+fn-migrate-config-to-property() {
+  declare desc="[deprecated] migrates deprecated config variables to property counterpart. Use 'prop migrate-config-to-property' instead."
+  declare PLUGIN="$1" KEY="$2" CONFIG_VAR="$3" GLOBAL_CONFIG_VAR="$4"
+
+  # todo: refactor to remove config_unset usage
+  if ! declare -f -F config_unset >/dev/null; then
+    source "$PLUGIN_AVAILABLE_PATH/config/functions"
+  fi
+
+  if ! declare -f -F fn-plugin-property-write >/dev/null; then
+    source "$PLUGIN_CORE_AVAILABLE_PATH/common/property-functions"
+  fi
+
+  if [[ -n "$GLOBAL_CONFIG_VAR" ]]; then
+    local value=$(plugn trigger config-get-global "$GLOBAL_CONFIG_VAR" || true)
+    if [[ -n "$value" ]]; then
+      dokku_log_info1 "Migrating deprecated global $GLOBAL_CONFIG_VAR to $PLUGIN $KEY property."
+      fn-plugin-property-write "$PLUGIN" --global "$KEY" "$value"
+      DOKKU_QUIET_OUTPUT=1 config_unset --global "$GLOBAL_CONFIG_VAR" || true
+    fi
+  fi
+
+  for app in $(dokku_apps "false"); do
+    local value=$(plugn trigger config-get "$app" "$CONFIG_VAR" || true)
+    if [[ -n "$value" ]]; then
+      dokku_log_info1 "Migrating deprecated $CONFIG_VAR to $PLUGIN $KEY property for $app."
+      fn-plugin-property-write "$PLUGIN" "$app" "$KEY" "$value"
+      DOKKU_QUIET_OUTPUT=1 config_unset --no-restart "$app" "$CONFIG_VAR" || true
+    fi
+  done
+}
+
+fn-registry-docker-config-dir() {
+  declare desc="returns docker config file path if per-app registry credentials exist"
+  declare APP="$1"
+  local config_dir="/var/lib/dokku/config/registry/$APP"
+  local config_file="$config_dir/config.json"
+
+  if [[ -f "$config_file" ]] && [[ "$(jq -r '.auths | length' "$config_file" 2>/dev/null)" != "0" ]]; then
+    echo "$config_dir"
+  fi
 }

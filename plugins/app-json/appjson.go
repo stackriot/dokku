@@ -1,54 +1,402 @@
 package appjson
 
 import (
-	"path/filepath"
+	"encoding/json"
+	"fmt"
+	"math"
+	"os"
+	"sort"
+	"strings"
+	"unicode"
 
 	"github.com/dokku/dokku/plugins/common"
+	"github.com/tailscale/hujson"
+	"k8s.io/utils/ptr"
 )
 
 var (
-	// DefaultProperties is a map of all valid network properties with corresponding default property values
+	// DefaultProperties is a map of all valid app-json properties with corresponding default property values
 	DefaultProperties = map[string]string{
 		"appjson-path": "",
 	}
 
-	// GlobalProperties is a map of all valid global network properties
+	// GlobalProperties is a map of all valid global app-json properties
 	GlobalProperties = map[string]bool{
 		"appjson-path": true,
 	}
 )
 
+// EnvVarValue represents an environment variable definition in app.json
+// It supports both simple string values and complex object definitions
+type EnvVarValue struct {
+	// Description provides context for the env var (used in prompts)
+	Description string `json:"description,omitempty"`
+
+	// Value is the default value for the env var
+	Value string `json:"value,omitempty"`
+
+	// Required indicates if the env var must have a value (defaults to true per Heroku spec)
+	Required *bool `json:"required,omitempty"`
+
+	// Generator specifies how to auto-generate a value (currently only "secret" is supported)
+	Generator string `json:"generator,omitempty"`
+
+	// Sync indicates if the value should be set on every deploy, not just first
+	Sync bool `json:"sync,omitempty"`
+}
+
+// UnmarshalJSON handles both string and object formats for env vars
+func (e *EnvVarValue) UnmarshalJSON(data []byte) error {
+	var str string
+	if err := json.Unmarshal(data, &str); err == nil {
+		e.Value = str
+		return nil
+	}
+
+	type envVarAlias EnvVarValue
+	return json.Unmarshal(data, (*envVarAlias)(e))
+}
+
+// IsRequired returns true if the env var is required (defaults to true per Heroku spec)
+func (e *EnvVarValue) IsRequired() bool {
+	if e.Required == nil {
+		return true
+	}
+	return *e.Required
+}
+
 // AppJSON is a struct that represents an app.json file as understood by Dokku
 type AppJSON struct {
-	Cron      []CronCommand        `json:"cron"`
+	// Buildpacks is a list of buildpacks to use for the app
+	Buildpacks []Buildpack `json:"buildpacks"`
+
+	// Cron is a list of cron tasks to execute
+	Cron []CronTask `json:"cron"`
+
+	// Env is a map of environment variables to set
+	Env map[string]EnvVarValue `json:"env,omitempty"`
+
+	// Formation is a map of process types to scale
 	Formation map[string]Formation `json:"formation"`
-	Scripts   struct {
+
+	// Healthchecks is a map of process types to healthchecks
+	Healthchecks map[string][]Healthcheck `json:"healthchecks"`
+
+	// Scripts is a map of scripts to execute
+	Scripts struct {
+		// Dokku is a map of scripts to execute for Dokku-specific events
 		Dokku struct {
-			Predeploy  string `json:"predeploy"`
+			// Predeploy is a script to execute before a deploy
+			Predeploy string `json:"predeploy"`
+
+			// Postdeploy is a script to execute after a deploy
 			Postdeploy string `json:"postdeploy"`
 		} `json:"dokku"`
+
+		// Postdeploy is a script to execute after a deploy
 		Postdeploy string `json:"postdeploy"`
 	} `json:"scripts"`
 }
 
-// CronCommand is a struct that represents a single cron command from an app.json file
-type CronCommand struct {
-	Command  string `json:"command"`
+// Buildpack is a struct that represents a single buildpack
+type Buildpack struct {
+	// URL is the URL of the buildpack
+	URL string `json:"url"`
+}
+
+// CronTask is a struct that represents a single cron task from an app.json file
+type CronTask struct {
+	// Command is the command to execute
+	Command string `json:"command"`
+
+	// Maintenance is whether or not the cron task is in maintenance mode
+	Maintenance bool `json:"maintenance"`
+
+	// Schedule is the cron schedule to execute the command on
 	Schedule string `json:"schedule"`
+
+	// ConcurrencyPolicy is the concurrency policy for the cron command
+	ConcurrencyPolicy string `json:"concurrency_policy"`
 }
 
 // Formation is a struct that represents the scale for a process from an app.json file
 type Formation struct {
-	Quantity    *int `json:"quantity"`
+	// Autoscaling is whether or not to enable autoscaling
+	Autoscaling *FormationAutoscaling `json:"autoscaling"`
+
+	// Quantity is the number of processes to run
+	Quantity *int `json:"quantity"`
+
+	// MaxParallel is the maximum number of processes to start in parallel
 	MaxParallel *int `json:"max_parallel"`
+
+	// Service is a struct that represents how to expose the process to the network
+	// This only applies to non-web processes
+	Service *FormationService `json:"service"`
+}
+
+// FormationService is a struct that represents how to expose a process to the network
+type FormationService struct {
+	// Exposed is whether or not the process is exposed as a service
+	Exposed bool `json:"exposed"`
+}
+
+// FormationAutoscaling is a struct that represents the autoscaling configuration for a process from an app.json file
+type FormationAutoscaling struct {
+	// CoolDownSeconds is the number of seconds to wait before scaling again
+	CooldownPeriodSeconds *int `json:"cooldown_period_seconds,omitempty"`
+
+	// MaxQuantity is the maximum number of processes to run
+	MaxQuantity *int `json:"max_quantity,omitempty"`
+
+	// MinQuantity is the minimum number of processes to run
+	MinQuantity *int `json:"min_quantity,omitempty"`
+
+	// PollingIntervalSeconds is the number of seconds to wait between autoscaling checks
+	PollingIntervalSeconds *int `json:"polling_interval_seconds,omitempty"`
+
+	// Triggers is a list of triggers to use for autoscaling
+	Triggers []FormationAutoscalingTrigger `json:"triggers,omitempty"`
+}
+
+// FormationAutoscalingTrigger is a struct that represents a single autoscaling trigger from an app.json file
+type FormationAutoscalingTrigger struct {
+	// Name is the name of the trigger
+	Name string `json:"name,omitempty"`
+
+	// Type is the type of the trigger
+	Type string `json:"type,omitempty"`
+
+	// Metadata is a map of metadata to use for the trigger
+	Metadata map[string]string `json:"metadata,omitempty"`
+}
+
+// Healthcheck is a struct that represents a single healthcheck from an app.json file
+type Healthcheck struct {
+	// Attempts is the number of attempts to make before considering a healthcheck failed
+	Attempts int32 `json:"attempts,omitempty"`
+
+	// Command is the command to execute for the healthcheck
+	Command []string `json:"command,omitempty"`
+
+	// Content is the content to check for in the healthcheck response
+	Content string `json:"content,omitempty"`
+
+	// HTTPHeaders is a list of HTTP headers to send with the healthcheck request
+	HTTPHeaders []HTTPHeader `json:"httpHeaders,omitempty"`
+
+	// InitialDelay is the number of seconds to wait before starting healthchecks
+	InitialDelay int32 `json:"initialDelay,omitempty"`
+
+	// Listening is whether or not this is a listening check
+	Listening bool `json:"listening,omitempty"`
+
+	// Name is the name of the healthcheck
+	Name string `json:"name,omitempty"`
+
+	// Path is the path to check for in the healthcheck response
+	Path string `json:"path,omitempty"`
+
+	// Port is the port to check for in the healthcheck response
+	Port int `json:"port,omitempty"`
+
+	// Scheme is the scheme to use for the healthcheck request
+	Scheme string `json:"scheme,omitempty"`
+
+	// Timeout is the number of seconds to wait before considering a healthcheck failed
+	Timeout int32 `json:"timeout,omitempty"`
+
+	// Type is the type of healthcheck
+	Type HealthcheckType `json:"type,omitempty"`
+
+	// Uptime is the number of seconds to wait before considering a container running
+	Uptime int32 `json:"uptime,omitempty"`
+
+	// Wait is the number of seconds to wait between healthchecks
+	Wait int32 `json:"wait,omitempty"`
+
+	// Warn is whether or not to warn on a failed healthcheck instead of error out
+	Warn bool `json:"warn,omitempty"`
+
+	// OnFailure is the action to take on a failed healthcheck
+	OnFailure *OnFailure `json:"onFailure,omitempty"`
+}
+
+// HealthcheckType is a string that represents the type of a healthcheck from an app.json file
+type HealthcheckType string
+
+const (
+	// HealthcheckType_Liveness is a healthcheck type that represents a liveness check
+	HealthcheckType_Liveness HealthcheckType = "liveness"
+
+	// HealthcheckType_Readiness is a healthcheck type that represents a readiness check
+	HealthcheckType_Readiness HealthcheckType = "readiness"
+
+	// HealthcheckType_Startup is a healthcheck type that represents a startup check
+	HealthcheckType_Startup HealthcheckType = "startup"
+)
+
+// validateHealthchecks ensures healthcheck fields that are passed to schedulers and proxies are well-formed
+func validateHealthchecks(appJSON AppJSON) error {
+	processTypes := make([]string, 0, len(appJSON.Healthchecks))
+	for processType := range appJSON.Healthchecks {
+		processTypes = append(processTypes, processType)
+	}
+	sort.Strings(processTypes)
+
+	for _, processType := range processTypes {
+		for index, healthcheck := range appJSON.Healthchecks[processType] {
+			name := healthcheck.Name
+			if name == "" {
+				name = fmt.Sprintf("#%d", index+1)
+			}
+
+			if err := validateHealthcheckScheme(healthcheck.Scheme); err != nil {
+				return fmt.Errorf("Invalid app.json healthcheck %s for process type %s: %w", name, processType, err)
+			}
+
+			if err := validateHealthcheckPath(healthcheck.Path); err != nil {
+				return fmt.Errorf("Invalid app.json healthcheck %s for process type %s: %w", name, processType, err)
+			}
+		}
+	}
+
+	return nil
+}
+
+// validateHealthcheckPath ensures a healthcheck path is absolute and contains no whitespace, control, or quote characters
+func validateHealthcheckPath(path string) error {
+	if path == "" {
+		return nil
+	}
+
+	if !strings.HasPrefix(path, "/") {
+		return fmt.Errorf("path %q must start with a /", path)
+	}
+
+	for _, r := range path {
+		if unicode.IsSpace(r) || unicode.IsControl(r) || strings.ContainsRune(`"'\`, r) {
+			return fmt.Errorf("path %q must not contain whitespace, control characters, quotes, or backslashes", path)
+		}
+	}
+
+	return nil
+}
+
+// validateHealthcheckScheme ensures a healthcheck scheme is either http or https
+func validateHealthcheckScheme(scheme string) error {
+	if scheme == "" {
+		return nil
+	}
+
+	switch strings.ToLower(scheme) {
+	case "http", "https":
+		return nil
+	}
+
+	return fmt.Errorf("scheme %q must be one of http or https", scheme)
+}
+
+// HTTPHeader is a struct that represents a single HTTP header associated with a healthcheck
+type HTTPHeader struct {
+	// Name is the name of the HTTP header
+	Name string `json:"name,omitempty"`
+
+	// Value is the value of the HTTP header
+	Value string `json:"value,omitempty"`
+}
+
+// OnFailure is a struct that represents the on failure action for a healthcheck
+type OnFailure struct {
+	// Command is the command to execute on failure
+	Command []string `json:"command,omitempty"`
+
+	// Url is the URL to call on failure
+	Url string `json:"url,omitempty"`
 }
 
 // GetAppjsonDirectory returns the directory containing a given app's extracted app.json file
 func GetAppjsonDirectory(appName string) string {
-	return filepath.Join(common.MustGetEnv("DOKKU_LIB_ROOT"), "data", "app-json", appName)
+	return common.GetAppDataDirectory("app-json", appName)
 }
 
-// GetAppjsonPath returns the path to a given app's extracted app.json file
+// GetAppjsonPath returns the path to a given app's extracted app.json file for use by other plugins
 func GetAppjsonPath(appName string) string {
-	return filepath.Join(GetAppjsonDirectory(appName), "app.json")
+	return getProcessSpecificAppJSONPath(appName)
+}
+
+// GetAppJSON returns the parsed app.json file for a given app
+func GetAppJSON(appName string) (AppJSON, error) {
+	if !hasAppJSON(appName) {
+		return AppJSON{}, nil
+	}
+
+	appJSONPath := getProcessSpecificAppJSONPath(appName)
+
+	return ReadAppJSON(appJSONPath)
+}
+
+func GetAutoscalingConfig(appName string, processType string, replicas int) (FormationAutoscaling, bool, error) {
+	appJSON, err := GetAppJSON(appName)
+	if err != nil {
+		return FormationAutoscaling{}, false, err
+	}
+
+	formation, ok := appJSON.Formation[processType]
+	if !ok {
+		return FormationAutoscaling{}, false, nil
+	}
+
+	if formation.Autoscaling == nil {
+		return FormationAutoscaling{}, false, nil
+	}
+
+	autoscaling := *formation.Autoscaling
+	if autoscaling.CooldownPeriodSeconds == nil {
+		autoscaling.CooldownPeriodSeconds = ptr.To(300)
+	}
+
+	if autoscaling.MinQuantity == nil {
+		autoscaling.MinQuantity = ptr.To(replicas)
+	}
+
+	if autoscaling.MaxQuantity == nil {
+		defaultValue := math.Max(float64(replicas), float64(*autoscaling.MinQuantity))
+		autoscaling.MaxQuantity = ptr.To(int(defaultValue))
+	}
+
+	if autoscaling.PollingIntervalSeconds == nil {
+		autoscaling.PollingIntervalSeconds = ptr.To(30)
+	}
+
+	if len(autoscaling.Triggers) == 0 {
+		return FormationAutoscaling{}, false, nil
+	}
+
+	return autoscaling, true, nil
+}
+
+// ReadAppJSON reads an app.json file from a given path
+func ReadAppJSON(path string) (AppJSON, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return AppJSON{}, fmt.Errorf("Cannot read app.json file: %v", err)
+	}
+
+	if strings.TrimSpace(string(b)) == "" {
+		return AppJSON{}, nil
+	}
+
+	ast, err := hujson.Parse(b)
+	if err != nil {
+		return AppJSON{}, fmt.Errorf("Cannot parse app.json as jsonc: %v", err)
+	}
+	ast.Standardize()
+
+	var appJSON AppJSON
+	if err = json.Unmarshal(ast.Pack(), &appJSON); err != nil {
+		return AppJSON{}, fmt.Errorf("Cannot parse app.json: %v", err)
+	}
+
+	return appJSON, nil
 }

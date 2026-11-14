@@ -3,87 +3,64 @@ package common
 import (
 	"bufio"
 	"fmt"
-	"io"
-	"io/ioutil"
 	"os"
 	"os/user"
 	"strconv"
 	"strings"
+
+	"github.com/otiai10/copy"
 )
 
 // CatFile cats the contents of a file (if it exists)
 func CatFile(filename string) {
-	slice, err := FileToSlice(filename)
+	f, err := os.Open(filename)
 	if err != nil {
-		LogDebug(fmt.Sprintf("Error cat'ing file %s: %s", filename, err.Error()))
 		return
 	}
+	defer f.Close()
 
-	for _, line := range slice {
-		LogDebug(fmt.Sprintf("line: '%s'", line))
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		LogDebug(fmt.Sprintf("line: '%s'", scanner.Text()))
 	}
 }
 
-// CopyFile copies a file from src to dst. If src and dst files exist, and are
-// the same, then return success. Otherise, attempt to create a hard link
-// between the two files. If that fail, copy the file contents from src to dst.
-// FROM: https://stackoverflow.com/a/21067803/1515875
-func CopyFile(src, dst string) (err error) {
-	sfi, err := os.Stat(src)
+// Copy copies a file/directory from src to dst. If the source is a file, it will also
+// convert line endings to unix style
+func Copy(src, dst string) error {
+	fi, err := os.Stat(src)
 	if err != nil {
-		return
+		return err
 	}
-	if !sfi.Mode().IsRegular() {
-		// cannot copy non-regular files (e.g., directories,
-		// symlinks, devices, etc.)
-		return fmt.Errorf("CopyFile: non-regular source file %s (%q)", sfi.Name(), sfi.Mode().String())
-	}
-	dfi, err := os.Stat(dst)
-	if err != nil {
-		if !os.IsNotExist(err) {
-			return
-		}
-	} else {
-		if !(dfi.Mode().IsRegular()) {
-			return fmt.Errorf("CopyFile: non-regular destination file %s (%q)", dfi.Name(), dfi.Mode().String())
-		}
-		if os.SameFile(sfi, dfi) {
-			return
-		}
-	}
-	if err = os.Link(src, dst); err == nil {
-		return
-	}
-	err = copyFileContents(src, dst)
-	return
-}
 
-// copyFileContents copies the contents of the file named src to the file named
-// by dst. The file will be created if it does not already exist. If the
-// destination file exists, all it's contents will be replaced by the contents
-// of the source file.
-// FROM: https://stackoverflow.com/a/21067803/1515875
-func copyFileContents(src, dst string) (err error) {
-	in, err := os.Open(src)
+	if !fi.Mode().IsRegular() {
+		return copy.Copy(src, dst)
+	}
+
+	// ensure file has the correct line endings
+	result, err := CallExecCommand(ExecCommandInput{
+		Command: "dos2unix",
+		Args:    []string{"-l", "-n", src, dst},
+	})
 	if err != nil {
-		return
+		return fmt.Errorf("Error running dos2unix: %s", err)
 	}
-	defer in.Close()
-	out, err := os.Create(dst)
+	if result.ExitCode != 0 {
+		return fmt.Errorf("Error running dos2unix: %s", result.StderrContents())
+	}
+
+	// ensure file permissions are correct
+	b, err := os.ReadFile(dst)
 	if err != nil {
-		return
+		return err
 	}
-	defer func() {
-		cerr := out.Close()
-		if err == nil {
-			err = cerr
-		}
-	}()
-	if _, err = io.Copy(out, in); err != nil {
-		return
+
+	err = os.WriteFile(dst, b, fi.Mode())
+	if err != nil {
+		return err
 	}
-	err = out.Sync()
-	return
+
+	return nil
 }
 
 // DirectoryExists returns if a path exists and is a directory
@@ -131,9 +108,20 @@ func IsAbsPath(path string) bool {
 	return strings.HasPrefix(path, "/")
 }
 
+// IsSymlink returns true if the path is a symlink
+// if lstat fails, it returns false
+func IsSymlink(path string) bool {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return false
+	}
+
+	return info.Mode()&os.ModeSymlink == os.ModeSymlink
+}
+
 // ListFilesWithPrefix lists files within a given path that have a given prefix
 func ListFilesWithPrefix(path string, prefix string) []string {
-	names, err := ioutil.ReadDir(path)
+	names, err := os.ReadDir(path)
 	if err != nil {
 		return []string{}
 	}
@@ -144,7 +132,7 @@ func ListFilesWithPrefix(path string, prefix string) []string {
 			continue
 		}
 
-		if f.Mode().IsRegular() {
+		if f.Type().IsRegular() {
 			files = append(files, fmt.Sprintf("%s/%s", path, f.Name()))
 		}
 	}
@@ -175,20 +163,33 @@ func ReadFirstLine(filename string) (text string) {
 	return
 }
 
+// SetPermissionInput is the input struct for SetPermissions
+type SetPermissionInput struct {
+	Filename  string
+	GroupName string
+	Mode      os.FileMode
+	Username  string
+}
+
 // SetPermissions sets the proper owner and filemode for a given file
-func SetPermissions(path string, fileMode os.FileMode) error {
-	if err := os.Chmod(path, fileMode); err != nil {
+func SetPermissions(input SetPermissionInput) error {
+	if err := os.Chmod(input.Filename, input.Mode); err != nil {
 		return err
 	}
 
-	systemGroup := GetenvWithDefault("DOKKU_SYSTEM_GROUP", "dokku")
-	systemUser := GetenvWithDefault("DOKKU_SYSTEM_USER", "dokku")
+	if input.GroupName == "" {
+		input.GroupName = GetenvWithDefault("DOKKU_SYSTEM_GROUP", "dokku")
+	}
 
-	group, err := user.LookupGroup(systemGroup)
+	if input.Username == "" {
+		input.Username = GetenvWithDefault("DOKKU_SYSTEM_USER", "dokku")
+	}
+
+	group, err := user.LookupGroup(input.GroupName)
 	if err != nil {
 		return err
 	}
-	user, err := user.Lookup(systemUser)
+	user, err := user.Lookup(input.Username)
 	if err != nil {
 		return err
 	}
@@ -202,26 +203,116 @@ func SetPermissions(path string, fileMode os.FileMode) error {
 	if err != nil {
 		return err
 	}
-	return os.Chown(path, uid, gid)
+	return os.Chown(input.Filename, uid, gid)
+}
+
+// TouchDir creates an empty directory at the specified path
+func TouchDir(filename string) error {
+	mode := os.FileMode(0700)
+	return os.MkdirAll(filename, mode)
+}
+
+// TouchFile ensures a file exists at the specified path without truncating
+// its contents. It matches the semantics of unix touch(1): create the file if
+// it does not exist, otherwise leave the existing contents intact.
+func TouchFile(filename string) error {
+	mode := os.FileMode(0600)
+	file, err := os.OpenFile(filename, os.O_WRONLY|os.O_CREATE, mode)
+	if err != nil {
+		return fmt.Errorf("Error opening file %v for creation: %v", filename, err)
+	}
+	defer file.Close()
+
+	if err := file.Chmod(mode); err != nil {
+		return fmt.Errorf("Error setting chown for new file %v: %v", filename, err)
+	}
+
+	if err := SetPermissions(SetPermissionInput{
+		Filename: filename,
+		Mode:     mode,
+	}); err != nil {
+		return fmt.Errorf("Error setting permissions for new file %v: %v", filename, err)
+	}
+
+	return nil
+}
+
+// WriteSliceToFileInput writes a slice of strings to a file
+type WriteSliceToFileInput struct {
+	Filename  string
+	GroupName string
+	Lines     []string
+	Mode      os.FileMode
+	Username  string
 }
 
 // WriteSliceToFile writes a slice of strings to a file
-func WriteSliceToFile(filename string, lines []string) error {
-	file, err := os.OpenFile(filename, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0600)
+func WriteSliceToFile(input WriteSliceToFileInput) error {
+	return WriteBytesToFile(WriteBytesToFileInput{
+		Bytes:     []byte(strings.TrimSuffix(strings.Join(input.Lines, "\n"), "\n") + "\n"),
+		Filename:  input.Filename,
+		GroupName: input.GroupName,
+		Mode:      input.Mode,
+		Username:  input.Username,
+	})
+}
+
+// WriteStringToFile writes a string to a file
+type WriteStringToFileInput struct {
+	Content   string
+	Filename  string
+	GroupName string
+	Mode      os.FileMode
+	Username  string
+}
+
+// WriteStringToFile writes a string to a file
+func WriteStringToFile(input WriteStringToFileInput) error {
+	return WriteBytesToFile(WriteBytesToFileInput{
+		Bytes:     []byte(input.Content),
+		Filename:  input.Filename,
+		GroupName: input.GroupName,
+		Mode:      input.Mode,
+		Username:  input.Username,
+	})
+}
+
+// WriteBytesToFileInput writes a byte array to a file
+type WriteBytesToFileInput struct {
+	Bytes     []byte
+	Filename  string
+	GroupName string
+	Mode      os.FileMode
+	Username  string
+}
+
+// WriteBytesToFile writes a byte array to a file
+func WriteBytesToFile(input WriteBytesToFileInput) error {
+	file, err := os.OpenFile(input.Filename, os.O_RDWR|os.O_CREATE|os.O_TRUNC, input.Mode)
 	if err != nil {
 		return err
 	}
+	defer file.Close()
 
-	w := bufio.NewWriter(file)
-	for _, line := range lines {
-		fmt.Fprintln(w, line)
-	}
-	if err = w.Flush(); err != nil {
+	if _, err := file.Write(input.Bytes); err != nil {
 		return err
 	}
 
-	file.Chmod(0600)
-	SetPermissions(filename, 0600)
+	if err := file.Chmod(input.Mode); err != nil {
+		return err
+	}
 
-	return nil
+	permissionsInput := SetPermissionInput{
+		Filename: input.Filename,
+		Mode:     input.Mode,
+	}
+
+	if input.GroupName != "" {
+		permissionsInput.GroupName = input.GroupName
+	}
+	if input.Username != "" {
+		permissionsInput.Username = input.Username
+	}
+
+	return SetPermissions(permissionsInput)
 }

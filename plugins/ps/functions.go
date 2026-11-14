@@ -1,7 +1,7 @@
 package ps
 
 import (
-	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -12,89 +12,109 @@ import (
 
 	"github.com/dokku/dokku/plugins/common"
 	dockeroptions "github.com/dokku/dokku/plugins/docker-options"
-	"github.com/ryanuber/columnize"
 )
+
+// appendClearedFormations appends a zero quantity formation for every existing
+// process type that was not specified, ensuring cleared process types are both
+// persisted and scaled down instead of being silently dropped
+func appendClearedFormations(formations FormationSlice, existingFormations FormationSlice) FormationSlice {
+	specifiedProcessTypes := map[string]bool{}
+	for _, formation := range formations {
+		specifiedProcessTypes[formation.ProcessType] = true
+	}
+
+	for _, existingFormation := range existingFormations {
+		if specifiedProcessTypes[existingFormation.ProcessType] {
+			continue
+		}
+
+		specifiedProcessTypes[existingFormation.ProcessType] = true
+		formations = append(formations, &Formation{
+			ProcessType: existingFormation.ProcessType,
+			Quantity:    0,
+		})
+	}
+
+	return formations
+}
 
 func canScaleApp(appName string) bool {
 	canScale := common.PropertyGetDefault("ps", appName, "can-scale", "true")
 	return common.ToBool(canScale)
 }
 
-func extractProcfile(appName, image string) error {
-	destination := getProcfilePath(appName)
-	common.CopyFromImage(appName, image, "Procfile", destination)
-	if !common.FileExists(destination) {
-		common.LogInfo1Quiet("No Procfile found in app image")
-		return nil
+// defaultProcessTuples returns the process tuples an app is created with, scaling
+// the web process to one when it is valid for the app and nothing otherwise
+func defaultProcessTuples(appName string) ([]string, error) {
+	if !hasProcfile(appName) {
+		return []string{"web=1"}, nil
 	}
 
-	common.LogInfo1Quiet("App Procfile file found")
-	checkCmd := common.NewShellCmd(strings.Join([]string{
-		"procfile-util",
-		"check",
-		"--procfile",
-		destination,
-	}, " "))
-	var stderr bytes.Buffer
-	checkCmd.ShowOutput = false
-	checkCmd.Command.Stderr = &stderr
-	_, err := checkCmd.Output()
-
+	validProcessTypes, err := processesInProcfile(getProcessSpecificProcfilePath(appName))
 	if err != nil {
-		return fmt.Errorf(strings.TrimSpace(stderr.String()))
+		return []string{}, err
 	}
 
-	return nil
-}
-
-func getProcessStatus(appName string) map[string]string {
-	statuses := make(map[string]string)
-	containerFiles := common.ListFilesWithPrefix(common.AppRoot(appName), "CONTAINER.")
-	for _, filename := range containerFiles {
-		containerID := common.ReadFirstLine(filename)
-		containerStatus, _ := common.DockerInspect(containerID, "{{ .State.Status }}")
-		process := strings.TrimPrefix(filename, fmt.Sprintf("%s/CONTAINER.", common.AppRoot(appName)))
-
-		if containerStatus == "" {
-			containerStatus = "missing"
-		}
-
-		statuses[process] = fmt.Sprintf("%s (CID: %s)", containerStatus, containerID[0:11])
+	if !validProcessTypes["web"] {
+		return []string{}, nil
 	}
 
-	return statuses
+	return []string{"web=1"}, nil
 }
 
-func getProcfileCommand(procfilePath string, processType string, port int) (string, error) {
+func getProcfileCommand(appName string, procfilePath string, processType string, port int) (string, error) {
 	if !common.FileExists(procfilePath) {
 		return "", errors.New("No procfile found")
 	}
 
-	shellCmd := common.NewShellCmd(strings.Join([]string{
-		"procfile-util",
-		"show",
-		"--procfile",
-		procfilePath,
-		"--process-type",
-		processType,
-		"--default-port",
-		strconv.Itoa(port),
-	}, " "))
-	var stderr bytes.Buffer
-	shellCmd.ShowOutput = false
-	shellCmd.Command.Stderr = &stderr
-	b, err := shellCmd.Output()
-
+	configResult, err := common.CallPlugnTrigger(common.PlugnTriggerInput{
+		Trigger: "config-export",
+		Args:    []string{appName, "false", "true", "envfile"},
+	})
 	if err != nil {
-		return "", fmt.Errorf(strings.TrimSpace(stderr.String()))
+		return "", err
 	}
 
-	return strings.TrimSpace(string(b[:])), nil
+	// write the envfile to a temporary file
+	tempFile, err := os.CreateTemp("", "envfile-*.env")
+	if err != nil {
+		return "", err
+	}
+	defer os.Remove(tempFile.Name())
+	if _, err := tempFile.Write(configResult.StdoutBytes()); err != nil {
+		return "", err
+	}
+	if err := tempFile.Close(); err != nil {
+		return "", err
+	}
+
+	result, err := common.CallExecCommand(common.ExecCommandInput{
+		Command: "procfile-util",
+		Args:    []string{"show", "--procfile", procfilePath, "--process-type", processType, "--default-port", strconv.Itoa(port), "--env-file", tempFile.Name()},
+	})
+	if err != nil {
+		return "", fmt.Errorf("Error running procfile-util: %s", err)
+	}
+	if result.ExitCode != 0 {
+		return "", fmt.Errorf("Error running procfile-util: %s", result.StderrContents())
+	}
+
+	return result.StdoutContents(), nil
 }
 
 func getProcfilePath(appName string) string {
-	directory := filepath.Join(common.MustGetEnv("DOKKU_LIB_ROOT"), "data", "ps", appName)
+	directory := common.GetAppDataDirectory("ps", appName)
 	return filepath.Join(directory, "Procfile")
+}
+
+func getProcessSpecificProcfilePath(appName string) string {
+	existingProcfile := getProcfilePath(appName)
+	processSpecificProcfile := fmt.Sprintf("%s.%s", existingProcfile, os.Getenv("DOKKU_PID"))
+	if common.FileExists(processSpecificProcfile) {
+		return processSpecificProcfile
+	}
+
+	return existingProcfile
 }
 
 func getRestartPolicy(appName string) (string, error) {
@@ -114,19 +134,33 @@ func getRestartPolicy(appName string) (string, error) {
 
 func getProcessCount(appName string) (int, error) {
 	scheduler := common.GetAppScheduler(appName)
-	b, _ := common.PlugnTriggerOutput("scheduler-app-status", []string{scheduler, appName}...)
-	count := strings.Split(strings.TrimSpace(string(b[:])), " ")[0]
+	results, _ := common.CallPlugnTrigger(common.PlugnTriggerInput{
+		Trigger: "scheduler-app-status",
+		Args:    []string{scheduler, appName},
+	})
+	count := strings.Split(results.StdoutContents(), " ")[0]
 	return strconv.Atoi(count)
 }
 
 func getRunningState(appName string) string {
 	scheduler := common.GetAppScheduler(appName)
-	b, _ := common.PlugnTriggerOutput("scheduler-app-status", []string{scheduler, appName}...)
-	return strings.Split(strings.TrimSpace(string(b[:])), " ")[1]
+	results, _ := common.CallPlugnTrigger(common.PlugnTriggerInput{
+		Trigger: "scheduler-app-status",
+		Args:    []string{scheduler, appName},
+	})
+	return strings.Split(results.StdoutContents(), " ")[1]
 }
 
 func hasProcfile(appName string) bool {
 	procfilePath := getProcfilePath(appName)
+	if common.FileExists(fmt.Sprintf("%s.%s.missing", procfilePath, os.Getenv("DOKKU_PID"))) {
+		return false
+	}
+
+	if common.FileExists(fmt.Sprintf("%s.%s", procfilePath, os.Getenv("DOKKU_PID"))) {
+		return true
+	}
+
 	return common.FileExists(procfilePath)
 }
 
@@ -152,18 +186,24 @@ func isValidRestartPolicy(policy string) bool {
 func parseProcessTuples(processTuples []string) (FormationSlice, error) {
 	formations := FormationSlice{}
 
+	foundFormations := map[string]bool{}
 	for _, processTuple := range processTuples {
-		s := strings.Split(processTuple, "=")
+		s := strings.SplitN(processTuple, "=", 2)
 		if len(s) == 1 {
 			return formations, fmt.Errorf("Missing count for process type %s", processTuple)
 		}
 
-		processType := s[0]
-		quantity, err := strconv.Atoi(s[1])
+		processType := strings.TrimSpace(s[0])
+		quantity, err := strconv.Atoi(strings.TrimSpace(s[1]))
 		if err != nil {
-			return formations, fmt.Errorf("Invalid count for process type %s", s[0])
+			return formations, fmt.Errorf("Invalid count for process type %s", processType)
 		}
 
+		if foundFormations[processType] {
+			continue
+		}
+
+		foundFormations[processType] = true
 		formations = append(formations, &Formation{
 			ProcessType: processType,
 			Quantity:    quantity,
@@ -176,22 +216,18 @@ func parseProcessTuples(processTuples []string) (FormationSlice, error) {
 func processesInProcfile(procfilePath string) (map[string]bool, error) {
 	processes := map[string]bool{}
 
-	shellCmd := common.NewShellCmd(strings.Join([]string{
-		"procfile-util",
-		"list",
-		"--procfile",
-		procfilePath,
-	}, " "))
-	var stderr bytes.Buffer
-	shellCmd.ShowOutput = false
-	shellCmd.Command.Stderr = &stderr
-	b, err := shellCmd.Output()
-
+	result, err := common.CallExecCommand(common.ExecCommandInput{
+		Command: "procfile-util",
+		Args:    []string{"list", "--procfile", procfilePath},
+	})
 	if err != nil {
-		return processes, fmt.Errorf(strings.TrimSpace(stderr.String()))
+		return processes, fmt.Errorf("Error listing processes: %s", err)
+	}
+	if result.ExitCode != 0 {
+		return processes, fmt.Errorf("Error listing processes: %s", result.StderrContents())
 	}
 
-	for _, s := range strings.Split(strings.TrimSpace(string(b[:])), "\n") {
+	for _, s := range strings.Split(result.StdoutContents(), "\n") {
 		processes[s] = true
 	}
 
@@ -205,53 +241,75 @@ func getFormations(appName string) (FormationSlice, error) {
 		return formations, err
 	}
 
-	return parseProcessTuples(processTuples)
-}
-
-func removeProcfile(appName string) error {
-	procfile := getProcfilePath(appName)
-	if !common.FileExists(procfile) {
-		return nil
+	oldProcessTuples, err := common.PropertyListGet("ps", appName, "scale.old")
+	if err != nil {
+		return formations, err
 	}
 
-	return os.Remove(procfile)
+	formations, err = parseProcessTuples(processTuples)
+	if err != nil {
+		return formations, err
+	}
+
+	oldFormations, err := parseProcessTuples(oldProcessTuples)
+	if err != nil {
+		return formations, err
+	}
+
+	foundProcessTypes := map[string]bool{}
+	for _, formation := range formations {
+		foundProcessTypes[formation.ProcessType] = true
+	}
+
+	for _, formation := range oldFormations {
+		if foundProcessTypes[formation.ProcessType] {
+			continue
+		}
+
+		foundProcessTypes[formation.ProcessType] = true
+		formations = append(formations, formation)
+	}
+
+	sort.Sort(formations)
+	return formations, nil
 }
 
 func restorePrep() error {
-	apps, err := common.DokkuApps()
+	_, err := common.CallPlugnTrigger(common.PlugnTriggerInput{
+		Trigger:     "proxy-clear-config",
+		Args:        []string{"--all"},
+		StreamStdio: true,
+	})
 	if err != nil {
-		common.LogWarn(err.Error())
-		return nil
-	}
-
-	for _, appName := range apps {
-		if err := common.PlugnTrigger("proxy-clear-config", []string{appName}...); err != nil {
-			return fmt.Errorf("Error clearing proxy config: %s", err)
-		}
+		return fmt.Errorf("Error clearing proxy config: %s", err)
 	}
 
 	return nil
 }
 
-func scaleReport(appName string) error {
+func scaleReport(appName string, format string) error {
 	formations, err := getFormations(appName)
 	if err != nil {
 		return err
 	}
 
+	if format == "json" {
+		out, err := json.Marshal(formations)
+		if err != nil {
+			return err
+		}
+
+		common.Log(string(out))
+		return nil
+	}
+
 	common.LogInfo1Quiet(fmt.Sprintf("Scaling for %s", appName))
-	config := columnize.DefaultConfig()
-	config.Delim = "="
-	config.Glue = ": "
-	config.Prefix = "    "
-	config.Empty = ""
 
 	content := []string{}
 	if os.Getenv("DOKKU_QUIET_OUTPUT") == "" {
 		content = append(content, "proctype=qty", "--------=---")
 	}
 
-	sort.Sort(formations)
 	for _, formation := range formations {
 		content = append(content, fmt.Sprintf("%s=%d", formation.ProcessType, formation.Quantity))
 	}
@@ -264,31 +322,88 @@ func scaleReport(appName string) error {
 	return nil
 }
 
-func scaleSet(appName string, skipDeploy bool, clearExisting bool, processTuples []string) error {
-	formations, err := parseProcessTuples(processTuples)
+// scaleSetInput is the input for the scaleSet function
+type scaleSetInput struct {
+	// appName is the name of the app to scale
+	appName string
+
+	// skipDeploy is a flag to skip the deploy phase
+	skipDeploy bool
+
+	// clearExisting is a flag to clear the existing scale
+	clearExisting bool
+
+	// processTuples is a list of process tuples to scale
+	processTuples []string
+
+	// deployOnlyChanged is a flag to deploy only the changed formations
+	deployOnlyChanged bool
+}
+
+func scaleSet(input scaleSetInput) error {
+	existingFormations, err := getFormations(input.appName)
 	if err != nil {
 		return err
 	}
 
-	if err := updateScale(appName, clearExisting, formations); err != nil {
-		return err
-	}
-
-	if skipDeploy {
-		return nil
-	}
-
-	if !common.IsDeployed(appName) {
-		return nil
-	}
-
-	imageTag, err := common.GetRunningImageTag(appName, "")
+	formations, err := parseProcessTuples(input.processTuples)
 	if err != nil {
 		return err
 	}
 
-	for _, formation := range formations {
-		if err := common.PlugnTrigger("deploy", []string{appName, imageTag, formation.ProcessType}...); err != nil {
+	if err := validateFormations(formations); err != nil {
+		return err
+	}
+
+	if input.clearExisting {
+		formations = appendClearedFormations(formations, existingFormations)
+	}
+
+	if err := updateScale(input.appName, input.clearExisting, formations); err != nil {
+		return err
+	}
+
+	if input.skipDeploy {
+		return nil
+	}
+
+	if !common.IsDeployed(input.appName) {
+		return nil
+	}
+
+	imageTag, err := common.GetRunningImageTag(input.appName, "")
+	if err != nil {
+		return err
+	}
+
+	changedFormations := FormationSlice{}
+	if input.deployOnlyChanged {
+		for _, formation := range formations {
+			isChanged := true
+			for _, existingFormation := range existingFormations {
+				if existingFormation.ProcessType == formation.ProcessType {
+					if existingFormation.Quantity == formation.Quantity {
+						isChanged = false
+						break
+					}
+				}
+			}
+
+			if isChanged {
+				changedFormations = append(changedFormations, formation)
+			}
+		}
+	} else {
+		changedFormations = formations
+	}
+
+	for _, formation := range changedFormations {
+		_, err := common.CallPlugnTrigger(common.PlugnTriggerInput{
+			Trigger:     "deploy",
+			Args:        []string{input.appName, imageTag, formation.ProcessType},
+			StreamStdio: true,
+		})
+		if err != nil {
 			return err
 		}
 	}
@@ -296,7 +411,18 @@ func scaleSet(appName string, skipDeploy bool, clearExisting bool, processTuples
 	return nil
 }
 
+// updateScale merges formationUpdates into the stored formation, holding the
+// app's ps property lock from the read of the stored formation to the write of
+// the merged one so concurrent scale changes cannot drop each other.
 func updateScale(appName string, clearExisting bool, formationUpdates FormationSlice) error {
+	return common.PropertyLock("ps", appName, func(p *common.LockedProperties) error {
+		return updateScaleWithLock(p, appName, clearExisting, formationUpdates)
+	})
+}
+
+// updateScaleWithLock merges formationUpdates into the stored formation. The
+// caller must hold the app's ps property lock.
+func updateScaleWithLock(p *common.LockedProperties, appName string, clearExisting bool, formationUpdates FormationSlice) error {
 	formations := FormationSlice{}
 	if !clearExisting {
 		processTuples, err := common.PropertyListGet("ps", appName, "scale")
@@ -310,12 +436,10 @@ func updateScale(appName string, clearExisting bool, formationUpdates FormationS
 		}
 	}
 
-	procfilePath := getProcfilePath(appName)
-	procfileExists := hasProcfile(appName)
 	validProcessTypes := make(map[string]bool)
-	if procfileExists {
+	if hasProcfile(appName) {
 		var err error
-		validProcessTypes, err = processesInProcfile(procfilePath)
+		validProcessTypes, err = processesInProcfile(getProcessSpecificProcfilePath(appName))
 		if err != nil {
 			return err
 		}
@@ -324,7 +448,7 @@ func updateScale(appName string, clearExisting bool, formationUpdates FormationS
 	foundProcessTypes := map[string]bool{}
 	updatedFormation := FormationSlice{}
 	for _, formation := range formationUpdates {
-		if procfileExists && !validProcessTypes[formation.ProcessType] && formation.Quantity != 0 {
+		if hasProcfile(appName) && !validProcessTypes[formation.ProcessType] && formation.Quantity != 0 {
 			return fmt.Errorf("%s is not a valid process name to scale up", formation.ProcessType)
 		}
 
@@ -359,9 +483,36 @@ func updateScale(appName string, clearExisting bool, formationUpdates FormationS
 	}
 
 	values := []string{}
+	oldValues := []string{}
 	for _, formation := range updatedFormation {
+		if !validProcessTypes[formation.ProcessType] && formation.Quantity == 0 {
+			oldValues = append(oldValues, fmt.Sprintf("%s=%d", formation.ProcessType, formation.Quantity))
+			continue
+		}
+
 		values = append(values, fmt.Sprintf("%s=%d", formation.ProcessType, formation.Quantity))
 	}
 
-	return common.PropertyListWrite("ps", appName, "scale", values)
+	if err := p.ListWrite("scale.old", oldValues); err != nil {
+		return err
+	}
+
+	return p.ListWrite("scale", values)
+}
+
+// validateFormations returns an error when a user specified formation cannot be scaled to.
+// Formations read back from the scale property are deliberately not validated so that a value
+// persisted by an older dokku version remains visible and repairable via ps:scale.
+func validateFormations(formations FormationSlice) error {
+	for _, formation := range formations {
+		if formation.ProcessType == "" {
+			return fmt.Errorf("Missing process type for count %d", formation.Quantity)
+		}
+
+		if formation.Quantity < 0 {
+			return fmt.Errorf("Invalid count for process type %s: value must be zero or greater", formation.ProcessType)
+		}
+	}
+
+	return nil
 }

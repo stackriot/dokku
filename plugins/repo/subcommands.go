@@ -10,14 +10,7 @@ func CommandGc(appName string) error {
 		return err
 	}
 
-	appRoot := common.AppRoot(appName)
-	cmdEnv := map[string]string{
-		"GIT_DIR": appRoot,
-	}
-	gitGcCmd := common.NewShellCmd("git gc --aggressive")
-	gitGcCmd.Env = cmdEnv
-	gitGcCmd.Execute()
-	return nil
+	return RepoGc(appName)
 }
 
 // CommandPurgeCache deletes the contents of the build cache stored in the repository

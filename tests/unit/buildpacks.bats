@@ -184,11 +184,123 @@ teardown() {
   assert_output "https://github.com/heroku/heroku-buildpack-golang.git https://github.com/heroku/heroku-buildpack-python.git https://github.com/heroku/heroku-buildpack-php.git"
 }
 
-@test "(buildpacks) buildpacks:set-property" {
-  run /bin/bash -c "dokku buildpacks:set-property --global stack gliderlabs/herokuish:latest"
+@test "(buildpacks) buildpacks:set --replace - failure" {
+  run /bin/bash -c "dokku buildpacks:set --replace $TEST_APP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_failure
+  assert_output_contains "buildpacks:clear"
+
+  run /bin/bash -c "dokku buildpacks:set --replace --index 1 $TEST_APP heroku/nodejs"
+  echo "output: $output"
+  echo "status: $status"
+  assert_failure
+  assert_output_contains "--index"
+
+  run /bin/bash -c "dokku buildpacks:set $TEST_APP heroku/nodejs heroku/ruby"
+  echo "output: $output"
+  echo "status: $status"
+  assert_failure
+  assert_output_contains "--replace"
+}
+
+@test "(buildpacks) buildpacks:set --replace - atomicity" {
+  run /bin/bash -c "dokku buildpacks:add $TEST_APP heroku/nodejs"
   echo "output: $output"
   echo "status: $status"
   assert_success
+
+  run /bin/bash -c "dokku buildpacks:set --replace $TEST_APP heroku/ruby nodejs"
+  echo "output: $output"
+  echo "status: $status"
+  assert_failure
+
+  run /bin/bash -c "dokku --quiet buildpacks:list $TEST_APP | xargs"
+  echo "output: $output"
+  echo "status: $status"
+  assert_output "https://github.com/heroku/heroku-buildpack-nodejs.git"
+}
+
+@test "(buildpacks) buildpacks:set --replace - success" {
+  run /bin/bash -c "dokku buildpacks:add $TEST_APP heroku/nodejs"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku buildpacks:add $TEST_APP heroku/python"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku buildpacks:set --replace $TEST_APP heroku/ruby heroku/golang heroku/php"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku --quiet buildpacks:list $TEST_APP | xargs"
+  echo "output: $output"
+  echo "status: $status"
+  assert_output "https://github.com/heroku/heroku-buildpack-ruby.git https://github.com/heroku/heroku-buildpack-golang.git https://github.com/heroku/heroku-buildpack-php.git"
+
+  run /bin/bash -c "dokku buildpacks:set --replace $TEST_APP heroku/nodejs"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku --quiet buildpacks:list $TEST_APP | xargs"
+  echo "output: $output"
+  echo "status: $status"
+  assert_output "https://github.com/heroku/heroku-buildpack-nodejs.git"
+}
+
+@test "(buildpacks) buildpacks:set-property forwards stack to the detected builder" {
+  run /bin/bash -c "dokku buildpacks:set-property $TEST_APP stack gliderlabs/herokuish:app"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output_contains "Deprecated"
+
+  run /bin/bash -c "dokku builder-herokuish:report $TEST_APP --builder-herokuish-stack"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "gliderlabs/herokuish:app"
+
+  run /bin/bash -c "dokku builder-pack:report $TEST_APP --builder-pack-stack"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output ""
+
+  run /bin/bash -c "dokku buildpacks:set-property $TEST_APP stack heroku/builder:24"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku builder-pack:report $TEST_APP --builder-pack-stack"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "heroku/builder:24"
+
+  run /bin/bash -c "dokku buildpacks:set-property $TEST_APP stack"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku builder-herokuish:report $TEST_APP --builder-herokuish-stack"
+  assert_success
+  assert_output ""
+
+  run /bin/bash -c "dokku builder-pack:report $TEST_APP --builder-pack-stack"
+  assert_success
+  assert_output ""
+}
+
+@test "(buildpacks:report) emits new stripped JSON keys alongside legacy" {
+  run /bin/bash -c "dokku buildpacks:report $TEST_APP --format json | jq -r 'has(\"list\") and has(\"buildpacks-list\")'"
+  assert_success
+  assert_output "true"
 }
 
 @test "(buildpacks) buildpacks:remove" {
@@ -205,7 +317,7 @@ teardown() {
   run /bin/bash -c "dokku --quiet buildpacks:list $TEST_APP | xargs"
   echo "output: $output"
   echo "status: $status"
-  assert_output_contains "https://github.com/heroku/heroku-buildpack-nodejs.git https://github.com/heroku/heroku-buildpack-ruby.git"
+  assert_output "https://github.com/heroku/heroku-buildpack-nodejs.git https://github.com/heroku/heroku-buildpack-ruby.git"
 
   run /bin/bash -c "dokku buildpacks:remove $TEST_APP heroku/nodejs"
   echo "output: $output"
@@ -215,7 +327,7 @@ teardown() {
   run /bin/bash -c "dokku --quiet buildpacks:list $TEST_APP | xargs"
   echo "output: $output"
   echo "status: $status"
-  assert_output_contains "https://github.com/heroku/heroku-buildpack-ruby.git"
+  assert_output "https://github.com/heroku/heroku-buildpack-ruby.git"
 
   run /bin/bash -c "dokku buildpacks:remove $TEST_APP heroku/php"
   echo "output: $output"
@@ -231,8 +343,37 @@ teardown() {
   echo "output: $output"
   echo "status: $status"
   assert_output_not_exists
-}
 
+  run /bin/bash -c "dokku buildpacks:add $TEST_APP https://github.com/heroku/heroku-buildpack-nodejs.git"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku buildpacks:add $TEST_APP https://github.com/heroku/heroku-buildpack-ruby.git"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku buildpacks:add $TEST_APP https://github.com/yespark/heroku-imagemagick-buildpack"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku --quiet buildpacks:list $TEST_APP | xargs"
+  echo "output: $output"
+  echo "status: $status"
+  assert_output "https://github.com/heroku/heroku-buildpack-nodejs.git https://github.com/heroku/heroku-buildpack-ruby.git https://github.com/yespark/heroku-imagemagick-buildpack"
+
+  run /bin/bash -c "dokku buildpacks:remove $TEST_APP --index 1"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku --quiet buildpacks:list $TEST_APP | xargs"
+  echo "output: $output"
+  echo "status: $status"
+  assert_output "https://github.com/heroku/heroku-buildpack-ruby.git https://github.com/yespark/heroku-imagemagick-buildpack"
+}
 
 @test "(buildpacks) buildpacks:clear" {
   run /bin/bash -c "dokku buildpacks:set $TEST_APP heroku/nodejs"
@@ -299,12 +440,62 @@ teardown() {
 }
 
 @test "(buildpacks) cleanup existing .buildpacks file" {
-  run deploy_app python dokku@dokku.me:$TEST_APP template_buildpacks_cleanup
+  run deploy_app python dokku@$DOKKU_DOMAIN:$TEST_APP template_buildpacks_cleanup
   echo "output: $output"
   echo "status: $status"
   assert_success
   assert_output_contains "heroku-buildpack-apt"
   assert_output_contains "heroku-buildpack-python"
+}
+
+@test "(buildpacks) deploy with buildpacks from app.json" {
+  run deploy_app python dokku@$DOKKU_DOMAIN:$TEST_APP template_buildpacks_appjson
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output_contains "heroku-buildpack-python"
+}
+
+@test "(buildpacks:add) concurrent calls for the same app keep every buildpack" {
+  run run_concurrently 20 /bin/bash -c 'dokku buildpacks:add "$1" "https://github.com/dokku/buildpack-race$2.git"' _ "$TEST_APP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku --quiet buildpacks:list $TEST_APP | grep -cE '^ *https://github.com/dokku/buildpack-race[0-9]+\.git$'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "20"
+
+  run run_concurrently 20 /bin/bash -c 'dokku buildpacks:remove "$1" "https://github.com/dokku/buildpack-race$2.git"' _ "$TEST_APP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku --quiet buildpacks:list $TEST_APP | grep -cE '^ *https://github.com/dokku/buildpack-race[0-9]+\.git$'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_output "0"
+}
+
+template_buildpacks_appjson() {
+  local APP="$1"
+  local APP_REPO_DIR="$2"
+  [[ -z "$APP" ]] && local APP="$TEST_APP"
+  echo "injecting app.json with buildpacks -> $APP_REPO_DIR/app.json"
+  cat <<EOF >"$APP_REPO_DIR/app.json"
+{
+  "buildpacks": [
+    {
+      "url": "heroku/python"
+    }
+  ]
+}
+EOF
+
+  echo "injecting requirements.txt -> $APP_REPO_DIR/requirements.txt"
+  touch "$APP_REPO_DIR/requirements.txt"
 }
 
 template_buildpacks_cleanup() {

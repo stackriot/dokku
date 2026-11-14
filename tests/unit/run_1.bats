@@ -24,8 +24,12 @@ teardown() {
 }
 
 @test "(run) run (with --options)" {
-  deploy_app
-  run /bin/bash -c "dokku --force --quiet run $TEST_APP python -V"
+  run deploy_app
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku --force --quiet run $TEST_APP python3 -V"
   echo "output: $output"
   echo "status: $status"
   assert_success
@@ -42,7 +46,7 @@ teardown() {
   echo "status: $status"
   assert_success
 
-  run deploy_app python dokku@dokku.me:$TEST_APP add_requirements_txt
+  run deploy_app python dokku@$DOKKU_DOMAIN:$TEST_APP add_requirements_txt
   echo "output: $output"
   echo "status: $status"
   assert_success
@@ -64,12 +68,17 @@ teardown() {
   echo "status: $status"
   assert_success
 
-  run /bin/bash -c "dokku config:set --no-restart $TEST_APP DOKKU_CNB_EXPERIMENTAL=1 SECRET_KEY=fjdkslafjdk"
+  run /bin/bash -c "dokku config:set --no-restart $TEST_APP SECRET_KEY=fjdkslafjdk"
   echo "output: $output"
   echo "status: $status"
   assert_success
 
-  run deploy_app python dokku@dokku.me:$TEST_APP add_requirements_txt
+  run /bin/bash -c "dokku builder:set $TEST_APP selected pack"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run deploy_app python dokku@$DOKKU_DOMAIN:$TEST_APP add_requirements_txt_cnb
   echo "output: $output"
   echo "status: $status"
   assert_success
@@ -88,4 +97,108 @@ teardown() {
   echo "output: $output"
   echo "status: $status"
   assert_success
+}
+
+@test "(run) run:retire" {
+  run deploy_app
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku run:detached --ttl-seconds=1 $TEST_APP sleep 300"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  container_id="$output"
+
+  # check the labels on the container to ensure the active deadline seconds is set
+  run /bin/bash -c "docker container inspect $container_id --format '{{ index .Config.Labels \"com.dokku.active-deadline-seconds\" }}'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "1"
+
+  run /bin/bash -c "dokku run:list --quiet $TEST_APP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output_contains "$container_id"
+
+  run /bin/bash -c "sleep 2"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku run:retire"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku run:list --quiet $TEST_APP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output_not_contains "$container_id"
+}
+
+@test "(run:logs) run:logs" {
+  run deploy_app
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku run:detached $TEST_APP worker"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku run:list $TEST_APP --format json | jq -r '.[0].name'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  local RUN_CONTAINER="$output"
+  sleep 5
+
+  run /bin/bash -c "dokku run:logs $TEST_APP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output_contains "sleeping for 60 seconds"
+
+  run /bin/bash -c "dokku run:logs $TEST_APP -n 1 -q"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "sleeping for 60 seconds"
+
+  run /bin/bash -c "dokku run:logs --container $RUN_CONTAINER -q"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "sleeping for 60 seconds"
+
+  run /bin/bash -c "dokku run:stop $TEST_APP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+}
+
+@test "(run:logs) invalid arguments" {
+  run /bin/bash -c "dokku run:logs $TEST_APP -n abc"
+  echo "output: $output"
+  echo "status: $status"
+  assert_failure
+  assert_output_contains "Invalid value for num: must be an integer"
+
+  run /bin/bash -c "dokku run:logs $TEST_APP --container other-app.run.1"
+  echo "output: $output"
+  echo "status: $status"
+  assert_failure
+  assert_output_contains "Specified app does not match app in container name"
+
+  run /bin/bash -c "dokku run:logs --container $TEST_APP.run.1"
+  echo "output: $output"
+  echo "status: $status"
+  assert_failure
+  assert_output_contains "Specified container does not exist"
 }

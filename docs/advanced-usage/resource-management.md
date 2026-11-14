@@ -1,13 +1,14 @@
 # Resource Management
 
+> [!IMPORTANT]
 > New as of 0.15.0
 
 ```
 resource:limit [--process-type <process-type>] [RESOURCE_OPTS...] <app>    # Limit resources for a given app/process-type combination
-resource:limit-clear [--process-type <process-type>] <app>                 # Limit resources for a given app/process-type combination
+resource:limit-clear [--process-type <process-type>] <app>                 # Clear resource limits for a given app/process-type combination
 resource:report [<app>] [<flag>]                                           # Displays a resource report for one or more apps
 resource:reserve [--process-type <process-type>] [RESOURCE_OPTS...] <app>  # Reserve resources for a given app/process-type combination
-resource:reserve-clear [--process-type <process-type>] <app>               # Reserve resources for a given app/process-type combination
+resource:reserve-clear [--process-type <process-type>] <app>               # Clear resource reservations for a given app/process-type combination
 ```
 
 The resource plugin is meant to allow users to limit or reserve resources for a given app/process-type combination.
@@ -16,7 +17,8 @@ The resource plugin is meant to allow users to limit or reserve resources for a 
 
 By default, Dokku allows unlimited resource access to apps deployed on a server. In some cases, it may be desirable to limit this on a per-app or per-process-type basis. The `resource` plugin allows management of both resource "limits" and resource "reservations", where each resource request type has specific meaning to the scheduler in use for a given app.
 
-> Warning: The meaning of a values and it's units are specific to the scheduler in use for a given app. If a value is incorrect for a scheduler, this may result in containers failing to start correctly. If a scheduler does not support a given resource type combination, it will be ignored. All resource commands require an app rebuild or deploy in order to take effect.
+> [!WARNING]
+> The meaning of a values and it's units are specific to the scheduler in use for a given app. If a value is incorrect for a scheduler, this may result in containers failing to start correctly. If a scheduler does not support a given resource type combination, it will be ignored. All resource commands require an app rebuild or deploy in order to take effect.
 
 Valid resource options include:
 
@@ -28,9 +30,11 @@ Valid resource options include:
 - `--network-egress`
 - `--nvidia-gpu`
 
-See the [Supported Resource Management Properties](/docs/advanced-usage/schedulers/docker-local.md#supported-resource-management-properties) section of the docker local scheduler documentation for more information on how each resource limit maps to Docker.
+Values for `--memory` and `--memory-swap` are validated when set, and invalid values are rejected.
 
-Resource limits and reservations are applied only during the `run` and `deploy` phases of an application, and will not impact the `build` phase of an application.
+See the [Supported Resource Management Properties](/docs/deployment/schedulers/docker-local.md#supported-resource-management-properties) section of the docker local scheduler documentation for more information on how each resource limit maps to Docker.
+
+Resource reservations are applied only during the `run` and `deploy` phases of an application. Resource limits also apply during the `build` phase when explicitly configured against the `build` process type - see [Build-time Resource Limits](#build-time-resource-limits) below.
 
 ### Resource Limits
 
@@ -118,26 +122,60 @@ dokku resource:limit --process-type web node-js-app
        nvidia-gpu:
 ```
 
+#### Build-time Resource Limits
+
+> [!IMPORTANT]
+> New as of 0.38.0
+
+Resource limits may be applied to the build container by using the special `build` process type. This allows constraining memory and CPU usage during the `build` phase, which is otherwise unconstrained.
+
+```shell
+dokku resource:limit --memory 4g --process-type build node-js-app
+```
+
+```
+=====> Setting resource limits for node-js-app (build)
+       memory: 4g
+```
+
+Build-time limits are applied via the `docker-args-process-build` plugin trigger. They do not inherit from default (`_default_`) limits - only limits explicitly set against the `build` process type are applied at build time. This is intentional: build phases often require more memory than the runtime process, and silently inheriting a small runtime limit would cause confusing OOM failures.
+
+> [!WARNING]
+> Do not use `build` as a runtime process type in your `Procfile`. The `build` name is reserved by the resource plugin to scope limits to the build container, and using it as a Procfile entry will cause those limits to be applied to that runtime container as well.
+
+Supported limits per builder:
+
+| Builder    | `--cpu` | `--memory` | `--memory-swap` | `--nvidia-gpu` |
+|------------|---------|------------|-----------------|----------------|
+| herokuish  | yes     | yes        | yes             | yes            |
+| dockerfile | no      | yes        | yes             | no             |
+| pack       | no      | no         | no              | no             |
+| nixpacks   | no      | no         | no              | no             |
+| railpack   | no      | no         | no              | no             |
+| lambda     | no      | no         | no              | no             |
+
+Resource keys outside the supported set for a builder are silently ignored. Reservations (`resource:reserve`) are never applied at build time - only limits.
+
 #### Clearing Resource Limits
 
-In cases where the values are incorrect - or there is no desire to limit resources - resource limits may be cleared using the `resource:limit-clear` command.
+In cases where the values are incorrect - or there is no desire to limit resources - resource limits may be cleared using the `resource:limit-clear` command. When no process type is specified, resource limits are cleared for all process types. Resource reservations are left untouched.
 
 ```shell
 dokku resource:limit-clear node-js-app
 ```
 
 ```
------> Clearing resource limit for node-js-app
+=====> clearing node-js-app limits
 ```
 
-Defaults can also be cleared by leaving the app unspecified.
+Resource limits for a single process type can be cleared by specifying the `--process-type` flag.
 
 ```shell
-dokku resource:limit-clear
+dokku resource:limit-clear --process-type worker node-js-app
 ```
 
 ```
------> Clearing default resource limits
+=====> clearing node-js-app limits (worker)
 ```
 
 ### Resource Reservations
@@ -228,24 +266,24 @@ dokku resource:reserve --process-type web node-js-app
 
 #### Clearing Resource Reservations
 
-In cases where the values are incorrect - or there is no desire to reserve resources - resource reservations may be cleared using the `resource:reserve-clear` command.
+In cases where the values are incorrect - or there is no desire to reserve resources - resource reservations may be cleared using the `resource:reserve-clear` command. When no process type is specified, resource reservations are cleared for all process types. Resource limits are left untouched.
 
 ```shell
 dokku resource:reserve-clear node-js-app
 ```
 
 ```
------> Clearing resource reservation for node-js-app
+=====> clearing node-js-app reservation
 ```
 
-Defaults can also be cleared by leaving the app unspecified.
+Resource reservations for a single process type can be cleared by specifying the `--process-type` flag.
 
 ```shell
-dokku resource:reserve-clear
+dokku resource:reserve-clear --process-type worker node-js-app
 ```
 
 ```
------> Clearing default resource reservation
+=====> clearing node-js-app reservation (worker)
 ```
 
 ### Displaying resource reports for an app

@@ -1,7 +1,7 @@
 package network
 
 import (
-	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -13,22 +13,15 @@ import (
 // CommandCreate is an alias for "docker network create"
 func CommandCreate(networkName string) error {
 	common.LogInfo1Quiet(fmt.Sprintf("Creating network %v", networkName))
-	createCmd := common.NewShellCmd(strings.Join([]string{
-		common.DockerBin(),
-		"network",
-		"create",
-		"--attachable",
-		"--label",
-		fmt.Sprintf("com.dokku.network-name=%v", networkName),
-		networkName,
-	}, " "))
-	var stderr bytes.Buffer
-	createCmd.ShowOutput = false
-	createCmd.Command.Stderr = &stderr
-	_, err := createCmd.Output()
-
+	result, err := common.CallExecCommand(common.ExecCommandInput{
+		Command: common.DockerBin(),
+		Args:    []string{"network", "create", "--attachable", "--label", fmt.Sprintf("%s=%v", dokkuNetworkNameLabel, networkName), networkName},
+	})
 	if err != nil {
-		err = errors.New(strings.TrimSpace(stderr.String()))
+		return fmt.Errorf("Unable to create network: %w", err)
+	}
+	if result.ExitCode != 0 {
+		return fmt.Errorf("Unable to create network: %s", result.StderrContents())
 	}
 
 	return err
@@ -47,22 +40,18 @@ func CommandDestroy(networkName string, forceDestroy bool) error {
 	}
 
 	common.LogInfo1Quiet(fmt.Sprintf("Destroying network %v", networkName))
-	destroyCmd := common.NewShellCmd(strings.Join([]string{
-		common.DockerBin(),
-		"network",
-		"rm",
-		networkName,
-	}, " "))
-	var stderr bytes.Buffer
-	destroyCmd.ShowOutput = false
-	destroyCmd.Command.Stderr = &stderr
-	_, err := destroyCmd.Output()
-
+	result, err := common.CallExecCommand(common.ExecCommandInput{
+		Command: common.DockerBin(),
+		Args:    []string{"network", "rm", networkName},
+	})
 	if err != nil {
-		err = errors.New(strings.TrimSpace(stderr.String()))
+		return fmt.Errorf("Unable to destroy network: %w", err)
+	}
+	if result.ExitCode != 0 {
+		return fmt.Errorf("Unable to destroy network: %s", result.StderrContents())
 	}
 
-	return err
+	return nil
 }
 
 // CommandExists checks if a network exists
@@ -86,29 +75,96 @@ func CommandExists(networkName string) error {
 }
 
 // CommandInfo is an alias for "docker network inspect"
-func CommandInfo() error {
-	return nil
-}
+func CommandInfo(networkName string, format string) error {
+	if networkName == "" {
+		return errors.New("No network name specified")
+	}
 
-// CommandList is an alias for "docker network ls"
-func CommandList() error {
-	networks, err := listNetworks()
+	if format != "json" && format != "text" {
+		return errors.New("Invalid format specified, use either text or json")
+	}
+
+	networks, err := getNetworks()
 	if err != nil {
 		return err
 	}
 
+	network, ok := networks[networkName]
+	if !ok {
+		return errors.New("Network does not exist")
+	}
+
+	if format == "json" {
+		out, err := json.Marshal(network)
+		if err != nil {
+			return err
+		}
+		common.Log(string(out))
+		return nil
+	}
+
+	length := 16
+	common.LogInfo2Quiet(fmt.Sprintf("%s network information", networkName))
+	common.LogVerbose(fmt.Sprintf("%s%s", common.RightPad("ID:", length, " "), network.ID))
+	common.LogVerbose(fmt.Sprintf("%s%s", common.RightPad("Name:", length, " "), network.Name))
+	common.LogVerbose(fmt.Sprintf("%s%s", common.RightPad("Driver:", length, " "), network.Driver))
+	common.LogVerbose(fmt.Sprintf("%s%s", common.RightPad("Scope:", length, " "), network.Scope))
+	common.LogVerbose(fmt.Sprintf("%s%v", common.RightPad("Dokku managed:", length, " "), network.DokkuManaged))
+
+	return nil
+}
+
+// CommandList is an alias for "docker network ls"
+func CommandList(format string, dokkuManaged bool) error {
+	networks, err := getNetworks()
+	if err != nil {
+		return err
+	}
+
+	if format == "json" {
+		networkList := []DockerNetwork{}
+		for _, network := range networks {
+			if dokkuManaged && !network.DokkuManaged {
+				continue
+			}
+			networkList = append(networkList, network)
+		}
+		out, err := json.Marshal(networkList)
+		if err != nil {
+			return err
+		}
+		common.Log(string(out))
+		return nil
+	}
+
 	common.LogInfo2Quiet("Networks")
-	for _, networkName := range networks {
-		fmt.Println(networkName)
+	for _, network := range networks {
+		if dokkuManaged && !network.DokkuManaged {
+			continue
+		}
+		fmt.Println(network.Name)
 	}
 
 	return nil
+}
+
+// CommandRebuild rebuilds network settings for an app
+func CommandRebuild(appName string) error {
+	if err := common.VerifyAppName(appName); err != nil {
+		return err
+	}
+
+	return BuildConfig(appName)
 }
 
 // CommandRebuildall rebuilds network settings for all apps
 func CommandRebuildall() error {
 	apps, err := common.DokkuApps()
 	if err != nil {
+		if errors.Is(err, common.NoAppsExist) {
+			common.LogWarn(err.Error())
+			return nil
+		}
 		return err
 	}
 
@@ -127,6 +183,10 @@ func CommandReport(appName string, format string, infoFlag string) error {
 	if len(appName) == 0 {
 		apps, err := common.DokkuApps()
 		if err != nil {
+			if errors.Is(err, common.NoAppsExist) {
+				common.LogWarn(err.Error())
+				return nil
+			}
 			return err
 		}
 		for _, appName := range apps {
@@ -141,18 +201,14 @@ func CommandReport(appName string, format string, infoFlag string) error {
 }
 
 // CommandSet set or clear a network property for an app
-func CommandSet(appName string, property string, value string) error {
+func CommandSet(appName string, property string, value string, values []string) error {
 	if appName != "--global" {
 		if err := common.VerifyAppName(appName); err != nil {
 			return err
 		}
 	}
 
-	if property == "bind-all-interfaces" && value == "" {
-		value = "false"
-	}
-
-	attachProperites := map[string]bool{
+	attachProperties := map[string]bool{
 		"attach-post-create": true,
 		"attach-post-deploy": true,
 	}
@@ -161,14 +217,17 @@ func CommandSet(appName string, property string, value string) error {
 		"host":   true,
 		"bridge": true,
 	}
-	if attachProperites[property] {
-		if invalidNetworks[value] {
-			return errors.New("Invalid network name specified for attach")
-		}
+	if attachProperties[property] {
+		for _, networkName := range values {
+			if invalidNetworks[networkName] {
+				return fmt.Errorf("Invalid network name specified for attach: %s", networkName)
+			}
 
-		if isConflictingPropertyValue(appName, property, value) {
-			return errors.New("Network name already associated with this app")
+			if isConflictingPropertyValue(appName, property, networkName) {
+				return fmt.Errorf("Network name already associated with this app: %s", networkName)
+			}
 		}
+		value = strings.Join(values, ",")
 	}
 
 	common.CommandPropertySet("network", appName, property, value, DefaultProperties, GlobalProperties)

@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+source "$PLUGIN_CORE_AVAILABLE_PATH/common/functions"
+source "$PLUGIN_CORE_AVAILABLE_PATH/common/property-functions"
+set -eo pipefail
+[[ $DOKKU_TRACE ]] && set -x
+
+fn-builder-herokuish-computed-allowed() {
+  declare APP="$1"
+
+  allowed="$(fn-builder-herokuish-allowed "$APP")"
+  if [[ -z "$allowed" ]]; then
+    allowed="$(fn-builder-herokuish-global-allowed)"
+  fi
+  if [[ -z "$allowed" ]]; then
+    allowed="true"
+    [[ "$(dpkg --print-architecture 2>/dev/null || true)" != "amd64" ]] && allowed="false"
+  fi
+
+  echo "$allowed"
+}
+
+fn-builder-herokuish-global-allowed() {
+  fn-plugin-property-get-default "builder-herokuish" "--global" "allowed" ""
+}
+
+fn-builder-herokuish-allowed() {
+  declare APP="$1"
+
+  fn-plugin-property-get-default "builder-herokuish" "$APP" "allowed" ""
+}
+
+fn-builder-herokuish-computed-stack() {
+  declare APP="$1"
+
+  stack="$(fn-builder-herokuish-stack "$APP")"
+  if [[ -z "$stack" ]]; then
+    stack="$(fn-builder-herokuish-global-stack "$APP")"
+  fi
+  if [[ -z "$stack" ]]; then
+    stack="${DOKKU_IMAGE:-gliderlabs/herokuish:latest-24}"
+  fi
+
+  echo "$stack"
+}
+
+fn-builder-herokuish-global-stack() {
+  fn-plugin-property-get-default "builder-herokuish" "--global" "stack" ""
+}
+
+fn-builder-herokuish-stack() {
+  declare APP="$1"
+
+  fn-plugin-property-get-default "builder-herokuish" "$APP" "stack" ""
+}

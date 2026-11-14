@@ -1,0 +1,746 @@
+#!/usr/bin/env bats
+
+load test_helper
+
+setup() {
+  global_setup
+  create_app
+}
+
+teardown() {
+  destroy_app
+  global_teardown
+}
+
+@test "(ps) ps:help" {
+  run /bin/bash -c "dokku ps"
+  echo "output: $output"
+  echo "status: $status"
+  assert_output_contains "Manage app processes"
+  help_output="$output"
+
+  run /bin/bash -c "dokku ps:help"
+  echo "output: $output"
+  echo "status: $status"
+  assert_output_contains "Manage app processes"
+  assert_output "$help_output"
+}
+
+@test "(ps) ps:inspect" {
+  run /bin/bash -c "dokku config:set $TEST_APP key=value key=value=value"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run deploy_app dockerfile
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  CID=$(<$DOKKU_ROOT/$TEST_APP/CONTAINER.web.1)
+  run /bin/bash -c "dokku ps:inspect $TEST_APP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output_contains "$CID" 7
+}
+
+@test "(ps:set) procfile" {
+  run /bin/bash -c "dokku ps:set --global procfile-path .dokku/Procfile"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku ps:report $TEST_APP --ps-computed-procfile-path"
+  echo "output: $output"
+  echo "status: $status"
+  assert_output ".dokku/Procfile"
+  assert_success
+
+  run /bin/bash -c "dokku ps:report $TEST_APP --ps-global-procfile-path"
+  echo "output: $output"
+  echo "status: $status"
+  assert_output ".dokku/Procfile"
+  assert_success
+
+  run /bin/bash -c "dokku ps:report $TEST_APP --ps-procfile-path"
+  echo "output: $output"
+  echo "status: $status"
+  assert_output ""
+  assert_success
+
+  run /bin/bash -c "dokku ps:set --global procfile-path"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku ps:report $TEST_APP --ps-computed-procfile-path"
+  echo "output: $output"
+  echo "status: $status"
+  assert_output "Procfile"
+  assert_success
+
+  run /bin/bash -c "dokku ps:report $TEST_APP --ps-global-procfile-path"
+  echo "output: $output"
+  echo "status: $status"
+  assert_output ""
+  assert_success
+
+  run /bin/bash -c "dokku ps:report $TEST_APP --ps-procfile-path"
+  echo "output: $output"
+  echo "status: $status"
+  assert_output ""
+  assert_success
+}
+
+@test "(ps:set) skip-deploy raw/global/computed" {
+  run /bin/bash -c "dokku ps:report $TEST_APP --format json | jq -r '.\"ps-computed-skip-deploy\"'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_output "false"
+  assert_success
+
+  run /bin/bash -c "dokku ps:set --global skip-deploy true"
+  assert_success
+
+  run /bin/bash -c "dokku ps:report $TEST_APP --format json | jq -r '.\"ps-global-skip-deploy\"'"
+  assert_success
+  assert_output "true"
+
+  run /bin/bash -c "dokku ps:report $TEST_APP --format json | jq -r '.\"ps-computed-skip-deploy\"'"
+  assert_success
+  assert_output "true"
+
+  run /bin/bash -c "dokku ps:report $TEST_APP --format json | jq -r '.\"ps-skip-deploy\"'"
+  assert_success
+  assert_output ""
+
+  run /bin/bash -c "dokku ps:set $TEST_APP skip-deploy false"
+  assert_success
+
+  run /bin/bash -c "dokku ps:report $TEST_APP --format json | jq -r '.\"ps-skip-deploy\"'"
+  assert_success
+  assert_output "false"
+
+  run /bin/bash -c "dokku ps:report $TEST_APP --format json | jq -r '.\"ps-global-skip-deploy\"'"
+  assert_success
+  assert_output "true"
+
+  run /bin/bash -c "dokku ps:report $TEST_APP --format json | jq -r '.\"ps-computed-skip-deploy\"'"
+  assert_success
+  assert_output "false"
+
+  run /bin/bash -c "dokku ps:set $TEST_APP skip-deploy"
+  assert_success
+
+  run /bin/bash -c "dokku ps:set --global skip-deploy"
+  assert_success
+
+  run /bin/bash -c "dokku ps:report $TEST_APP --format json | jq -r '.\"ps-global-skip-deploy\"'"
+  assert_success
+  assert_output ""
+
+  run /bin/bash -c "dokku ps:report $TEST_APP --format json | jq -r '.\"ps-computed-skip-deploy\"'"
+  assert_success
+  assert_output "false"
+}
+
+@test "(ps:set) dockerfile-start-cmd raw and computed" {
+  run /bin/bash -c "dokku ps:report $TEST_APP --format json | jq -r '.\"ps-dockerfile-start-cmd\"'"
+  assert_success
+  assert_output ""
+
+  run /bin/bash -c "dokku ps:report $TEST_APP --format json | jq -r '.\"ps-computed-dockerfile-start-cmd\"'"
+  assert_success
+  assert_output ""
+
+  run /bin/bash -c "dokku ps:set $TEST_APP dockerfile-start-cmd 'node app.js'"
+  assert_success
+
+  run /bin/bash -c "dokku ps:report $TEST_APP --format json | jq -r '.\"ps-dockerfile-start-cmd\"'"
+  assert_success
+  assert_output "node app.js"
+
+  run /bin/bash -c "dokku ps:report $TEST_APP --format json | jq -r '.\"ps-computed-dockerfile-start-cmd\"'"
+  assert_success
+  assert_output "node app.js"
+
+  run /bin/bash -c "dokku ps:set $TEST_APP dockerfile-start-cmd"
+  assert_success
+
+  run /bin/bash -c "dokku ps:report $TEST_APP --format json | jq -r '.\"ps-dockerfile-start-cmd\"'"
+  assert_success
+  assert_output ""
+}
+
+@test "(ps:set) start-cmd raw and computed" {
+  run /bin/bash -c "dokku ps:report $TEST_APP --format json | jq -r '.\"ps-start-cmd\"'"
+  assert_success
+  assert_output ""
+
+  run /bin/bash -c "dokku ps:report $TEST_APP --format json | jq -r '.\"ps-computed-start-cmd\"'"
+  assert_success
+  assert_output ""
+
+  run /bin/bash -c "dokku ps:set $TEST_APP start-cmd 'bundle exec rails server'"
+  assert_success
+
+  run /bin/bash -c "dokku ps:report $TEST_APP --format json | jq -r '.\"ps-start-cmd\"'"
+  assert_success
+  assert_output "bundle exec rails server"
+
+  run /bin/bash -c "dokku ps:report $TEST_APP --format json | jq -r '.\"ps-computed-start-cmd\"'"
+  assert_success
+  assert_output "bundle exec rails server"
+
+  run /bin/bash -c "dokku ps:set $TEST_APP start-cmd"
+  assert_success
+
+  run /bin/bash -c "dokku ps:report $TEST_APP --format json | jq -r '.\"ps-start-cmd\"'"
+  assert_success
+  assert_output ""
+}
+
+@test "(ps:scale) procfile commands extraction" {
+  source "$PLUGIN_CORE_AVAILABLE_PATH/ps/functions"
+  cat <<EOF >"$DOKKU_LIB_ROOT/data/ps/$TEST_APP/Procfile"
+web: node web.js --port \$PORT
+worker: node worker.js
+release: interpolated \$ENV_VAR
+EOF
+
+  run /bin/bash -c "dokku config:set '$TEST_APP' ENV_VAR=value"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku plugin:trigger procfile-get-command '$TEST_APP' web 5001"
+  echo "output: $output"
+  echo "status: $status"
+  assert_output "node web.js --port 5001"
+
+  run /bin/bash -c "dokku plugin:trigger procfile-get-command '$TEST_APP' worker"
+  echo "output: $output"
+  echo "status: $status"
+  assert_output "node worker.js"
+
+  run /bin/bash -c "dokku plugin:trigger procfile-get-command '$TEST_APP' release 5001"
+  echo "output: $output"
+  echo "status: $status"
+  assert_output "interpolated value"
+}
+
+@test "(ps:scale) update formations from Procfile" {
+  local TMP=$(mktemp -d "/tmp/${DOKKU_DOMAIN}.XXXXX")
+  trap 'popd &>/dev/null || true; rm -rf "$TMP"' INT TERM
+
+  CUSTOM_TMP="$TMP" deploy_app nodejs-express
+
+  run /bin/bash -c "dokku --quiet ps:scale $TEST_APP"
+  output=$(echo "$output" | tr -s " ")
+  echo "output: ($output)"
+  echo "status: $status"
+  assert_output $'cron: 0\ncustom: 0\nrelease: 0\nweb: 1\nworker: 0'
+
+  pushd $TMP
+  echo scaletest: sleep infinity >>Procfile
+  git commit Procfile -m 'Add scaletest process'
+  git push target master:master
+
+  run /bin/bash -c "dokku --quiet ps:scale $TEST_APP"
+  output=$(echo "$output" | tr -s " ")
+  echo "output: ($output)"
+  echo "status: $status"
+  assert_output $'cron: 0\ncustom: 0\nrelease: 0\nscaletest: 0\nweb: 1\nworker: 0'
+
+  popd
+  rm -rf "$TMP"
+}
+
+@test "(ps:scale) ps:scale formatting" {
+  echo "web=4
+worker=1
+beat                                                                            =0
+web                                                                             =0" >/var/lib/dokku/config/ps/$TEST_APP/scale
+
+  run /bin/bash -c "dokku --quiet ps:scale $TEST_APP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_output $'beat: 0\nweb:  4\nworker: 1'
+}
+
+@test "(ps:scale) --format json" {
+  run /bin/bash -c "dokku ps:scale $TEST_APP --format json"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output '[{"process_type":"web","quantity":1}]'
+
+  echo "web=4
+worker=1" >/var/lib/dokku/config/ps/$TEST_APP/scale
+
+  run /bin/bash -c "dokku ps:scale $TEST_APP --format json | jq '. | length'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "2"
+
+  run /bin/bash -c "dokku ps:scale $TEST_APP --format json | jq -r '.[] | select(.process_type==\"web\") | .quantity'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "4"
+
+  run /bin/bash -c "dokku ps:scale $TEST_APP --format json | jq -r '.[] | select(.process_type==\"worker\") | .quantity'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "1"
+
+  rm -f /var/lib/dokku/config/ps/$TEST_APP/scale
+  run /bin/bash -c "dokku ps:scale $TEST_APP --format json"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "[]"
+}
+
+@test "(ps:scale) --replace" {
+  echo "web=4
+worker=1" >/var/lib/dokku/config/ps/$TEST_APP/scale
+
+  run /bin/bash -c "dokku ps:scale --replace $TEST_APP web=2"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku --quiet ps:scale $TEST_APP"
+  output=$(echo "$output" | tr -s " ")
+  echo "output: ($output)"
+  echo "status: $status"
+  assert_output $'web: 2\nworker: 0'
+}
+
+@test "(ps:scale) --clear" {
+  echo "web=4
+worker=1" >/var/lib/dokku/config/ps/$TEST_APP/scale
+
+  run /bin/bash -c "dokku ps:scale --clear $TEST_APP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku --quiet ps:scale $TEST_APP"
+  output=$(echo "$output" | tr -s " ")
+  echo "output: ($output)"
+  echo "status: $status"
+  assert_output $'web: 1\nworker: 0'
+}
+
+@test "(ps:scale) --clear and --replace argument validation" {
+  run /bin/bash -c "dokku ps:scale --replace $TEST_APP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_failure
+  assert_output_contains "Must specify at least one process type when using the --replace flag"
+
+  run /bin/bash -c "dokku ps:scale --clear $TEST_APP web=1"
+  echo "output: $output"
+  echo "status: $status"
+  assert_failure
+  assert_output_contains "Process types cannot be specified when using the --clear flag"
+
+  run /bin/bash -c "dokku ps:scale --clear --replace $TEST_APP web=1"
+  echo "output: $output"
+  echo "status: $status"
+  assert_failure
+  assert_output_contains "The --clear and --replace flags cannot be specified together"
+}
+
+@test "(ps:scale) invalid process counts" {
+  run /bin/bash -c "dokku ps:scale $TEST_APP web=-1"
+  echo "output: $output"
+  echo "status: $status"
+  assert_failure
+  assert_output_contains "Invalid count for process type web: value must be zero or greater"
+
+  run /bin/bash -c "dokku ps:scale --replace $TEST_APP web=1 worker=-2"
+  echo "output: $output"
+  echo "status: $status"
+  assert_failure
+  assert_output_contains "Invalid count for process type worker: value must be zero or greater"
+
+  run /bin/bash -c "dokku ps:scale $TEST_APP =1"
+  echo "output: $output"
+  echo "status: $status"
+  assert_failure
+  assert_output_contains "Missing process type for count 1"
+
+  run_plugn_trigger ps-set-scale $TEST_APP true false web=-1
+  echo "output: $output"
+  echo "status: $status"
+  assert_failure
+  assert_output_contains "Invalid count for process type web: value must be zero or greater"
+
+  run /bin/bash -c "dokku --quiet ps:scale $TEST_APP"
+  output=$(echo "$output" | tr -s " ")
+  echo "output: ($output)"
+  echo "status: $status"
+  assert_output "web: 1"
+
+  run /bin/bash -c "dokku ps:scale --skip-deploy $TEST_APP web=0"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku --quiet ps:scale $TEST_APP"
+  output=$(echo "$output" | tr -s " ")
+  echo "output: ($output)"
+  echo "status: $status"
+  assert_output "web: 0"
+}
+
+@test "(ps:scale) repairing a negative process count" {
+  echo "web=-1
+worker=2" >/var/lib/dokku/config/ps/$TEST_APP/scale
+
+  run /bin/bash -c "dokku --quiet ps:scale $TEST_APP"
+  output=$(echo "$output" | tr -s " ")
+  echo "output: ($output)"
+  echo "status: $status"
+  assert_success
+  assert_output $'web: -1\nworker: 2'
+
+  run_plugn_trigger ps-current-scale $TEST_APP
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku ps:scale --skip-deploy $TEST_APP web=1"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku --quiet ps:scale $TEST_APP"
+  output=$(echo "$output" | tr -s " ")
+  echo "output: ($output)"
+  echo "status: $status"
+  assert_output $'web: 1\nworker: 2'
+}
+
+@test "(ps) handle windows newlines in procfile" {
+  run deploy_app python dokku@$DOKKU_DOMAIN:$TEST_APP procfile_line_endings_to_windows
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+}
+
+@test "(ps:report) stop-timeout-seconds raw vs computed vs global" {
+  run /bin/bash -c "dokku ps:set --global stop-timeout-seconds"
+  assert_success
+
+  run /bin/bash -c "dokku ps:report $TEST_APP --format json | jq -r '.\"ps-stop-timeout-seconds\"'"
+  assert_success
+  assert_output ""
+
+  run /bin/bash -c "dokku ps:report $TEST_APP --format json | jq -r '.\"stop-timeout-seconds\"'"
+  assert_success
+  assert_output ""
+
+  run /bin/bash -c "dokku ps:report $TEST_APP --format json | jq -r '.\"ps-global-stop-timeout-seconds\"'"
+  assert_success
+  assert_output ""
+
+  run /bin/bash -c "dokku ps:report $TEST_APP --format json | jq -r '.\"global-stop-timeout-seconds\"'"
+  assert_success
+  assert_output ""
+
+  run /bin/bash -c "dokku ps:report $TEST_APP --format json | jq -r '.\"ps-computed-stop-timeout-seconds\"'"
+  assert_success
+  assert_output "30"
+
+  run /bin/bash -c "dokku ps:report $TEST_APP --format json | jq -r '.\"computed-stop-timeout-seconds\"'"
+  assert_success
+  assert_output "30"
+
+  run /bin/bash -c "dokku ps:set --global stop-timeout-seconds 90"
+  assert_success
+
+  run /bin/bash -c "dokku ps:report $TEST_APP --format json | jq -r '.\"ps-global-stop-timeout-seconds\"'"
+  assert_success
+  assert_output "90"
+
+  run /bin/bash -c "dokku ps:report $TEST_APP --format json | jq -r '.\"global-stop-timeout-seconds\"'"
+  assert_success
+  assert_output "90"
+
+  run /bin/bash -c "dokku ps:report $TEST_APP --format json | jq -r '.\"ps-computed-stop-timeout-seconds\"'"
+  assert_success
+  assert_output "90"
+
+  run /bin/bash -c "dokku ps:report $TEST_APP --format json | jq -r '.\"computed-stop-timeout-seconds\"'"
+  assert_success
+  assert_output "90"
+
+  run /bin/bash -c "dokku ps:set $TEST_APP stop-timeout-seconds 45"
+  assert_success
+
+  run /bin/bash -c "dokku ps:report $TEST_APP --format json | jq -r '.\"ps-stop-timeout-seconds\"'"
+  assert_success
+  assert_output "45"
+
+  run /bin/bash -c "dokku ps:report $TEST_APP --format json | jq -r '.\"stop-timeout-seconds\"'"
+  assert_success
+  assert_output "45"
+
+  run /bin/bash -c "dokku ps:report $TEST_APP --format json | jq -r '.\"ps-global-stop-timeout-seconds\"'"
+  assert_success
+  assert_output "90"
+
+  run /bin/bash -c "dokku ps:report $TEST_APP --format json | jq -r '.\"ps-computed-stop-timeout-seconds\"'"
+  assert_success
+  assert_output "45"
+
+  run /bin/bash -c "dokku ps:report $TEST_APP --format json | jq -r '.\"computed-stop-timeout-seconds\"'"
+  assert_success
+  assert_output "45"
+
+  run /bin/bash -c "dokku ps:set $TEST_APP stop-timeout-seconds"
+  assert_success
+
+  run /bin/bash -c "dokku ps:set --global stop-timeout-seconds"
+  assert_success
+}
+
+@test "(ps:report) --global --format json" {
+  run /bin/bash -c "dokku ps:report --global --format json | jq -e ."
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku ps:report --global --format json | jq -r 'has(\"ps-global-procfile-path\")'"
+  assert_success
+  assert_output "true"
+
+  run /bin/bash -c "dokku ps:report --global --format json | jq -r 'has(\"global-procfile-path\")'"
+  assert_success
+  assert_output "true"
+
+  run /bin/bash -c "dokku ps:report --global --format json | jq -r 'has(\"ps-computed-procfile-path\")'"
+  assert_success
+  assert_output "true"
+
+  run /bin/bash -c "dokku ps:report --global --format json | jq -r 'has(\"computed-procfile-path\")'"
+  assert_success
+  assert_output "true"
+
+  run /bin/bash -c "dokku ps:report --global --format json | jq -r 'has(\"ps-global-stop-timeout-seconds\")'"
+  assert_success
+  assert_output "true"
+
+  run /bin/bash -c "dokku ps:report --global --format json | jq -r 'has(\"global-stop-timeout-seconds\")'"
+  assert_success
+  assert_output "true"
+
+  run /bin/bash -c "dokku ps:report --global --format json | jq -r 'has(\"ps-computed-stop-timeout-seconds\")'"
+  assert_success
+  assert_output "true"
+
+  run /bin/bash -c "dokku ps:report --global --format json | jq -r 'has(\"computed-stop-timeout-seconds\")'"
+  assert_success
+  assert_output "true"
+
+  run /bin/bash -c "dokku ps:set --global stop-timeout-seconds 75"
+  assert_success
+
+  run /bin/bash -c "dokku ps:report --global --format json | jq -r '.\"ps-global-stop-timeout-seconds\"'"
+  assert_success
+  assert_output "75"
+
+  run /bin/bash -c "dokku ps:report --global --format json | jq -r '.\"global-stop-timeout-seconds\"'"
+  assert_success
+  assert_output "75"
+
+  run /bin/bash -c "dokku ps:report --global --format json | jq -r '.\"ps-computed-stop-timeout-seconds\"'"
+  assert_success
+  assert_output "75"
+
+  run /bin/bash -c "dokku ps:report --global --format json | jq -r '.\"computed-stop-timeout-seconds\"'"
+  assert_success
+  assert_output "75"
+
+  run /bin/bash -c "dokku ps:set --global stop-timeout-seconds"
+  assert_success
+
+  run /bin/bash -c "dokku ps:report --global --format json | jq -r '.\"ps-global-stop-timeout-seconds\"'"
+  assert_success
+  assert_output ""
+
+  run /bin/bash -c "dokku ps:report --global --format json | jq -r '.\"global-stop-timeout-seconds\"'"
+  assert_success
+  assert_output ""
+
+  run /bin/bash -c "dokku ps:report --global --format json | jq -r '.\"ps-computed-stop-timeout-seconds\"'"
+  assert_success
+  assert_output "30"
+
+  run /bin/bash -c "dokku ps:report --global --format json | jq -r '.\"computed-stop-timeout-seconds\"'"
+  assert_success
+  assert_output "30"
+}
+
+@test "(ps:restart-policy) default policy" {
+  run /bin/bash -c "dokku ps:report $TEST_APP --ps-restart-policy"
+  echo "output: $output"
+  echo "status: $status"
+  assert_output ""
+
+  run /bin/bash -c "dokku ps:report $TEST_APP --ps-computed-restart-policy"
+  echo "output: $output"
+  echo "status: $status"
+  assert_output "on-failure:10"
+}
+
+@test "(ps:restart-policy) ps:set restart-policy" {
+  for policy in no unless-stopped always on-failure on-failure:20; do
+    run /bin/bash -c "dokku ps:set $TEST_APP restart-policy $policy"
+    echo "output: $output"
+    echo "status: $status"
+    assert_success
+
+    run /bin/bash -c "dokku ps:report $TEST_APP --ps-restart-policy"
+    echo "output: $output"
+    echo "status: $status"
+    assert_output "$policy"
+
+    run /bin/bash -c "dokku ps:report $TEST_APP --ps-computed-restart-policy"
+    echo "output: $output"
+    echo "status: $status"
+    assert_output "$policy"
+  done
+}
+
+@test "(ps:restart-policy) ps:set restart-policy unset" {
+  run /bin/bash -c "dokku ps:set $TEST_APP restart-policy on-failure:5"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku ps:report $TEST_APP --ps-restart-policy"
+  echo "output: $output"
+  echo "status: $status"
+  assert_output "on-failure:5"
+
+  run /bin/bash -c "dokku ps:set $TEST_APP restart-policy"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku ps:report $TEST_APP --ps-restart-policy"
+  echo "output: $output"
+  echo "status: $status"
+  assert_output ""
+
+  run /bin/bash -c "dokku ps:report $TEST_APP --ps-computed-restart-policy"
+  echo "output: $output"
+  echo "status: $status"
+  assert_output "on-failure:10"
+}
+
+@test "(ps:restart-policy) invalid policy" {
+  run /bin/bash -c "dokku ps:set $TEST_APP restart-policy bogus"
+  echo "output: $output"
+  echo "status: $status"
+  assert_failure
+  assert_output_contains "Invalid restart-policy specified"
+}
+
+@test "(ps:restart-policy) global policy" {
+  run /bin/bash -c "dokku ps:set --global restart-policy always"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku ps:report $TEST_APP --ps-global-restart-policy"
+  echo "output: $output"
+  echo "status: $status"
+  assert_output "always"
+
+  run /bin/bash -c "dokku ps:report $TEST_APP --ps-restart-policy"
+  echo "output: $output"
+  echo "status: $status"
+  assert_output ""
+
+  run /bin/bash -c "dokku ps:report $TEST_APP --ps-computed-restart-policy"
+  echo "output: $output"
+  echo "status: $status"
+  assert_output "always"
+
+  run /bin/bash -c "dokku ps:set $TEST_APP restart-policy no"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku ps:report $TEST_APP --ps-computed-restart-policy"
+  echo "output: $output"
+  echo "status: $status"
+  assert_output "no"
+
+  run /bin/bash -c "dokku ps:set --global restart-policy"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+}
+
+@test "(ps:restart-policy) deployed policy" {
+  test_restart_policy="on-failure:20"
+  run /bin/bash -c "dokku ps:set $TEST_APP restart-policy $test_restart_policy"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku ps:report $TEST_APP --ps-restart-policy"
+  echo "output: $output"
+  echo "status: $status"
+  assert_output "$test_restart_policy"
+
+  run deploy_app dockerfile
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  CID=$(<$DOKKU_ROOT/$TEST_APP/CONTAINER.web.1)
+  run /bin/bash -c "docker inspect $CID"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "docker inspect -f '{{ .HostConfig.RestartPolicy.Name }}:{{ .HostConfig.RestartPolicy.MaximumRetryCount }}' $CID"
+  echo "output: $output"
+  echo "status: $status"
+  assert_output "$test_restart_policy"
+
+  run /bin/bash -c "dokku ps:set $TEST_APP restart-policy"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku ps:rebuild $TEST_APP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  CID=$(<$DOKKU_ROOT/$TEST_APP/CONTAINER.web.1)
+  run /bin/bash -c "docker inspect -f '{{ .HostConfig.RestartPolicy.Name }}:{{ .HostConfig.RestartPolicy.MaximumRetryCount }}' $CID"
+  echo "output: $output"
+  echo "status: $status"
+  assert_output "on-failure:10"
+}
+
+procfile_line_endings_to_windows() {
+  local APP="$1"
+  local APP_REPO_DIR="$2"
+  [[ -z "$APP" ]] && local APP="$TEST_APP"
+  echo "setting line endings on Procfile to \n via unix2dos"
+  sed -i -e 's/\r*$/\r/' "$APP_REPO_DIR/Procfile"
+}

@@ -1,0 +1,2860 @@
+package scheduler_k3s
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha1"
+	"encoding/base64"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"net"
+	"os"
+	"path/filepath"
+	"regexp"
+	"slices"
+	"sort"
+	"strconv"
+	"strings"
+	"text/template"
+	"time"
+
+	appjson "github.com/dokku/dokku/plugins/app-json"
+	"github.com/dokku/dokku/plugins/common"
+	dockeroptions "github.com/dokku/dokku/plugins/docker-options"
+	"github.com/dokku/dokku/plugins/logs"
+	nginxvhosts "github.com/dokku/dokku/plugins/nginx-vhosts"
+	resty "github.com/go-resty/resty/v2"
+	"github.com/gosimple/slug"
+	kedav1alpha1 "github.com/kedacore/keda/v2/apis/keda/v1alpha1"
+	"golang.org/x/sync/errgroup"
+	"gopkg.in/yaml.v3"
+	"helm.sh/helm/v3/pkg/strvals"
+	corev1 "k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/validation"
+	"k8s.io/apimachinery/pkg/util/wait"
+	utilexec "k8s.io/client-go/util/exec"
+	"k8s.io/kubernetes/pkg/client/conditions"
+	"k8s.io/utils/ptr"
+	"mvdan.cc/sh/v3/shell"
+)
+
+// EnterPodInput contains all the information needed to enter a pod
+type EnterPodInput struct {
+	// AllowCompletion is whether to allow the command to complete
+	AllowCompletion bool
+
+	// Clientset is the kubernetes clientset
+	Clientset KubernetesClient
+
+	// Command is the command to run
+	Command []string
+
+	// Entrypoint is the entrypoint to run
+	Entrypoint string
+
+	// SelectedContainerName is the container name to enter
+	SelectedContainerName string
+
+	// SelectedPod is the pod to enter
+	SelectedPod v1.Pod
+
+	// WaitTimeout is the timeout to wait for the pod to be ready
+	WaitTimeout float64
+}
+
+// Node contains information about a node
+type Node struct {
+	// Name is the name of the node
+	Name string
+
+	// Roles is the roles of the node
+	Roles []string
+
+	// Ready is whether the node is ready
+	Ready bool
+
+	// RemoteHost is the remote host
+	RemoteHost string
+
+	// Version is the version of the node
+	Version string
+}
+
+// String returns a string representation of the node
+func (n Node) String() string {
+	return fmt.Sprintf("%s|%s|%s|%s", n.Name, strconv.FormatBool(n.Ready), strings.Join(n.Roles, ","), n.Version)
+}
+
+// StartCommandInput contains all the information needed to get the start command
+type StartCommandInput struct {
+	// AppName is the name of the app
+	AppName string
+	// ProcessType is the process type
+	ProcessType string
+	// ImageSourceType is the image source type
+	ImageSourceType string
+	// Port is the port
+	Port int32
+	// Env is the environment variables
+	Env map[string]string
+}
+
+// StartCommandOutput contains the start command
+type StartCommandOutput struct {
+	// Command is the start command
+	Command []string
+}
+
+type WaitForNodeToExistInput struct {
+	Clientset  KubernetesClient
+	Namespace  string
+	RetryCount int
+	NodeName   string
+}
+
+type WaitForPodBySelectorRunningInput struct {
+	// AllowCompletion is whether to allow the command to complete
+	AllowCompletion bool
+
+	// Clientset is the kubernetes clientset
+	Clientset KubernetesClient
+
+	// Namespace is the namespace to search in
+	Namespace string
+
+	// LabelSelector is the label selector to search for
+	LabelSelector string
+
+	// PodName is the pod name to search for
+	PodName string
+
+	// Timeout is the timeout in seconds to wait for the pod to be ready
+	Timeout float64
+
+	// Waiter is the waiter function
+	Waiter func(ctx context.Context, clientset KubernetesClient, podName, namespace string) wait.ConditionWithContextFunc
+}
+
+type WaitForPodBySelectorCompletedInput struct {
+	// Clientset is the kubernetes clientset
+	Clientset KubernetesClient
+
+	// Namespace is the namespace to search in
+	Namespace string
+
+	// LabelSelector is the label selector to search for
+	LabelSelector string
+
+	// PodName is the pod name to search for
+	PodName string
+
+	// Timeout is the timeout in seconds to wait for the pod to reach a terminal phase
+	Timeout float64
+}
+
+type WaitForPodToExistInput struct {
+	Clientset     KubernetesClient
+	Namespace     string
+	RetryCount    int
+	PodName       string
+	LabelSelector string
+}
+
+// applyKedaClusterTriggerAuthentications applies keda cluster trigger authentications chart to the cluster
+func applyKedaClusterTriggerAuthentications(ctx context.Context, triggerType string, metadata map[string]string) error {
+	chartDir, err := os.MkdirTemp("", "keda-cluster-trigger-authentications-chart-")
+	if err != nil {
+		return fmt.Errorf("Error creating keda-cluster-trigger-authentications chart directory: %w", err)
+	}
+	defer os.RemoveAll(chartDir)
+
+	// create the chart.yaml
+	chart := &Chart{
+		ApiVersion: "v2",
+		AppVersion: "1.0.0",
+		Icon:       "https://dokku.com/assets/dokku-logo.svg",
+		Name:       fmt.Sprintf("keda-cluster-trigger-authentications-%s", triggerType),
+		Version:    "0.0.1",
+	}
+
+	err = writeYaml(WriteYamlInput{
+		Object: chart,
+		Path:   filepath.Join(chartDir, "Chart.yaml"),
+	})
+	if err != nil {
+		return fmt.Errorf("Error writing keda-cluster-trigger-authentications chart: %w", err)
+	}
+
+	// create the values.yaml
+	values := ClusterKedaValues{
+		Secrets: map[string]string{},
+		Type:    triggerType,
+	}
+
+	for key, value := range metadata {
+		values.Secrets[key] = base64.StdEncoding.EncodeToString([]byte(value))
+	}
+
+	if err := os.MkdirAll(filepath.Join(chartDir, "templates"), os.FileMode(0755)); err != nil {
+		return fmt.Errorf("Error creating keda-cluster-trigger-authentications chart templates directory: %w", err)
+	}
+
+	err = writeYaml(WriteYamlInput{
+		Object: values,
+		Path:   filepath.Join(chartDir, "values.yaml"),
+	})
+	if err != nil {
+		return fmt.Errorf("Error writing chart: %w", err)
+	}
+
+	templateFiles := []string{"keda-cluster-trigger-authentication", "keda-cluster-secret"}
+	for _, template := range templateFiles {
+		b, err := templates.ReadFile(fmt.Sprintf("templates/chart/%s.yaml", template))
+		if err != nil {
+			return fmt.Errorf("Error reading %s template: %w", template, err)
+		}
+
+		filename := filepath.Join(chartDir, "templates", fmt.Sprintf("%s.yaml", template))
+		err = os.WriteFile(filename, b, os.FileMode(0644))
+		if err != nil {
+			return fmt.Errorf("Error writing %s template: %w", template, err)
+		}
+
+		if os.Getenv("DOKKU_TRACE") == "1" {
+			common.CatFile(filename)
+		}
+	}
+
+	b, err := templates.ReadFile("templates/chart/_helpers.tpl")
+	if err != nil {
+		return fmt.Errorf("Error reading _helpers template: %w", err)
+	}
+
+	helpersFile := filepath.Join(chartDir, "templates", "_helpers.tpl")
+	err = os.WriteFile(helpersFile, b, os.FileMode(0644))
+	if err != nil {
+		return fmt.Errorf("Error writing _helpers template: %w", err)
+	}
+
+	if os.Getenv("DOKKU_TRACE") == "1" {
+		common.CatFile(helpersFile)
+	}
+
+	// install the chart
+	helmAgent, err := NewHelmAgent("keda", DeployLogPrinter)
+	if err != nil {
+		return fmt.Errorf("Error creating helm agent: %w", err)
+	}
+
+	chartPath, err := filepath.Abs(chartDir)
+	if err != nil {
+		return fmt.Errorf("Error getting chart path: %w", err)
+	}
+
+	timeoutDuration, err := time.ParseDuration("300s")
+	if err != nil {
+		return fmt.Errorf("Error parsing deploy timeout duration: %w", err)
+	}
+
+	err = helmAgent.InstallOrUpgradeChart(ctx, ChartInput{
+		ChartPath:         chartPath,
+		Namespace:         "keda",
+		ReleaseName:       fmt.Sprintf("keda-cluster-trigger-authentications-%s", triggerType),
+		RollbackOnFailure: true,
+		Timeout:           timeoutDuration,
+		Wait:              true,
+	})
+	if err != nil {
+		return fmt.Errorf("Error installing keda-cluster-trigger-authentications-%s chart: %w", triggerType, err)
+	}
+
+	common.LogInfo1Quiet(fmt.Sprintf("Applied keda-cluster-trigger-authentications-%s chart", triggerType))
+
+	return nil
+}
+
+func applyClusterIssuers(ctx context.Context) error {
+	chartDir, err := os.MkdirTemp("", "cluster-issuer-chart-")
+	if err != nil {
+		return fmt.Errorf("Error creating cluster-issuer chart directory: %w", err)
+	}
+	defer os.RemoveAll(chartDir)
+
+	// create the chart.yaml
+	chart := &Chart{
+		ApiVersion: "v2",
+		AppVersion: "1.0.0",
+		Icon:       "https://dokku.com/assets/dokku-logo.svg",
+		Name:       "cluster-issuers",
+		Version:    "0.0.1",
+	}
+
+	err = writeYaml(WriteYamlInput{
+		Object: chart,
+		Path:   filepath.Join(chartDir, "Chart.yaml"),
+	})
+	if err != nil {
+		return fmt.Errorf("Error writing cluster-issuer chart: %w", err)
+	}
+
+	// create the values.yaml
+	letsencryptEmailStag := getGlobalLetsencryptEmailStag()
+	letsencryptEmailProd := getGlobalLetsencryptEmailProd()
+
+	clusterIssuerValues := ClusterIssuerValues{
+		ClusterIssuers: map[string]ClusterIssuer{
+			"letsencrypt-stag": {
+				Email:        letsencryptEmailStag,
+				Enabled:      letsencryptEmailStag != "",
+				IngressClass: getComputedIngressClass(),
+				Name:         "letsencrypt-stag",
+				Server:       LetsencryptServerStag,
+			},
+			"letsencrypt-prod": {
+				Email:        letsencryptEmailProd,
+				Enabled:      letsencryptEmailProd != "",
+				IngressClass: getComputedIngressClass(),
+				Name:         "letsencrypt-prod",
+				Server:       LetsencryptServerProd,
+			},
+		},
+	}
+
+	if err := os.MkdirAll(filepath.Join(chartDir, "templates"), os.FileMode(0755)); err != nil {
+		return fmt.Errorf("Error creating cluster-issuer chart templates directory: %w", err)
+	}
+
+	err = writeYaml(WriteYamlInput{
+		Object: clusterIssuerValues,
+		Path:   filepath.Join(chartDir, "values.yaml"),
+	})
+	if err != nil {
+		return fmt.Errorf("Error writing chart: %w", err)
+	}
+
+	// create the templates/cluster-issuer.yaml
+	b, err := templates.ReadFile("templates/chart/cluster-issuer.yaml")
+	if err != nil {
+		return fmt.Errorf("Error reading cluster-issuer template: %w", err)
+	}
+
+	filename := filepath.Join(chartDir, "templates", "cluster-issuer.yaml")
+	err = os.WriteFile(filename, b, os.FileMode(0644))
+	if err != nil {
+		return fmt.Errorf("Error writing cluster-issuer template: %w", err)
+	}
+
+	if os.Getenv("DOKKU_TRACE") == "1" {
+		common.CatFile(filename)
+	}
+
+	// install the chart
+	helmAgent, err := NewHelmAgent("cert-manager", DevNullPrinter)
+	if err != nil {
+		return fmt.Errorf("Error creating helm agent: %w", err)
+	}
+
+	chartPath, err := filepath.Abs(chartDir)
+	if err != nil {
+		return fmt.Errorf("Error getting chart path: %w", err)
+	}
+
+	timeoutDuration, err := time.ParseDuration("300s")
+	if err != nil {
+		return fmt.Errorf("Error parsing deploy timeout duration: %w", err)
+	}
+
+	err = helmAgent.InstallOrUpgradeChart(ctx, ChartInput{
+		ChartPath:         chartPath,
+		Namespace:         "cert-manager",
+		ReleaseName:       "cluster-issuers",
+		RollbackOnFailure: true,
+		Timeout:           timeoutDuration,
+		Wait:              true,
+	})
+	if err != nil {
+		return fmt.Errorf("Error installing cluster-issuer chart: %w", err)
+	}
+
+	return nil
+}
+
+func createKubernetesNamespace(ctx context.Context, namespaceName string) error {
+	clientset, err := NewKubernetesClient()
+	if err != nil {
+		return err
+	}
+
+	namespace := corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: namespaceName,
+			Annotations: map[string]string{
+				"dokku.com/managed": "true",
+			},
+			Labels: map[string]string{
+				"dokku.com/managed": "true",
+			},
+		},
+	}
+	_, err = clientset.CreateNamespace(ctx, CreateNamespaceInput{
+		Name: namespace,
+	})
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// attachExitError surfaces the exit code of the remote command from a
+// kubernetes exec stream as an ExitCodeError, so that attached sessions
+// (dokku run in interactive mode, dokku enter) exit with the command's own
+// status rather than a generic failure, matching docker-local scheduler
+// behavior. Other errors pass through unchanged.
+func attachExitError(err error) error {
+	if err == nil {
+		return nil
+	}
+
+	var coded utilexec.CodeExitError
+	if errors.As(err, &coded) && coded.Code > 0 {
+		return &ExitCodeError{Code: coded.Code, Message: coded.Error()}
+	}
+
+	return err
+}
+
+func enterPod(ctx context.Context, input EnterPodInput) error {
+	labelSelector := []string{}
+	for k, v := range input.SelectedPod.Labels {
+		labelSelector = append(labelSelector, fmt.Sprintf("%s=%s", k, v))
+	}
+
+	if input.WaitTimeout == 0 {
+		input.WaitTimeout = 10
+	}
+
+	err := waitForPodBySelectorRunning(ctx, WaitForPodBySelectorRunningInput{
+		AllowCompletion: input.AllowCompletion,
+		Clientset:       input.Clientset,
+		Namespace:       input.SelectedPod.Namespace,
+		LabelSelector:   strings.Join(labelSelector, ","),
+		PodName:         input.SelectedPod.Name,
+		Timeout:         input.WaitTimeout,
+		Waiter:          isPodReady,
+	})
+	if err != nil {
+		return fmt.Errorf("Error waiting for pod to be ready: %w", err)
+	}
+
+	defaultContainerName, hasDefaultContainer := input.SelectedPod.Annotations["kubectl.kubernetes.io/default-container"]
+	if input.SelectedContainerName == "" && hasDefaultContainer {
+		input.SelectedContainerName = defaultContainerName
+	}
+	if input.SelectedContainerName == "" {
+		return fmt.Errorf("No container specified and no default container found")
+	}
+
+	return attachExitError(input.Clientset.ExecCommand(ctx, ExecCommandInput{
+		Command:       input.Command,
+		ContainerName: input.SelectedContainerName,
+		Entrypoint:    input.Entrypoint,
+		Name:          input.SelectedPod.Name,
+		Namespace:     input.SelectedPod.Namespace,
+	}))
+}
+
+func extractStartCommand(input StartCommandInput) string {
+	command := ""
+	if input.ImageSourceType == "herokuish" {
+		return "/start " + input.ProcessType
+	}
+
+	if startCmd := common.PropertyGet("ps", input.AppName, "start-cmd"); startCmd != "" {
+		command = startCmd
+	}
+
+	if input.ImageSourceType == "dockerfile" {
+		if dockerfileStartCmd := common.PropertyGet("ps", input.AppName, "dockerfile-start-cmd"); dockerfileStartCmd != "" {
+			command = dockerfileStartCmd
+		}
+	}
+
+	if command == "" {
+		results, _ := common.CallPlugnTrigger(common.PlugnTriggerInput{
+			Trigger: "procfile-get-command",
+			Args:    []string{input.AppName, input.ProcessType, fmt.Sprint(input.Port)},
+		})
+		command = results.StdoutContents()
+	}
+
+	return command
+}
+
+// getAnnotations retrieves annotations for a given app and process type
+func getAnnotations(appName string, processType string) (ProcessAnnotations, error) {
+	annotations := ProcessAnnotations{}
+	certificateAnnotations, err := getAnnotation(appName, processType, "certificate")
+	if err != nil {
+		return annotations, err
+	}
+	annotations.CertificateAnnotations = certificateAnnotations
+
+	cronJobAnnotations, err := getAnnotation(appName, processType, "cronjob")
+	if err != nil {
+		return annotations, err
+	}
+	annotations.CronJobAnnotations = cronJobAnnotations
+
+	deploymentAnnotations, err := getAnnotation(appName, processType, "deployment")
+	if err != nil {
+		return annotations, err
+	}
+	annotations.DeploymentAnnotations = deploymentAnnotations
+
+	ingressAnnotations, err := getIngressAnnotations(appName, processType)
+	if err != nil {
+		return annotations, err
+	}
+	annotations.IngressAnnotations = ingressAnnotations
+
+	jobAnnotations, err := getAnnotation(appName, processType, "job")
+	if err != nil {
+		return annotations, err
+	}
+	annotations.JobAnnotations = jobAnnotations
+
+	kedaScalingObjectAnnotations, err := getAnnotation(appName, processType, "keda_scaled_object")
+	if err != nil {
+		return annotations, err
+	}
+	annotations.KedaScalingObjectAnnotations = kedaScalingObjectAnnotations
+
+	kedaSecretAnnotations, err := getAnnotation(appName, processType, "keda_secret")
+	if err != nil {
+		return annotations, err
+	}
+	annotations.KedaSecretAnnotations = kedaSecretAnnotations
+
+	kedaTriggerAuthenticationAnnotations, err := getAnnotation(appName, processType, "keda_trigger_authentication")
+	if err != nil {
+		return annotations, err
+	}
+	annotations.KedaTriggerAuthenticationAnnotations = kedaTriggerAuthenticationAnnotations
+
+	podAnnotations, err := getAnnotation(appName, processType, "pod")
+	if err != nil {
+		return annotations, err
+	}
+	annotations.PodAnnotations = podAnnotations
+
+	secretAnnotations, err := getAnnotation(appName, processType, "secret")
+	if err != nil {
+		return annotations, err
+	}
+	annotations.SecretAnnotations = secretAnnotations
+
+	serviceAnnotations, err := getAnnotation(appName, processType, "service")
+	if err != nil {
+		return annotations, err
+	}
+	annotations.ServiceAnnotations = serviceAnnotations
+
+	serviceAccountAnnotations, err := getAnnotation(appName, processType, "serviceaccount")
+	if err != nil {
+		return annotations, err
+	}
+	annotations.ServiceAccountAnnotations = serviceAccountAnnotations
+
+	traefikIngressRouteAnnotations, err := getAnnotation(appName, processType, "traefik_ingressroute")
+	if err != nil {
+		return annotations, err
+	}
+	annotations.TraefikIngressRouteAnnotations = traefikIngressRouteAnnotations
+
+	traefikMiddlewareAnnotations, err := getAnnotation(appName, processType, "traefik_middleware")
+	if err != nil {
+		return annotations, err
+	}
+	annotations.TraefikMiddlewareAnnotations = traefikMiddlewareAnnotations
+
+	return annotations, nil
+}
+
+// GetAutoscalingInput contains all the information needed to get autoscaling config
+type GetAutoscalingInput struct {
+	// AppName is the name of the app
+	AppName string
+
+	// ProcessType is the process type
+	ProcessType string
+
+	// Replicas is the number of replicas
+	Replicas int
+
+	// KedaValues is the keda values
+	KedaValues GlobalKedaValues
+}
+
+// getAutoscaling retrieves autoscaling config for a given app and process type
+func getAutoscaling(input GetAutoscalingInput) (ProcessAutoscaling, error) {
+	config, ok, err := appjson.GetAutoscalingConfig(input.AppName, input.ProcessType, input.Replicas)
+	if err != nil {
+		common.LogWarn(fmt.Sprintf("Error getting autoscaling config for %s: %v", input.AppName, err))
+		return ProcessAutoscaling{}, err
+	}
+
+	if !ok {
+		return ProcessAutoscaling{}, nil
+	}
+
+	replacements := map[string]string{
+		"APP_NAME":        input.AppName,
+		"PROCESS_TYPE":    input.ProcessType,
+		"DEPLOYMENT_NAME": fmt.Sprintf("%s-%s", input.AppName, input.ProcessType),
+	}
+
+	validHttpScaleMethods := map[string]bool{
+		"request_rate": true,
+		"concurrency":  true,
+	}
+
+	hasHttpTrigger := false
+	httpTrigger := ProcessAutoscalingTrigger{}
+	triggers := []ProcessAutoscalingTrigger{}
+	for idx, trigger := range config.Triggers {
+		if trigger.Type == "" {
+			return ProcessAutoscaling{}, fmt.Errorf("Autoscaling trigger type is required for trigger: index %d", idx)
+		}
+		metadata := map[string]string{}
+		for key, value := range trigger.Metadata {
+			tmpl, err := template.New("").Delims("[[", "]]").Parse(value)
+			if err != nil {
+				return ProcessAutoscaling{}, fmt.Errorf("Error parsing autoscaling trigger metadata: %w", err)
+			}
+
+			var output bytes.Buffer
+			if err := tmpl.Execute(&output, replacements); err != nil {
+				return ProcessAutoscaling{}, fmt.Errorf("Error executing autoscaling trigger metadata template: %w", err)
+			}
+			metadata[key] = output.String()
+		}
+
+		if trigger.Name == "" {
+			trigger.Name = fmt.Sprintf("trigger-%s-%d", trigger.Type, idx+1)
+		}
+
+		autoscalingTrigger := ProcessAutoscalingTrigger{
+			Name:     trigger.Name,
+			Type:     trigger.Type,
+			Metadata: metadata,
+		}
+
+		if auth, ok := input.KedaValues.Authentications[trigger.Type]; ok {
+			autoscalingTrigger.AuthenticationRef = &ProcessAutoscalingTriggerAuthenticationRef{
+				Name: auth.Name,
+				Kind: string(auth.Kind),
+			}
+		} else if auth, ok := input.KedaValues.GlobalAuthentications[trigger.Type]; ok {
+			autoscalingTrigger.AuthenticationRef = &ProcessAutoscalingTriggerAuthenticationRef{
+				Name: auth.Name,
+				Kind: string(auth.Kind),
+			}
+		}
+
+		if autoscalingTrigger.Type == "http" {
+			if hasHttpTrigger {
+				return ProcessAutoscaling{}, errors.New("Only one http trigger is allowed")
+			}
+
+			hasHttpTrigger = true
+			httpTrigger = autoscalingTrigger
+
+			if _, ok := metadata["scale_by"]; !ok {
+				httpTrigger.Metadata["scale_by"] = "request_rate"
+			}
+
+			if !validHttpScaleMethods[metadata["scale_by"]] {
+				return ProcessAutoscaling{}, fmt.Errorf("Invalid http scale method: %s", metadata["scale_by"])
+			}
+
+			if _, ok := metadata["scaledown_period_seconds"]; !ok {
+				httpTrigger.Metadata["scaledown_period_seconds"] = "300"
+			}
+
+			if _, ok := metadata["request_rate_granularity_seconds"]; !ok {
+				httpTrigger.Metadata["request_rate_granularity_seconds"] = "1"
+			}
+
+			if _, ok := metadata["request_rate_target_value"]; !ok {
+				httpTrigger.Metadata["request_rate_target_value"] = "100"
+			}
+
+			if _, ok := metadata["request_rate_window_seconds"]; !ok {
+				httpTrigger.Metadata["request_rate_window_seconds"] = "60"
+			}
+
+			if _, ok := metadata["concurrency_target_value"]; !ok {
+				httpTrigger.Metadata["concurrency_target_value"] = "100"
+			}
+
+			triggers = append(triggers, ProcessAutoscalingTrigger{
+				Name: trigger.Name,
+				Type: "external-push",
+				Metadata: map[string]string{
+					"httpScaledObject": fmt.Sprintf("%s-%s", input.AppName, input.ProcessType),
+					"scalerAddress":    "keda-add-ons-http-external-scaler.keda:9090",
+				},
+			})
+			continue
+		}
+
+		triggers = append(triggers, autoscalingTrigger)
+	}
+
+	autoscaling := ProcessAutoscaling{
+		CooldownPeriodSeconds:  ptr.Deref(config.CooldownPeriodSeconds, 300),
+		Enabled:                len(triggers) > 0 || hasHttpTrigger,
+		MaxReplicas:            ptr.Deref(config.MaxQuantity, 0),
+		MinReplicas:            ptr.Deref(config.MinQuantity, 0),
+		PollingIntervalSeconds: ptr.Deref(config.PollingIntervalSeconds, 30),
+		HttpTrigger:            httpTrigger,
+		Triggers:               triggers,
+		Type:                   "keda",
+	}
+
+	return autoscaling, nil
+}
+
+// getKedaValues retrieves keda values for a given app and process type
+func getKedaValues(ctx context.Context, clientset KubernetesClient, appName string) (GlobalKedaValues, error) {
+	properties, err := common.PropertyGetAllByPrefix("scheduler-k3s", appName, TriggerAuthPropertyPrefix)
+	if err != nil {
+		return GlobalKedaValues{}, fmt.Errorf("Error getting trigger-auth properties: %w", err)
+	}
+
+	auths := map[string]KedaAuthentication{}
+	for key, value := range properties {
+		parts := strings.SplitN(strings.TrimPrefix(key, TriggerAuthPropertyPrefix), ".", 2)
+		if len(parts) != 2 {
+			return GlobalKedaValues{}, fmt.Errorf("Invalid trigger-auth property format: %s", key)
+		}
+
+		authType := parts[0]
+		secretKey := parts[1]
+		if len(secretKey) == 0 {
+			return GlobalKedaValues{}, fmt.Errorf("Invalid trigger-auth property format: %s", key)
+		}
+
+		if _, ok := auths[authType]; !ok {
+			auths[authType] = KedaAuthentication{
+				Name:    fmt.Sprintf("%s-%s", appName, authType),
+				Type:    authType,
+				Kind:    KedaAuthenticationKind_TriggerAuthentication,
+				Secrets: make(map[string]string),
+			}
+		}
+
+		auths[authType].Secrets[secretKey] = base64.StdEncoding.EncodeToString([]byte(value))
+	}
+
+	items, err := clientset.ListClusterTriggerAuthentications(ctx, ListClusterTriggerAuthenticationsInput{})
+	if err != nil {
+		if !k8serrors.IsNotFound(err) {
+			return GlobalKedaValues{}, fmt.Errorf("Error listing cluster trigger authentications: %w", err)
+		}
+
+		common.LogWarn(fmt.Sprintf("Error listing cluster trigger authentications: %v", err))
+		common.LogWarn("Continuing with no cluster trigger authentications")
+		common.LogWarn("This may be due to the keda helm chart not being installed")
+		items = []kedav1alpha1.ClusterTriggerAuthentication{}
+	}
+
+	globalAuths := map[string]KedaAuthentication{}
+	for _, item := range items {
+		globalAuths[item.Name] = KedaAuthentication{
+			Name: item.Name,
+			Kind: KedaAuthenticationKind_ClusterTriggerAuthentication,
+			Type: item.Name,
+		}
+	}
+
+	return GlobalKedaValues{
+		Authentications:       auths,
+		GlobalAuthentications: globalAuths,
+	}, nil
+}
+
+// getGlobalAnnotations retrieves global annotations for a given app
+func getGlobalAnnotations(appName string) (ProcessAnnotations, error) {
+	return getAnnotations(appName, GlobalProcessType)
+}
+
+// getAnnotation retrieves an annotation for a given app, process type, and resource type
+func getAnnotation(appName string, processType string, resourceType string) (map[string]string, error) {
+	return common.PropertyMapGet("scheduler-k3s", appName, fmt.Sprintf("%s.%s", processType, resourceType))
+}
+
+func getDeployTimeout(appName string) string {
+	return common.PropertyGet("scheduler-k3s", appName, "deploy-timeout")
+}
+
+func getGlobalDeployTimeout() string {
+	return common.PropertyGet("scheduler-k3s", "--global", "deploy-timeout")
+}
+
+func getComputedDeployTimeout(appName string) string {
+	deployTimeout := getDeployTimeout(appName)
+	if deployTimeout == "" {
+		deployTimeout = getGlobalDeployTimeout()
+	}
+	if deployTimeout == "" {
+		deployTimeout = "300s"
+	}
+
+	return deployTimeout
+}
+
+// getHelmChart returns the helm chart managed by dokku with the given release name
+func getHelmChart(chartName string) (HelmChart, error) {
+	knownCharts := []string{}
+	for _, chart := range HelmCharts {
+		if chart.ReleaseName == chartName {
+			return chart, nil
+		}
+		knownCharts = append(knownCharts, chart.ReleaseName)
+	}
+
+	sort.Strings(knownCharts)
+	return HelmChart{}, fmt.Errorf("Invalid chart name %q, valid charts: %s", chartName, strings.Join(knownCharts, ", "))
+}
+
+func getImagePullSecrets(appName string) string {
+	return common.PropertyGet("scheduler-k3s", appName, "image-pull-secrets")
+}
+
+func getGlobalImagePullSecrets() string {
+	return common.PropertyGet("scheduler-k3s", "--global", "image-pull-secrets")
+}
+
+func getComputedImagePullSecrets(appName string) string {
+	imagePullSecrets := getImagePullSecrets(appName)
+	if imagePullSecrets == "" {
+		imagePullSecrets = getGlobalImagePullSecrets()
+	}
+
+	return imagePullSecrets
+}
+
+// pruneStaleImagePullSecretsFromDeployments rewrites the imagePullSecrets list on existing app
+// Deployments to contain only the names in keepNames. This removes references that helm has
+// lost track of due to strategic-merge accumulation on PodSpec.ImagePullSecrets, which is the
+// root cause of stale-secret pod hard crashes after rollbacks. The patch is a no-op when the
+// live list already matches.
+func pruneStaleImagePullSecretsFromDeployments(ctx context.Context, clientset KubernetesClient, namespace string, appName string, keepNames []string) error {
+	deployments, err := clientset.ListDeployments(ctx, ListDeploymentsInput{
+		Namespace:     namespace,
+		LabelSelector: fmt.Sprintf("app.kubernetes.io/part-of=%s", appName),
+	})
+	if err != nil {
+		return fmt.Errorf("error listing deployments: %w", err)
+	}
+
+	keepSet := map[string]struct{}{}
+	for _, name := range keepNames {
+		if name != "" {
+			keepSet[name] = struct{}{}
+		}
+	}
+
+	for _, deployment := range deployments {
+		live := deployment.Spec.Template.Spec.ImagePullSecrets
+		if needsImagePullSecretsPrune(live, keepSet) {
+			common.LogVerboseQuiet(fmt.Sprintf("Pruning stale imagePullSecrets entries from deployment %s", deployment.Name))
+			err := clientset.SetDeploymentImagePullSecrets(ctx, SetDeploymentImagePullSecretsInput{
+				Name:             deployment.Name,
+				Namespace:        namespace,
+				ImagePullSecrets: keepNames,
+			})
+			if err != nil {
+				return fmt.Errorf("error pruning deployment %s: %w", deployment.Name, err)
+			}
+		}
+	}
+
+	return nil
+}
+
+// needsImagePullSecretsPrune reports whether the live imagePullSecrets list differs from the
+// desired keep-set (either contains entries not in the keep-set or is missing entries in it).
+func needsImagePullSecretsPrune(live []corev1.LocalObjectReference, keepSet map[string]struct{}) bool {
+	if len(live) != len(keepSet) {
+		return true
+	}
+
+	seen := map[string]struct{}{}
+	for _, ref := range live {
+		if _, ok := keepSet[ref.Name]; !ok {
+			return true
+		}
+		seen[ref.Name] = struct{}{}
+	}
+
+	return len(seen) != len(keepSet)
+}
+
+func getGlobalIngressClass() string {
+	return common.PropertyGet("scheduler-k3s", "--global", "ingress-class")
+}
+
+func getComputedIngressClass() string {
+	ingressClass := getGlobalIngressClass()
+	if ingressClass == "" {
+		ingressClass = DefaultIngressClass
+	}
+
+	return ingressClass
+}
+
+func getIngressAnnotations(appName string, processType string) (map[string]string, error) {
+	type annotation struct {
+		annotation      string
+		getter          func(appName string) string
+		modifier        func(value string) string
+		locationSnippet func(value string) string
+		serverSnippet   func(value string) string
+	}
+
+	locationLines := []string{}
+	serverLines := []string{}
+
+	numericOnlyRegex := regexp.MustCompile("[^0-9]")
+
+	properties := map[string]annotation{
+		"access-log-path": {
+			getter: nginxvhosts.ComputedAccessLogPath,
+			serverSnippet: func(value string) string {
+				if value == "" {
+					return ""
+				}
+				return fmt.Sprintf("access_log %s;", value)
+			},
+		},
+		"bind-address-ipv4": {
+			getter: nginxvhosts.ComputedBindAddressIPv4,
+		},
+		"bind-address-ipv6": {
+			getter: nginxvhosts.ComputedBindAddressIPv6,
+		},
+		"client-body-timeout": {
+			getter: nginxvhosts.ComputedClientBodyTimeout,
+			serverSnippet: func(value string) string {
+				if value == "" {
+					return ""
+				}
+				return fmt.Sprintf("client_body_timeout %s;", value)
+			},
+		},
+		"client-header-timeout": {
+			getter: nginxvhosts.ComputedClientHeaderTimeout,
+			serverSnippet: func(value string) string {
+				if value == "" {
+					return ""
+				}
+				return fmt.Sprintf("client_header_timeout %s;", value)
+			},
+		},
+		"client-max-body-size": {
+			annotation: "nginx.ingress.kubernetes.io/proxy-body-size",
+			getter:     nginxvhosts.ComputedClientMaxBodySize,
+		},
+		"disable-custom-config": {
+			getter: nginxvhosts.ComputedDisableCustomConfig,
+		},
+		"error-log-path": {
+			getter: nginxvhosts.ComputedErrorLogPath,
+			serverSnippet: func(value string) string {
+				if value == "" {
+					return ""
+				}
+				return fmt.Sprintf("error_log %s;", value)
+			},
+		},
+		// todo: handle hsts properly
+		"hsts-include-subdomains": {
+			getter: nginxvhosts.ComputedHSTSIncludeSubdomains,
+		},
+		"hsts-max-age": {
+			getter: nginxvhosts.ComputedHSTSMaxAge,
+		},
+		"hsts-preload": {
+			getter: nginxvhosts.ComputedHSTSPreload,
+		},
+		"hsts": {
+			getter: nginxvhosts.ComputedHSTS,
+		},
+		"keepalive-timeout": {
+			getter: nginxvhosts.ComputedKeepaliveTimeout,
+			serverSnippet: func(value string) string {
+				if value == "" {
+					return ""
+				}
+				return fmt.Sprintf("keepalive_timeout %s;", value)
+			},
+		},
+		"lingering-timeout": {
+			getter: nginxvhosts.ComputedLingeringTimeout,
+			serverSnippet: func(value string) string {
+				if value == "" {
+					return ""
+				}
+				return fmt.Sprintf("lingering_timeout %s;", value)
+			},
+		},
+		"nginx-conf-sigil-path": {
+			getter: nginxvhosts.ComputedNginxConfSigilPath,
+		},
+		"proxy-buffer-size": {
+			annotation: "nginx.ingress.kubernetes.io/proxy-buffer-size",
+			getter:     nginxvhosts.ComputedProxyBufferSize,
+		},
+		"proxy-buffering": {
+			annotation: "nginx.ingress.kubernetes.io/proxy-buffering",
+			getter:     nginxvhosts.ComputedProxyBuffering,
+		},
+		"proxy-buffers-number": {
+			annotation: "nginx.ingress.kubernetes.io/proxy-buffers-number",
+			getter:     nginxvhosts.ComputedProxyBuffers,
+			modifier: func(value string) string {
+				parts := strings.Split(value, " ")
+				if len(parts) != 2 {
+					return "8"
+				}
+				return parts[0]
+			},
+		},
+		"proxy-buffers-size": {
+			annotation: "nginx.ingress.kubernetes.io/proxy-buffers-size",
+			getter:     nginxvhosts.ComputedProxyBuffers,
+			modifier: func(value string) string {
+				parts := strings.Split(value, " ")
+				if len(parts) != 2 {
+					return "4k"
+				}
+				return parts[1]
+			},
+		},
+		"proxy-busy-buffers-size": {
+			getter: nginxvhosts.ComputedProxyBusyBuffersSize,
+			locationSnippet: func(value string) string {
+				if value == "" {
+					return ""
+				}
+				return fmt.Sprintf("proxy_busy_buffers_size %s;", value)
+			},
+		},
+		"proxy-http-version": {
+			annotation: "nginx.ingress.kubernetes.io/proxy-http-version",
+			getter:     nginxvhosts.ComputedProxyHttpVersion,
+		},
+		"proxy-connect-timeout": {
+			annotation: "nginx.ingress.kubernetes.io/proxy-connect-timeout",
+			getter:     nginxvhosts.ComputedProxyConnectTimeout,
+			modifier: func(value string) string {
+				return numericOnlyRegex.ReplaceAllString(value, "")
+			},
+		},
+		"proxy-read-timeout": {
+			annotation: "nginx.ingress.kubernetes.io/proxy-read-timeout",
+			getter:     nginxvhosts.ComputedProxyReadTimeout,
+			modifier: func(value string) string {
+				return numericOnlyRegex.ReplaceAllString(value, "")
+			},
+		},
+		"proxy-send-timeout": {
+			annotation: "nginx.ingress.kubernetes.io/proxy-send-timeout",
+			getter:     nginxvhosts.ComputedProxySendTimeout,
+			modifier: func(value string) string {
+				return numericOnlyRegex.ReplaceAllString(value, "")
+			},
+		},
+		"send-timeout": {
+			getter: nginxvhosts.ComputedSendTimeout,
+			serverSnippet: func(value string) string {
+				if value == "" {
+					return ""
+				}
+				return fmt.Sprintf("send_timeout %s;", value)
+			},
+		},
+		"underscore-in-headers": {
+			getter: nginxvhosts.ComputedUnderscoreInHeaders,
+			serverSnippet: func(value string) string {
+				if value == "" {
+					return ""
+				}
+				return fmt.Sprintf("underscores_in_headers %s;", value)
+			},
+		},
+		"x-forwarded-ssl": {
+			getter: nginxvhosts.ComputedXForwardedSSL,
+			locationSnippet: func(value string) string {
+				if value == "" {
+					return ""
+				}
+				return fmt.Sprintf("proxy_set_header X-Forwarded-SSL %s;", value)
+			},
+		},
+	}
+
+	annotations := map[string]string{}
+	keys := make([]string, 0, len(properties))
+	for key := range properties {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	for _, key := range keys {
+		newKey := properties[key]
+		value := newKey.getter(appName)
+		if newKey.modifier != nil {
+			value = newKey.modifier(value)
+		}
+
+		if newKey.locationSnippet != nil {
+			locationLines = append(locationLines, newKey.locationSnippet(value))
+		} else if newKey.serverSnippet != nil {
+			serverLines = append(serverLines, newKey.serverSnippet(value))
+		} else if newKey.annotation != "" {
+			annotations[newKey.annotation] = value
+		}
+	}
+
+	var locationSnippet string
+	for _, line := range locationLines {
+		if line != "" {
+			locationSnippet += line + "\n"
+		}
+	}
+	var serverSnippet string
+	for _, line := range serverLines {
+		if line != "" {
+			serverSnippet += line + "\n"
+		}
+	}
+
+	if locationSnippet != "" {
+		annotations["nginx.ingress.kubernetes.io/configuration-snippet"] = locationSnippet
+	}
+	if serverSnippet != "" {
+		annotations["nginx.ingress.kubernetes.io/server-snippet"] = serverSnippet
+	}
+
+	customAnnotations, err := getAnnotation(appName, processType, "deployment")
+	if err != nil {
+		return map[string]string{}, err
+	}
+
+	for key, value := range customAnnotations {
+		if _, ok := annotations[key]; ok {
+			common.LogWarn(fmt.Sprintf("Nginx-based annotation %s will be overwritten by custom annotation", key))
+		}
+
+		annotations[key] = value
+	}
+
+	return annotations, nil
+}
+
+// getLabels retrieves labels for a given app and process type
+func getLabels(appName string, processType string) (ProcessLabels, error) {
+	labels := ProcessLabels{}
+	certificateLabels, err := getLabel(appName, processType, "certificate")
+	if err != nil {
+		return labels, err
+	}
+	labels.CertificateLabels = certificateLabels
+
+	cronJobLabels, err := getLabel(appName, processType, "cronjob")
+	if err != nil {
+		return labels, err
+	}
+	labels.CronJobLabels = cronJobLabels
+
+	deploymentLabels, err := getLabel(appName, processType, "deployment")
+	if err != nil {
+		return labels, err
+	}
+	labels.DeploymentLabels = deploymentLabels
+
+	ingressLabels, err := getLabel(appName, processType, "ingress")
+	if err != nil {
+		return labels, err
+	}
+	labels.IngressLabels = ingressLabels
+
+	jobLabels, err := getLabel(appName, processType, "job")
+	if err != nil {
+		return labels, err
+	}
+	labels.JobLabels = jobLabels
+
+	podLabels, err := getLabel(appName, processType, "pod")
+	if err != nil {
+		return labels, err
+	}
+	labels.PodLabels = podLabels
+
+	secretLabels, err := getLabel(appName, processType, "secret")
+	if err != nil {
+		return labels, err
+	}
+	labels.SecretLabels = secretLabels
+
+	serviceLabels, err := getLabel(appName, processType, "service")
+	if err != nil {
+		return labels, err
+	}
+	labels.ServiceLabels = serviceLabels
+
+	serviceAccountLabels, err := getLabel(appName, processType, "serviceaccount")
+	if err != nil {
+		return labels, err
+	}
+	labels.ServiceAccountLabels = serviceAccountLabels
+
+	traefikIngressRouteLabels, err := getLabel(appName, processType, "traefik_ingressroute")
+	if err != nil {
+		return labels, err
+	}
+	labels.TraefikIngressRouteLabels = traefikIngressRouteLabels
+
+	traefikMiddlewareLabels, err := getLabel(appName, processType, "traefik_middleware")
+	if err != nil {
+		return labels, err
+	}
+	labels.TraefikMiddlewareLabels = traefikMiddlewareLabels
+
+	return labels, nil
+}
+
+// getGlobalLabel retrieves global labels for a given app
+func getGlobalLabel(appName string) (ProcessLabels, error) {
+	return getLabels(appName, GlobalProcessType)
+}
+
+// getLabel retrieves a label for a given app, process type, and resource type
+func getLabel(appName string, processType string, resourceType string) (map[string]string, error) {
+	return common.PropertyMapGet("scheduler-k3s", appName, fmt.Sprintf("labels.%s.%s", processType, resourceType))
+}
+
+func getCertIssuerName(appName string) string {
+	return common.PropertyGet("scheduler-k3s", appName, "cert-issuer-name")
+}
+
+func getGlobalCertIssuerName() string {
+	return common.PropertyGet("scheduler-k3s", "--global", "cert-issuer-name")
+}
+
+func getComputedCertIssuerName(appName string) string {
+	certIssuerName := getCertIssuerName(appName)
+	if certIssuerName == "" {
+		certIssuerName = getGlobalCertIssuerName()
+	}
+
+	return certIssuerName
+}
+
+func getCertIssuerKind(appName string) string {
+	return common.PropertyGet("scheduler-k3s", appName, "cert-issuer-kind")
+}
+
+func getGlobalCertIssuerKind() string {
+	return common.PropertyGet("scheduler-k3s", "--global", "cert-issuer-kind")
+}
+
+func getComputedCertIssuerKind(appName string) string {
+	certIssuerKind := getCertIssuerKind(appName)
+	if certIssuerKind == "" {
+		certIssuerKind = getGlobalCertIssuerKind()
+	}
+	if certIssuerKind == "" {
+		certIssuerKind = CertIssuerKindClusterIssuer
+	}
+
+	return certIssuerKind
+}
+
+// normalizeCertIssuerKind validates a cert-issuer-kind value case-insensitively and
+// returns it in the casing cert-manager expects, as the value is interpolated
+// directly into the rendered Certificate manifest. An empty value is left as-is so
+// the property can still be unset.
+func normalizeCertIssuerKind(value string) (string, error) {
+	switch strings.ToLower(value) {
+	case "":
+		return "", nil
+	case strings.ToLower(CertIssuerKindIssuer):
+		return CertIssuerKindIssuer, nil
+	case strings.ToLower(CertIssuerKindClusterIssuer):
+		return CertIssuerKindClusterIssuer, nil
+	}
+
+	return "", fmt.Errorf("Invalid cert-issuer-kind: %s, valid values are %s and %s", value, CertIssuerKindIssuer, CertIssuerKindClusterIssuer)
+}
+
+// validateCertIssuerName ensures a cert-issuer-name refers to a legal Kubernetes
+// object name. An empty value unsets the property and the reserved disabled value
+// opts an app out of a globally configured issuer, so neither is name-checked.
+func validateCertIssuerName(value string) error {
+	if value == "" || value == CertIssuerNameDisabled {
+		return nil
+	}
+
+	if errs := validation.IsDNS1123Subdomain(value); len(errs) > 0 {
+		return fmt.Errorf("Invalid cert-issuer-name: %s, %s", value, strings.Join(errs, ", "))
+	}
+
+	return nil
+}
+
+// validateLetsencryptServer ensures a letsencrypt-server value is one the deploy can
+// act on, so a typo fails when it is set rather than breaking every subsequent deploy.
+func validateLetsencryptServer(value string) error {
+	switch value {
+	case "", "prod", "production", "stag", "staging", LetsencryptServerDisabled:
+		return nil
+	}
+
+	return fmt.Errorf("Invalid letsencrypt-server: %s, valid values are prod, production, stag, staging, and %s", value, LetsencryptServerDisabled)
+}
+
+func getLetsencryptServer(appName string) string {
+	return common.PropertyGet("scheduler-k3s", appName, "letsencrypt-server")
+}
+
+func getGlobalLetsencryptServer() string {
+	return common.PropertyGet("scheduler-k3s", "--global", "letsencrypt-server")
+}
+
+func getComputedLetsencryptServer(appName string) string {
+	letsencryptServer := getLetsencryptServer(appName)
+	if letsencryptServer == "" {
+		letsencryptServer = getGlobalLetsencryptServer()
+	}
+	if letsencryptServer == "" {
+		letsencryptServer = "prod"
+	}
+
+	return letsencryptServer
+}
+
+func getLetsencryptEmailProd(appName string) string {
+	return common.PropertyGet("scheduler-k3s", appName, "letsencrypt-email-prod")
+}
+
+func getGlobalLetsencryptEmailProd() string {
+	return common.PropertyGet("scheduler-k3s", "--global", "letsencrypt-email-prod")
+}
+
+func getComputedLetsencryptEmailProd(appName string) string {
+	letsencryptEmail := getLetsencryptEmailProd(appName)
+	if letsencryptEmail == "" {
+		letsencryptEmail = getGlobalLetsencryptEmailProd()
+	}
+
+	return letsencryptEmail
+}
+
+func getLetsencryptEmailStag(appName string) string {
+	return common.PropertyGet("scheduler-k3s", appName, "letsencrypt-email-stag")
+}
+
+func getGlobalLetsencryptEmailStag() string {
+	return common.PropertyGet("scheduler-k3s", "--global", "letsencrypt-email-stag")
+}
+
+func getComputedLetsencryptEmailStag(appName string) string {
+	letsencryptEmail := getLetsencryptEmailStag(appName)
+	if letsencryptEmail == "" {
+		letsencryptEmail = getGlobalLetsencryptEmailStag()
+	}
+
+	return letsencryptEmail
+}
+
+// resolveLetsencryptIssuer determines the issuer kind and name an app's Certificate should
+// reference for the selected letsencrypt server. When the app sets its own email for that
+// server, a namespaced Issuer is rendered into the app's chart using the app's email;
+// otherwise the app references the shared global ClusterIssuer.
+func resolveLetsencryptIssuer(appName string, clusterIssuerName string, appEmail string, computedEmail string, server string) (string, string, AppIssuer) {
+	if appEmail == "" {
+		return "ClusterIssuer", clusterIssuerName, AppIssuer{}
+	}
+
+	issuerName := fmt.Sprintf("%s-%s", appName, clusterIssuerName)
+	return CertIssuerKindIssuer, issuerName, AppIssuer{
+		Email:        computedEmail,
+		Enabled:      true,
+		IngressClass: getComputedIngressClass(),
+		Name:         issuerName,
+		Server:       server,
+	}
+}
+
+// AppTLSConfig is the resolved certificate configuration for an app's web process.
+type AppTLSConfig struct {
+	// Enabled is whether the app serves https and has a certificate source
+	Enabled bool
+
+	// Issuer is a namespaced cert-manager Issuer for Dokku to render into the app's
+	// own chart. It is zero-valued whenever Dokku manages no issuer for the app.
+	Issuer AppIssuer
+
+	// IssuerKind is the cert-manager kind the app's Certificate references
+	IssuerKind string
+
+	// IssuerName is the cert-manager issuer name the app's Certificate references
+	IssuerName string
+
+	// UseImportedCert is whether the app serves a certificate imported via the certs plugin
+	UseImportedCert bool
+
+	// UsesCustomIssuer is whether IssuerName refers to an issuer the operator manages
+	// rather than one Dokku creates
+	UsesCustomIssuer bool
+}
+
+// ResolveAppTLSConfigInput contains the inputs to resolveAppTLSConfig
+type ResolveAppTLSConfigInput struct {
+	// AppName is the app being resolved
+	AppName string
+
+	// ImportedCertExists is whether a certificate imported via the certs plugin is
+	// available for the app
+	ImportedCertExists bool
+}
+
+// resolveAppTLSConfig determines which certificate source an app's web process uses.
+// An imported certificate wins outright, then the letsencrypt-server kill switch,
+// then a manually managed issuer named by cert-issuer-name, and finally the built-in
+// letsencrypt flow. It reads only properties so it can be exercised without a cluster.
+func resolveAppTLSConfig(input ResolveAppTLSConfigInput) (AppTLSConfig, error) {
+	appName := input.AppName
+	if input.ImportedCertExists {
+		return AppTLSConfig{
+			Enabled:         true,
+			UseImportedCert: true,
+		}, nil
+	}
+
+	server := getComputedLetsencryptServer(appName)
+	if server == LetsencryptServerDisabled {
+		return AppTLSConfig{}, nil
+	}
+
+	certIssuerName := getComputedCertIssuerName(appName)
+	if certIssuerName != "" && certIssuerName != CertIssuerNameDisabled {
+		certIssuerKind, err := normalizeCertIssuerKind(getComputedCertIssuerKind(appName))
+		if err != nil {
+			return AppTLSConfig{}, err
+		}
+
+		return AppTLSConfig{
+			Enabled:          true,
+			IssuerKind:       certIssuerKind,
+			IssuerName:       certIssuerName,
+			UsesCustomIssuer: true,
+		}, nil
+	}
+
+	switch server {
+	case "prod", "production":
+		computedEmail := getComputedLetsencryptEmailProd(appName)
+		issuerKind, issuerName, appIssuer := resolveLetsencryptIssuer(appName, "letsencrypt-prod", getLetsencryptEmailProd(appName), computedEmail, LetsencryptServerProd)
+		return AppTLSConfig{
+			Enabled:    computedEmail != "",
+			Issuer:     appIssuer,
+			IssuerKind: issuerKind,
+			IssuerName: issuerName,
+		}, nil
+	case "stag", "staging":
+		computedEmail := getComputedLetsencryptEmailStag(appName)
+		issuerKind, issuerName, appIssuer := resolveLetsencryptIssuer(appName, "letsencrypt-stag", getLetsencryptEmailStag(appName), computedEmail, LetsencryptServerStag)
+		return AppTLSConfig{
+			Enabled:    computedEmail != "",
+			Issuer:     appIssuer,
+			IssuerKind: issuerKind,
+			IssuerName: issuerName,
+		}, nil
+	}
+
+	return AppTLSConfig{}, fmt.Errorf("Invalid letsencrypt server config: %s", server)
+}
+
+// warnMissingCertIssuer warns when an app references a manually managed cert-manager
+// issuer that is not present in the cluster. Without it a deploy succeeds while
+// cert-manager sits on IssuerNotFound and the ingress serves its default certificate.
+// Every failure is swallowed: this is advisory only and must never interrupt a deploy.
+func warnMissingCertIssuer(ctx context.Context, appName string) {
+	tlsConfig, err := resolveAppTLSConfig(ResolveAppTLSConfigInput{
+		AppName:            appName,
+		ImportedCertExists: HasImportedTLSCert(appName),
+	})
+	if err != nil {
+		common.LogDebug(fmt.Sprintf("Skipping cert issuer check for %s: %v", appName, err))
+		return
+	}
+
+	if !tlsConfig.UsesCustomIssuer {
+		return
+	}
+
+	if err := isKubernetesAvailable(); err != nil {
+		common.LogDebug(fmt.Sprintf("Skipping cert issuer check for %s: %v", appName, err))
+		return
+	}
+
+	clientset, err := NewKubernetesClient()
+	if err != nil {
+		common.LogDebug(fmt.Sprintf("Skipping cert issuer check for %s: %v", appName, err))
+		return
+	}
+
+	namespace := getComputedNamespace(appName)
+	exists, err := clientset.CertIssuerExists(ctx, CertIssuerExistsInput{
+		Kind:      tlsConfig.IssuerKind,
+		Name:      tlsConfig.IssuerName,
+		Namespace: namespace,
+	})
+	if err != nil {
+		common.LogDebug(fmt.Sprintf("Skipping cert issuer check for %s: %v", appName, err))
+		return
+	}
+
+	if exists {
+		return
+	}
+
+	if tlsConfig.IssuerKind == CertIssuerKindIssuer {
+		common.LogWarn(fmt.Sprintf("Issuer %s not found in namespace %s, certificates will not be issued for %s", tlsConfig.IssuerName, namespace, appName))
+		return
+	}
+
+	common.LogWarn(fmt.Sprintf("ClusterIssuer %s not found, certificates will not be issued for %s", tlsConfig.IssuerName, appName))
+}
+
+// domainSlug renders a domain as a Kubernetes object name suffix. A leading wildcard
+// label is spelled out rather than stripped, so that a wildcard domain and its parent
+// do not collapse onto the same generated name.
+func domainSlug(domain string) string {
+	if strings.HasPrefix(domain, "*.") {
+		return fmt.Sprintf("wildcard-%s", slug.Make(strings.TrimPrefix(domain, "*.")))
+	}
+
+	return slug.Make(domain)
+}
+
+// nodeLabels returns the labels to apply to a node joining the cluster, including
+// the node profile label when the node was added with a named profile. The returned
+// map is always a fresh copy so callers cannot mutate ServerLabels or WorkerLabels.
+func nodeLabels(role string, profileName string) map[string]string {
+	source := ServerLabels
+	if role == "worker" {
+		source = WorkerLabels
+	}
+
+	labels := make(map[string]string, len(source)+1)
+	for key, value := range source {
+		labels[key] = value
+	}
+
+	if profileName != "" {
+		labels[NodeProfileLabel] = profileName
+	}
+
+	return labels
+}
+
+// InitializeInstallerArgsInput contains the inputs to initializeInstallerArgs
+type InitializeInstallerArgsInput struct {
+	// IngressClass is the ingress class the cluster is initialized with
+	IngressClass string
+	// KubeletArgs is a list of key=value kubelet arguments for the server node
+	KubeletArgs []string
+	// NodeName is the generated name of the server node
+	NodeName string
+	// TaintScheduling is whether to taint the node against app workloads
+	TaintScheduling bool
+	// Token is the cluster join token
+	Token string
+}
+
+// initializeInstallerArgs builds the argument list handed to the k3s installer
+// when creating the initial server node
+func initializeInstallerArgs(input InitializeInstallerArgsInput) []string {
+	args := []string{
+		// initialize the cluster
+		"--cluster-init",
+		// disable local-storage
+		"--disable", "local-storage",
+		// disable traefik so it can be installed separately
+		"--disable", "traefik",
+		// expose etcd metrics
+		"--etcd-expose-metrics",
+		// use wireguard for flannel
+		"--flannel-backend=wireguard-native",
+		// bind controller-manager to all interfaces
+		"--kube-controller-manager-arg", "bind-address=0.0.0.0",
+		// bind proxy metrics to all interfaces
+		"--kube-proxy-arg", "metrics-bind-address=0.0.0.0",
+		// bind scheduler to all interfaces
+		"--kube-scheduler-arg", "bind-address=0.0.0.0",
+		// gc terminated pods
+		"--kube-controller-manager-arg", "terminated-pod-gc-threshold=10",
+		// specify the node name
+		"--node-name", input.NodeName,
+		// allow access for the dokku user
+		"--write-kubeconfig-mode", "0644",
+		// specify a token
+		"--token", input.Token,
+	}
+
+	if input.TaintScheduling {
+		args = append(args, "--node-taint", "CriticalAddonsOnly=true:NoSchedule")
+	}
+
+	for _, kubeletArg := range input.KubeletArgs {
+		args = append(args, "--kubelet-arg", kubeletArg)
+	}
+
+	if input.IngressClass == "nginx" {
+		args = append(args, "--disable", "traefik")
+	}
+
+	return args
+}
+
+func getKustomizeDirectory(appName string) string {
+	directory := filepath.Join(common.MustGetEnv("DOKKU_LIB_ROOT"), "data", "scheduler-k3s", appName)
+	return filepath.Join(directory, "kustomization")
+}
+
+func getKustomizeRootPath(appName string) string {
+	return common.PropertyGet("scheduler-k3s", appName, "kustomize-root-path")
+}
+
+func getGlobalKustomizeRootPath() string {
+	return common.PropertyGet("scheduler-k3s", "--global", "kustomize-root-path")
+}
+
+func getComputedKustomizeRootPath(appName string) string {
+	kustomizeRootPath := getKustomizeRootPath(appName)
+	if kustomizeRootPath == "" {
+		kustomizeRootPath = getGlobalKustomizeRootPath()
+	}
+	if kustomizeRootPath == "" {
+		kustomizeRootPath = "config/kustomize"
+	}
+
+	return kustomizeRootPath
+}
+
+func getGlobalNodeSysctlsImage() string {
+	return common.PropertyGet("scheduler-k3s", "--global", "node-sysctls-image")
+}
+
+func getComputedNodeSysctlsImage() string {
+	image := getGlobalNodeSysctlsImage()
+	if image == "" {
+		image = DefaultNodeSysctlsImage
+	}
+
+	return image
+}
+
+func getGlobalNodeSysctlsPauseImage() string {
+	return common.PropertyGet("scheduler-k3s", "--global", "node-sysctls-pause-image")
+}
+
+func getComputedNodeSysctlsPauseImage() string {
+	image := getGlobalNodeSysctlsPauseImage()
+	if image == "" {
+		image = DefaultNodeSysctlsPauseImage
+	}
+
+	return image
+}
+
+func getNamespace(appName string) string {
+	return common.PropertyGet("scheduler-k3s", appName, "namespace")
+}
+
+func getGlobalNamespace() string {
+	return common.PropertyGet("scheduler-k3s", "--global", "namespace")
+}
+
+func getComputedNamespace(appName string) string {
+	namespace := getNamespace(appName)
+	if namespace == "" {
+		namespace = getGlobalNamespace()
+	}
+	if namespace == "" {
+		namespace = "default"
+	}
+
+	return namespace
+}
+
+func getGlobalNetworkInterface() string {
+	return common.PropertyGet("scheduler-k3s", "--global", "network-interface")
+}
+
+func getComputedNetworkInterface() string {
+	networkInterface := getGlobalNetworkInterface()
+	if networkInterface == "" {
+		networkInterface = "eth0"
+	}
+
+	return networkInterface
+}
+
+func getRollbackOnFailure(appName string) string {
+	return common.PropertyGet("scheduler-k3s", appName, "rollback-on-failure")
+}
+
+func getGlobalRollbackOnFailure() string {
+	return common.PropertyGet("scheduler-k3s", "--global", "rollback-on-failure")
+}
+
+func getComputedRollbackOnFailure(appName string) string {
+	rollbackOnFailure := getRollbackOnFailure(appName)
+	if rollbackOnFailure == "" {
+		rollbackOnFailure = getGlobalRollbackOnFailure()
+	}
+	if rollbackOnFailure == "" {
+		rollbackOnFailure = "false"
+	}
+
+	return rollbackOnFailure
+}
+
+func getShmSize(appName string) string {
+	return common.PropertyGet("scheduler-k3s", appName, "shm-size")
+}
+
+func getGlobalShmSize() string {
+	return common.PropertyGet("scheduler-k3s", "--global", "shm-size")
+}
+
+func getComputedShmSize(appName string) string {
+	shmSize := getShmSize(appName)
+	if shmSize == "" {
+		shmSize = getGlobalShmSize()
+	}
+
+	return shmSize
+}
+
+func getGlobalGlobalToken() string {
+	return common.PropertyGet("scheduler-k3s", "--global", "token")
+}
+
+func getDeployedAppImageTag(appName string) (string, error) {
+	appValues, err := helmValuesForApp(appName)
+	if err != nil {
+		return "", err
+	}
+
+	if appValues.Global.Image.Name == "" {
+		return "", fmt.Errorf("image name not found in helm release")
+	}
+
+	return appValues.Global.Image.Name, nil
+}
+
+func helmValuesForApp(appName string) (AppValues, error) {
+	namespace := getComputedNamespace(appName)
+	helmAgent, err := NewHelmAgent(namespace, DevNullPrinter)
+	if err != nil {
+		return AppValues{}, fmt.Errorf("error creating helm agent: %w", err)
+	}
+
+	exists, err := helmAgent.ChartExists(appName)
+	if err != nil {
+		return AppValues{}, fmt.Errorf("error checking if chart exists: %w", err)
+	}
+	if !exists {
+		return AppValues{}, fmt.Errorf("app %s is not deployed", appName)
+	}
+
+	values, err := helmAgent.GetValues(appName)
+	if err != nil {
+		return AppValues{}, fmt.Errorf("error getting helm values: %w", err)
+	}
+
+	b, err := yaml.Marshal(values)
+	if err != nil {
+		return AppValues{}, fmt.Errorf("error marshaling helm values: %w", err)
+	}
+
+	var appValues AppValues
+	if err := yaml.Unmarshal(b, &appValues); err != nil {
+		return AppValues{}, fmt.Errorf("error unmarshaling helm values: %w", err)
+	}
+
+	return appValues, nil
+}
+
+func isAppDeployed(appName string) bool {
+	namespace := getComputedNamespace(appName)
+	helmAgent, err := NewHelmAgent(namespace, DevNullPrinter)
+	if err != nil {
+		return false
+	}
+
+	exists, err := helmAgent.ChartExists(appName)
+	if err != nil {
+		return false
+	}
+
+	return exists
+}
+
+func getProcessHealtchecks(healthchecks []appjson.Healthcheck, primaryPort int32) ProcessHealthchecks {
+	if len(healthchecks) == 0 {
+		return ProcessHealthchecks{}
+	}
+
+	livenessChecks := []ProcessHealthcheck{}
+	readinessChecks := []ProcessHealthcheck{}
+	startupChecks := []ProcessHealthcheck{}
+	uptimeSeconds := []int32{}
+	for _, healthcheck := range healthchecks {
+		probe := ProcessHealthcheck{
+			InitialDelaySeconds: healthcheck.InitialDelay,
+			PeriodSeconds:       healthcheck.Wait,
+			TimeoutSeconds:      healthcheck.Timeout,
+			FailureThreshold:    healthcheck.Attempts,
+			SuccessThreshold:    int32(1),
+		}
+		if len(healthcheck.Command) > 0 {
+			probe.Exec = &ExecHealthcheck{
+				Command: healthcheck.Command,
+			}
+		} else if healthcheck.Listening {
+			probe.TCPSocket = &TCPHealthcheck{
+				Port: primaryPort,
+			}
+			for _, header := range healthcheck.HTTPHeaders {
+				if header.Name == "Host" {
+					probe.TCPSocket.Host = header.Value
+				}
+			}
+		} else if healthcheck.Path != "" {
+			probe.HTTPGet = &HTTPHealthcheck{
+				Path:        healthcheck.Path,
+				Port:        primaryPort,
+				HTTPHeaders: []HTTPHeader{},
+			}
+
+			if healthcheck.Scheme != "" {
+				probe.HTTPGet.Scheme = URIScheme(strings.ToUpper(healthcheck.Scheme))
+			}
+
+			for _, header := range healthcheck.HTTPHeaders {
+				probe.HTTPGet.HTTPHeaders = append(probe.HTTPGet.HTTPHeaders, HTTPHeader{
+					Name:  header.Name,
+					Value: header.Value,
+				})
+			}
+		} else if healthcheck.Uptime > 0 {
+			uptimeSeconds = append(uptimeSeconds, healthcheck.Uptime)
+		}
+
+		if healthcheck.Type == appjson.HealthcheckType_Liveness {
+			livenessChecks = append(livenessChecks, probe)
+		} else if healthcheck.Type == appjson.HealthcheckType_Readiness {
+			readinessChecks = append(readinessChecks, probe)
+		} else if healthcheck.Type == appjson.HealthcheckType_Startup {
+			startupChecks = append(startupChecks, probe)
+		}
+	}
+	if len(livenessChecks) > 1 {
+		common.LogWarn("Multiple liveness checks are not supported, only the first one will be used")
+	}
+	if len(readinessChecks) > 1 {
+		common.LogWarn("Multiple readiness checks are not supported, only the first one will be used")
+	}
+	if len(startupChecks) > 1 {
+		common.LogWarn("Multiple startup checks are not supported, only the first one will be used")
+	}
+	if len(uptimeSeconds) > 1 {
+		common.LogWarn("Multiple uptime checks are not supported, only the first one will be used")
+	}
+
+	processHealthchecks := ProcessHealthchecks{}
+	if len(livenessChecks) > 0 {
+		processHealthchecks.Liveness = livenessChecks[0]
+	}
+	if len(readinessChecks) > 0 {
+		processHealthchecks.Readiness = readinessChecks[0]
+	}
+	if len(startupChecks) > 0 {
+		processHealthchecks.Startup = startupChecks[0]
+	}
+	if len(uptimeSeconds) > 0 {
+		processHealthchecks.MinReadySeconds = uptimeSeconds[0]
+	}
+
+	return processHealthchecks
+}
+
+func getProcessResources(appName string, processType string) (ProcessResourcesMap, error) {
+	processResources := ProcessResourcesMap{
+		Limits: ProcessResources{},
+		Requests: ProcessResources{
+			CPU:    "100m",
+			Memory: "128Mi",
+		},
+	}
+
+	emptyValues := map[string]bool{
+		"":  true,
+		"0": true,
+	}
+
+	result, err := common.CallPlugnTrigger(common.PlugnTriggerInput{
+		Trigger: "resource-get-property",
+		Args:    []string{appName, processType, "limit", "cpu"},
+	})
+	if err == nil && !emptyValues[result.StdoutContents()] {
+		quantity, err := resource.ParseQuantity(result.StdoutContents())
+		if err != nil {
+			return ProcessResourcesMap{}, fmt.Errorf("Error parsing cpu limit: %w", err)
+		}
+		if quantity.MilliValue() != 0 {
+			processResources.Limits.CPU = quantity.String()
+		} else {
+			processResources.Limits.CPU = ""
+		}
+	}
+	response, err := common.CallPlugnTrigger(common.PlugnTriggerInput{
+		Trigger: "resource-get-property",
+		Args:    []string{appName, processType, "limit", "nvidia-gpu"},
+	})
+	nvidiaGpuLimit := response.StdoutContents()
+	if err == nil && nvidiaGpuLimit != "" && nvidiaGpuLimit != "0" {
+		_, err := resource.ParseQuantity(nvidiaGpuLimit)
+		if err != nil {
+			return ProcessResourcesMap{}, fmt.Errorf("Error parsing nvidia-gpu limit: %w", err)
+		}
+		processResources.Limits.NvidiaGPU = nvidiaGpuLimit
+	}
+	result, err = common.CallPlugnTrigger(common.PlugnTriggerInput{
+		Trigger: "resource-get-property",
+		Args:    []string{appName, processType, "limit", "memory"},
+	})
+	if err == nil && !emptyValues[result.StdoutContents()] {
+		quantity, err := parseMemoryQuantity(result.StdoutContents())
+		if err != nil {
+			return ProcessResourcesMap{}, fmt.Errorf("Error parsing memory limit: %w", err)
+		}
+		if quantity != "0" {
+			processResources.Limits.Memory = quantity
+		} else {
+			processResources.Limits.Memory = ""
+		}
+	}
+
+	result, err = common.CallPlugnTrigger(common.PlugnTriggerInput{
+		Trigger: "resource-get-property",
+		Args:    []string{appName, processType, "reserve", "cpu"},
+	})
+	if err == nil && !emptyValues[result.StdoutContents()] {
+		quantity, err := resource.ParseQuantity(result.StdoutContents())
+		if err != nil {
+			return ProcessResourcesMap{}, fmt.Errorf("Error parsing cpu request: %w", err)
+		}
+		if quantity.MilliValue() != 0 {
+			processResources.Requests.CPU = quantity.String()
+		} else {
+			processResources.Requests.CPU = ""
+		}
+	}
+	result, err = common.CallPlugnTrigger(common.PlugnTriggerInput{
+		Trigger: "resource-get-property",
+		Args:    []string{appName, processType, "reserve", "memory"},
+	})
+	if err == nil && !emptyValues[result.StdoutContents()] {
+		quantity, err := parseMemoryQuantity(result.StdoutContents())
+		if err != nil {
+			return ProcessResourcesMap{}, fmt.Errorf("Error parsing memory request: %w", err)
+		}
+		if quantity != "0" {
+			processResources.Requests.Memory = quantity
+		} else {
+			processResources.Requests.Memory = ""
+		}
+	}
+
+	return processResources, nil
+}
+
+func getServerIP() (string, error) {
+	serverIP := ""
+	networkInterface := getComputedNetworkInterface()
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return "", fmt.Errorf("Unable to get network interfaces: %w", err)
+	}
+
+	for _, iface := range ifaces {
+		if iface.Name == networkInterface {
+			addr, err := iface.Addrs()
+			if err != nil {
+				return "", fmt.Errorf("Unable to get network addresses for interface %s: %w", networkInterface, err)
+			}
+			for _, a := range addr {
+				if ipnet, ok := a.(*net.IPNet); ok {
+					if ipnet.IP.To4() != nil {
+						serverIP = ipnet.IP.String()
+					}
+				}
+			}
+		}
+	}
+
+	if len(serverIP) == 0 {
+		return "", fmt.Errorf("Unable to determine server ip address from network-interface %s", networkInterface)
+	}
+	return serverIP, nil
+}
+
+func getStartCommand(input StartCommandInput) (StartCommandOutput, error) {
+	command := extractStartCommand(input)
+	fields, err := shell.Fields(command, func(name string) string {
+		if name == "PORT" {
+			return fmt.Sprint(input.Port)
+		}
+
+		return input.Env[name]
+	})
+	if err != nil {
+		return StartCommandOutput{}, err
+	}
+
+	return StartCommandOutput{
+		Command: fields,
+	}, nil
+}
+
+// namespacedSysctlPrefixes are the sysctl prefixes the kernel maintains per-namespace
+var namespacedSysctlPrefixes = []string{
+	"net.",
+	"kernel.shm",
+	"kernel.msg",
+	"fs.mqueue.",
+}
+
+// isNamespacedSysctl reports whether a sysctl is maintained per-namespace by the
+// kernel and can therefore be set on a pod spec. Sysctls outside these subtrees
+// hold a single value shared by the entire machine, and kubelet rejects them.
+func isNamespacedSysctl(name string) bool {
+	if name == "kernel.sem" {
+		return true
+	}
+
+	for _, prefix := range namespacedSysctlPrefixes {
+		if strings.HasPrefix(name, prefix) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// parseSysctls converts docker-option key=value pairs into sysctls sorted by name,
+// rejecting any sysctl that cannot take effect within a pod's namespaces.
+func parseSysctls(values []string) ([]Sysctl, error) {
+	sysctls := []Sysctl{}
+	for _, value := range values {
+		name, sysctlValue, found := strings.Cut(value, "=")
+		if !found || name == "" {
+			return nil, fmt.Errorf("Invalid --sysctl value, expected name=value: %s", value)
+		}
+
+		if !isNamespacedSysctl(name) {
+			return nil, fmt.Errorf("Sysctl %s is not namespaced and cannot be set on a pod, apply it to the nodes with 'dokku scheduler-k3s:node-sysctls:set %s <value>' instead", name, name)
+		}
+
+		sysctls = append(sysctls, Sysctl{Name: name, Value: sysctlValue})
+	}
+
+	sort.Slice(sysctls, func(i int, j int) bool {
+		return sysctls[i].Name < sysctls[j].Name
+	})
+
+	return sysctls, nil
+}
+
+func getSecurityContext(appName string, phase string) (SecurityContext, error) {
+	securityContext := SecurityContext{}
+	deployOptions, err := dockeroptions.GetSpecifiedDockerOptionsForPhase(appName, phase, []string{
+		"--cap-add",
+		"--cap-drop",
+		"--privileged",
+		"--sysctl",
+	})
+	if err != nil {
+		return SecurityContext{}, fmt.Errorf("Error getting deploy options: %w", err)
+	}
+
+	if _, ok := deployOptions["--privileged"]; ok {
+		securityContext.Privileged = true
+	}
+	if capAdd, ok := deployOptions["--cap-add"]; ok {
+		capabilities := []string{}
+		for _, cap := range capAdd {
+			capabilities = append(capabilities, strings.ToUpper(cap))
+		}
+		securityContext.Capabilities.Add = capabilities
+	}
+	if capDrop, ok := deployOptions["--cap-drop"]; ok {
+		capabilities := []string{}
+		for _, cap := range capDrop {
+			capabilities = append(capabilities, strings.ToUpper(cap))
+		}
+		securityContext.Capabilities.Drop = capabilities
+	}
+	if sysctlOptions, ok := deployOptions["--sysctl"]; ok {
+		sysctls, err := parseSysctls(sysctlOptions)
+		if err != nil {
+			return SecurityContext{}, err
+		}
+		securityContext.Sysctls = sysctls
+	}
+	return securityContext, nil
+}
+
+func getProcessSpecificKustomizeRootPath(appName string) string {
+	if !hasKustomizeDirectory(appName) {
+		return ""
+	}
+
+	directory := getKustomizeDirectory(appName)
+	processSpecificDirectory := fmt.Sprintf("%s.%s", directory, os.Getenv("DOKKU_PID"))
+	if common.DirectoryExists(processSpecificDirectory) {
+		return processSpecificDirectory
+	}
+
+	return directory
+}
+
+func hasKustomizeDirectory(appName string) bool {
+	directory := getKustomizeDirectory(appName)
+
+	if common.FileExists(fmt.Sprintf("%s.%s.missing", directory, os.Getenv("DOKKU_PID"))) {
+		return false
+	}
+
+	if common.DirectoryExists(fmt.Sprintf("%s.%s", directory, os.Getenv("DOKKU_PID"))) {
+		return true
+	}
+
+	return common.DirectoryExists(directory)
+}
+
+// ChartInstallDecisionInput is the input for the chartInstallDecision function
+type ChartInstallDecisionInput struct {
+	// Chart is the chart being evaluated
+	Chart HelmChart
+
+	// ForceChartNames is the list of release names to install regardless of state
+	ForceChartNames []string
+
+	// ForceInstall is whether every chart should be installed regardless of state
+	ForceInstall bool
+
+	// IngressClass is the ingress class configured for the cluster
+	IngressClass string
+
+	// InstalledRevision is the helm release currently installed for the chart
+	InstalledRevision Release
+}
+
+// ChartInstallDecision reports whether a chart should be installed and why
+type ChartInstallDecision struct {
+	// Install is whether the chart should be installed
+	Install bool
+
+	// Reason describes why the chart is being installed or skipped
+	Reason string
+}
+
+// chartInstallDecision reports whether a chart should be installed, and why. A
+// chart whose installed release has drifted from the pinned version is
+// reinstalled so that the pinned version is what ends up on the cluster.
+func chartInstallDecision(input ChartInstallDecisionInput) ChartInstallDecision {
+	if input.Chart.ChartPath == "traefik" && input.IngressClass == "nginx" {
+		return ChartInstallDecision{Install: false, Reason: "Skipping chart due to ingress-class mismatch"}
+	}
+
+	if input.Chart.ChartPath == "ingress-nginx" && input.IngressClass == "traefik" {
+		return ChartInstallDecision{Install: false, Reason: "Skipping chart due to ingress-class mismatch"}
+	}
+
+	if input.ForceInstall {
+		return ChartInstallDecision{Install: true, Reason: "Force installing chart"}
+	}
+
+	if slices.Contains(input.ForceChartNames, input.Chart.ReleaseName) {
+		return ChartInstallDecision{Install: true, Reason: "Force installing chart due to flag"}
+	}
+
+	if input.InstalledRevision.Name == "" {
+		return ChartInstallDecision{Install: true, Reason: "Installing missing chart"}
+	}
+
+	if input.InstalledRevision.Version != input.Chart.Version {
+		return ChartInstallDecision{
+			Install: true,
+			Reason:  fmt.Sprintf("Installing chart due to version mismatch: %s != %s", input.InstalledRevision.Version, input.Chart.Version),
+		}
+	}
+
+	return ChartInstallDecision{Install: false, Reason: "Skipping chart: already installed"}
+}
+
+func installHelmCharts(ctx context.Context, clientset KubernetesClient, shouldInstall func(HelmChart) bool) error {
+	for _, chart := range HelmCharts {
+		if !shouldInstall(chart) {
+			continue
+		}
+
+		if chart.CreateNamespace {
+			namespace := corev1.Namespace{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: chart.Namespace,
+					Annotations: map[string]string{
+						"dokku.com/managed": "true",
+					},
+					Labels: map[string]string{
+						"dokku.com/managed": "true",
+					},
+				},
+			}
+			_, err := clientset.CreateNamespace(ctx, CreateNamespaceInput{
+				Name: namespace,
+			})
+			if err != nil {
+				return fmt.Errorf("Error creating namespace %s: %w", chart.Namespace, err)
+			}
+		}
+
+		contents, err := templates.ReadFile(fmt.Sprintf("templates/helm-config/%s.yaml", chart.ReleaseName))
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("Error reading values file %s: %w", chart.ReleaseName, err)
+		}
+
+		values := map[string]interface{}{}
+		if len(contents) > 0 {
+			err = yaml.Unmarshal(contents, &values)
+			if err != nil {
+				return fmt.Errorf("Error unmarshalling values file: %w", err)
+			}
+		}
+
+		if chart.ReleaseName == "vector" && chart.Namespace == "vector" {
+			values, err = updateVectorValues(values)
+			if err != nil {
+				return fmt.Errorf("Error updating vector values: %w", err)
+			}
+		}
+
+		chartProperties, err := common.PropertyMapGet("scheduler-k3s", "--global", "chart-overrides."+chart.ReleaseName)
+		if err != nil {
+			return fmt.Errorf("Error getting chart properties: %w", err)
+		}
+		for key, value := range chartProperties {
+			strval := fmt.Sprintf("%s=%s", key, value)
+			if err := strvals.ParseInto(strval, values); err != nil {
+				return fmt.Errorf("Error parsing chart property %s: %w", strval, err)
+			}
+		}
+
+		helmAgent, err := NewHelmAgent(chart.Namespace, DeployLogPrinter)
+		if err != nil {
+			return fmt.Errorf("Error creating helm agent: %w", err)
+		}
+
+		timeoutDuration, err := time.ParseDuration("300s")
+		if err != nil {
+			return fmt.Errorf("Error parsing deploy timeout duration: %w", err)
+		}
+
+		installedRevision, err := helmAgent.InstalledRevision(chart.ReleaseName)
+		if err != nil {
+			return fmt.Errorf("Error getting installed revision for %s: %w", chart.ReleaseName, err)
+		}
+
+		hooks, err := selectChartHooks(chart.ReleaseName, installedRevision.Version, chart.Version)
+		if err != nil {
+			return fmt.Errorf("Error selecting upgrade hooks for chart %s: %w", chart.ReleaseName, err)
+		}
+
+		buildChartInput := func(version string) ChartInput {
+			return ChartInput{
+				ChartPath:   chart.ChartPath,
+				Namespace:   chart.Namespace,
+				ReleaseName: chart.ReleaseName,
+				RepoURL:     chart.RepoURL,
+				Values:      values,
+				Version:     version,
+				Timeout:     timeoutDuration,
+				Wait:        true,
+			}
+		}
+
+		lastUpgradedVersion := ""
+		for _, hook := range hooks {
+			if hook.PreUpgrade != nil {
+				common.LogVerbose(fmt.Sprintf("Running pre-upgrade hook %s@%s", chart.ReleaseName, hook.TargetVersion))
+				if err := hook.PreUpgrade(ctx, clientset, chart, installedRevision); err != nil {
+					return fmt.Errorf("Error running pre-upgrade hook for %s@%s: %w", chart.ReleaseName, hook.TargetVersion, err)
+				}
+			}
+
+			common.LogVerbose(fmt.Sprintf("Upgrading %s to intermediate version %s", chart.ReleaseName, hook.TargetVersion))
+			if err := helmAgent.InstallOrUpgradeChart(ctx, buildChartInput(hook.TargetVersion)); err != nil {
+				return fmt.Errorf("Error installing chart %s at version %s: %w", chart.ChartPath, hook.TargetVersion, err)
+			}
+			lastUpgradedVersion = hook.TargetVersion
+
+			if hook.PostUpgrade != nil {
+				common.LogVerbose(fmt.Sprintf("Running post-upgrade hook %s@%s", chart.ReleaseName, hook.TargetVersion))
+				if err := hook.PostUpgrade(ctx, clientset, chart, installedRevision); err != nil {
+					return fmt.Errorf("Error running post-upgrade hook for %s@%s: %w", chart.ReleaseName, hook.TargetVersion, err)
+				}
+			}
+		}
+
+		if lastUpgradedVersion == chart.Version {
+			continue
+		}
+
+		if err := helmAgent.InstallOrUpgradeChart(ctx, buildChartInput(chart.Version)); err != nil {
+			return fmt.Errorf("Error installing chart %s: %w", chart.ChartPath, err)
+		}
+	}
+	return nil
+}
+
+const (
+	// kubernetesLogsTransform is the base transform enriching every container log event
+	kubernetesLogsTransform = "kubernetes_container_logs"
+
+	// kubernetesRouterTransform splits container logs into cron and non-cron branches
+	kubernetesRouterTransform = "kubernetes_router"
+
+	// kubernetesCronRemapTransform flattens cron metadata onto the event
+	kubernetesCronRemapTransform = "kubernetes_cron_remap"
+
+	// kubernetesDefaultSink is the console sink shipped in the base values file
+	kubernetesDefaultSink = "default_global_sink"
+
+	// kubernetesGlobalSink receives non-cron logs when a vector-sink is configured
+	kubernetesGlobalSink = "kubernetes_global_sink"
+
+	// kubernetesCronSink receives cron task logs when a vector-cron-sink is configured
+	kubernetesCronSink = "kubernetes_cron_sink"
+)
+
+// kubernetesCronRouteTransforms returns the route and remap pair that splits
+// container logs into cron and non-cron branches.
+//
+// Cron pods are labelled app.kubernetes.io/name=cron. The raw cron id exceeds
+// the Kubernetes label length cap, so it lives in an annotation and is
+// flattened onto the event here - vector drops any event whose sink template
+// references a missing field.
+func kubernetesCronRouteTransforms() map[string]interface{} {
+	return map[string]interface{}{
+		kubernetesRouterTransform: map[string]interface{}{
+			"type":              "route",
+			"inputs":            []string{kubernetesLogsTransform},
+			"reroute_unmatched": true,
+			"route": map[string]interface{}{
+				logs.CronRouteName: map[string]interface{}{
+					"type":   "vrl",
+					"source": `.kubernetes.pod_labels."app.kubernetes.io/name" == "cron"`,
+				},
+			},
+		},
+		kubernetesCronRemapTransform: map[string]interface{}{
+			"type":   "remap",
+			"inputs": []string{kubernetesRouterTransform + "." + logs.CronRouteName},
+			"source": ".dokku_app = to_string(.kubernetes.pod_labels.\"app.kubernetes.io/part-of\") ?? \"\"\n" +
+				".dokku_cron_id = to_string(.kubernetes.pod_annotations.\"dokku.com/cron-id\") ?? \"\"",
+		},
+	}
+}
+
+// updateVectorValues layers the configured log sinks onto the vector chart
+// values. Sinks and transforms from the base values file are preserved unless
+// they are explicitly superseded, so unrelated components such as the
+// prometheus exporter keep working.
+func updateVectorValues(values map[string]interface{}) (map[string]interface{}, error) {
+	sinkValue := common.PropertyGet("logs", "--global", "vector-sink")
+	cronSinkValue := common.PropertyGet("logs", "--global", "vector-cron-sink")
+	if sinkValue == "" && cronSinkValue == "" {
+		return values, nil
+	}
+
+	customConfig, ok := values["customConfig"].(map[string]interface{})
+	if !ok {
+		return values, errors.New("Missing or invalid customConfig in vector chart values")
+	}
+
+	sinks, ok := customConfig["sinks"].(map[string]interface{})
+	if !ok {
+		sinks = map[string]interface{}{}
+	}
+
+	// a configured sink supersedes the console sink from the base values;
+	// without one, the console sink remains the destination for non-cron logs
+	nonCronSinkID := kubernetesDefaultSink
+	if sinkValue != "" {
+		nonCronSinkID = kubernetesGlobalSink
+		delete(sinks, kubernetesDefaultSink)
+
+		sink, err := logs.SinkValueToConfig(logs.SinkValueToConfigInput{
+			SinkValue: sinkValue,
+			Inputs:    []string{kubernetesLogsTransform},
+		})
+		if err != nil {
+			return values, fmt.Errorf("Error parsing vector-sink: %w", err)
+		}
+
+		// stored as a plain map so that later lookups, and the yaml encoder,
+		// see the same shape as the sinks parsed from the base values file
+		sinks[kubernetesGlobalSink] = map[string]interface{}(sink)
+	}
+
+	if cronSinkValue != "" {
+		transforms, ok := customConfig["transforms"].(map[string]interface{})
+		if !ok {
+			transforms = map[string]interface{}{}
+		}
+		for id, transform := range kubernetesCronRouteTransforms() {
+			transforms[id] = transform
+		}
+		customConfig["transforms"] = transforms
+
+		cronSink, err := logs.SinkValueToConfig(logs.SinkValueToConfigInput{
+			SinkValue: cronSinkValue,
+			Inputs:    []string{kubernetesCronRemapTransform},
+		})
+		if err != nil {
+			return values, fmt.Errorf("Error parsing vector-cron-sink: %w", err)
+		}
+		sinks[kubernetesCronSink] = map[string]interface{}(cronSink)
+
+		// cron logs are routed away from the non-cron sink so that each event
+		// lands in exactly one destination
+		nonCronSink, ok := sinks[nonCronSinkID].(map[string]interface{})
+		if !ok {
+			return values, fmt.Errorf("Missing or invalid %s sink in vector chart values", nonCronSinkID)
+		}
+		nonCronSink["inputs"] = []string{kubernetesRouterTransform + "._unmatched"}
+		sinks[nonCronSinkID] = nonCronSink
+	}
+
+	customConfig["sinks"] = sinks
+	values["customConfig"] = customConfig
+
+	return values, nil
+}
+
+func installHelperCommands(ctx context.Context) error {
+	urls := map[string]string{
+		"kubectx": "https://github.com/ahmetb/kubectx/releases/latest/download/kubectx",
+		"kubens":  "https://github.com/ahmetb/kubectx/releases/latest/download/kubens",
+	}
+
+	client := resty.New()
+	for binaryName, url := range urls {
+		resp, err := client.R().
+			SetContext(ctx).
+			Get(url)
+		if err != nil {
+			return fmt.Errorf("Unable to download %s: %w", binaryName, err)
+		}
+		if resp == nil {
+			return fmt.Errorf("Missing response from %s download: %w", binaryName, err)
+		}
+
+		if resp.StatusCode() != 200 {
+			return fmt.Errorf("Invalid status code for %s: %d", binaryName, resp.StatusCode())
+		}
+
+		f, err := os.Create(filepath.Join("/usr/local/bin", binaryName))
+		if err != nil {
+			return fmt.Errorf("Unable to create %s: %w", binaryName, err)
+		}
+
+		if err := f.Close(); err != nil {
+			return fmt.Errorf("Unable to close %s file: %w", binaryName, err)
+		}
+
+		err = common.WriteStringToFile(common.WriteStringToFileInput{
+			Content:   resp.String(),
+			Filename:  f.Name(),
+			GroupName: "root",
+			Mode:      os.FileMode(0755),
+			Username:  "root",
+		})
+		if err != nil {
+			return fmt.Errorf("Unable to write %s to file: %w", binaryName, err)
+		}
+
+		fi, err := os.Stat(f.Name())
+		if err != nil {
+			return fmt.Errorf("Unable to get %s file size: %w", binaryName, err)
+		}
+
+		if fi.Size() == 0 {
+			return fmt.Errorf("Invalid %s filesize", binaryName)
+		}
+	}
+
+	return installHelm(ctx)
+}
+
+func installHelm(ctx context.Context) error {
+	client := resty.New()
+	resp, err := client.R().
+		SetContext(ctx).
+		Get("https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3")
+	if err != nil {
+		return fmt.Errorf("Unable to download helm installer: %w", err)
+	}
+	if resp == nil {
+		return fmt.Errorf("Missing response from helm installer download: %w", err)
+	}
+
+	if resp.StatusCode() != 200 {
+		return fmt.Errorf("Invalid status code for helm installer script: %d", resp.StatusCode())
+	}
+
+	f, err := os.CreateTemp("", "sample")
+	if err != nil {
+		return fmt.Errorf("Unable to create temporary file for helm installer: %w", err)
+	}
+	defer os.Remove(f.Name())
+
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("Unable to close helm installer file: %w", err)
+	}
+
+	err = common.WriteStringToFile(common.WriteStringToFileInput{
+		Content:  resp.String(),
+		Filename: f.Name(),
+		Mode:     os.FileMode(0755),
+	})
+	if err != nil {
+		return fmt.Errorf("Unable to write helm installer to file: %w", err)
+	}
+
+	fi, err := os.Stat(f.Name())
+	if err != nil {
+		return fmt.Errorf("Unable to get helm installer file size: %w", err)
+	}
+
+	if fi.Size() == 0 {
+		return fmt.Errorf("Invalid helm installer filesize")
+	}
+
+	common.LogInfo2Quiet("Running helm installer")
+	installerCmd, err := common.CallExecCommand(common.ExecCommandInput{
+		Command:     f.Name(),
+		StreamStdio: true,
+	})
+	if err != nil {
+		return fmt.Errorf("Unable to call helm installer command: %w", err)
+	}
+	if installerCmd.ExitCode != 0 {
+		return fmt.Errorf("Invalid exit code from helm installer command: %d", installerCmd.ExitCode)
+	}
+
+	return nil
+}
+
+// isKubernetesAvailable returns an error if kubernetes api is not available
+func isKubernetesAvailable() error {
+	client, err := NewKubernetesClient()
+	if err != nil {
+		return fmt.Errorf("Error creating kubernetes client: %w", err)
+	}
+
+	if err := client.Ping(); err != nil {
+		return fmt.Errorf("Error pinging kubernetes: %w", err)
+	}
+
+	return nil
+}
+
+// isK3sInstalled returns an error if k3s is not installed
+func isK3sInstalled() error {
+	if !common.FileExists("/usr/local/bin/k3s") {
+		return fmt.Errorf("k3s binary is not available")
+	}
+
+	if !common.FileExists(getComputedKubeconfigPath()) {
+		return fmt.Errorf("k3s kubeconfig is not available")
+	}
+
+	return nil
+}
+
+// isK3sKubernetes returns true if the current kubernetes cluster is configured to be k3s
+func isK3sKubernetes() bool {
+	return getComputedKubeconfigPath() == KubeConfigPath
+}
+
+func isPodReady(ctx context.Context, clientset KubernetesClient, podName, namespace string) wait.ConditionWithContextFunc {
+	return func(ctx context.Context) (bool, error) {
+		pod, err := clientset.GetPod(ctx, GetPodInput{
+			Name:      podName,
+			Namespace: namespace,
+		})
+		if err != nil {
+			return false, err
+		}
+
+		switch pod.Status.Phase {
+		case v1.PodRunning:
+			return true, nil
+		case v1.PodFailed, v1.PodSucceeded:
+			return false, conditions.ErrPodCompleted
+		}
+		return false, nil
+	}
+}
+
+// waitForPodBySelectorCompleted polls the first pod matching the input
+// selector until it reaches a terminal phase (PodSucceeded / PodFailed) or
+// the timeout elapses. Used after a Follow=true StreamLogs returns, to
+// handle the kubelet -> apiserver phase propagation delay for short-lived
+// run pods.
+func waitForPodBySelectorCompleted(ctx context.Context, input WaitForPodBySelectorCompletedInput) (v1.Pod, error) {
+	pods, err := waitForPodToExist(ctx, WaitForPodToExistInput{
+		Clientset:     input.Clientset,
+		LabelSelector: input.LabelSelector,
+		Namespace:     input.Namespace,
+		PodName:       input.PodName,
+		RetryCount:    3,
+	})
+	if err != nil {
+		return v1.Pod{}, fmt.Errorf("Error waiting for pod to exist: %w", err)
+	}
+
+	if len(pods) == 0 {
+		return v1.Pod{}, fmt.Errorf("no pods in %s with selector %s", input.Namespace, input.LabelSelector)
+	}
+
+	podName := pods[0].Name
+	if input.PodName != "" {
+		podName = input.PodName
+	}
+
+	timeout := time.Duration(input.Timeout * float64(time.Second))
+	var pod v1.Pod
+	err = wait.PollUntilContextTimeout(ctx, time.Second, timeout, true, func(ctx context.Context) (bool, error) {
+		p, err := input.Clientset.GetPod(ctx, GetPodInput{
+			Name:      podName,
+			Namespace: input.Namespace,
+		})
+		if err != nil {
+			return false, err
+		}
+		pod = p
+		switch p.Status.Phase {
+		case v1.PodSucceeded, v1.PodFailed:
+			return true, nil
+		}
+		return false, nil
+	})
+	return pod, err
+}
+
+// kubernetesNodeToNode converts a kubernetes node to a Node
+func kubernetesNodeToNode(node v1.Node) Node {
+	roles := []string{}
+	if len(node.Labels["kubernetes.io/role"]) > 0 {
+		roles = append(roles, node.Labels["kubernetes.io/role"])
+	} else {
+		for k, v := range node.Labels {
+			if strings.HasPrefix(k, "node-role.kubernetes.io/") && v == "true" {
+				roles = append(roles, strings.TrimPrefix(k, "node-role.kubernetes.io/"))
+			}
+		}
+	}
+
+	sort.Strings(roles)
+
+	ready := false
+	for _, condition := range node.Status.Conditions {
+		if condition.Type == "Ready" {
+			ready = condition.Status == "True"
+			break
+		}
+	}
+
+	remoteHost := ""
+	if val, ok := node.Annotations["dokku.com/remote-host"]; ok {
+		remoteHost = val
+	}
+
+	return Node{
+		Name:       node.Name,
+		Roles:      roles,
+		Ready:      ready,
+		RemoteHost: remoteHost,
+		Version:    node.Status.NodeInfo.KubeletVersion,
+	}
+}
+
+// cronIDLabelValue returns the sha1 hex digest of the supplied cron ID,
+// used as the dokku.com/cron-hash label/annotation value on cron resources.
+// The raw cron ID exceeds Kubernetes' 63-byte label cap for non-trivial
+// commands, so we hash it to a fixed 40-character string and keep the
+// original in the dokku.com/cron-id annotation for display.
+func cronIDLabelValue(cronID string) string {
+	sum := sha1.Sum([]byte(cronID))
+	return hex.EncodeToString(sum[:])
+}
+
+// parseMemoryQuantity parses a docker-compatible memory value into a binary memory quantity
+func parseMemoryQuantity(input string) (string, error) {
+	bytes, err := common.ParseMemoryBytes(input)
+	if err != nil {
+		return "", err
+	}
+
+	return resource.NewQuantity(bytes, resource.BinarySI).String(), nil
+}
+
+func uninstallHelperCommands(ctx context.Context) error {
+	errs, _ := errgroup.WithContext(ctx)
+	errs.Go(func() error {
+		return os.RemoveAll("/usr/local/bin/kubectx")
+	})
+	errs.Go(func() error {
+		return os.RemoveAll("/usr/local/bin/kubens")
+	})
+	return errs.Wait()
+}
+
+func waitForPodBySelectorRunning(ctx context.Context, input WaitForPodBySelectorRunningInput) error {
+	pods, err := waitForPodToExist(ctx, WaitForPodToExistInput{
+		Clientset:     input.Clientset,
+		LabelSelector: input.LabelSelector,
+		Namespace:     input.Namespace,
+		PodName:       input.PodName,
+		RetryCount:    3,
+	})
+	if err != nil {
+		return fmt.Errorf("Error waiting for pod to exist: %w", err)
+	}
+
+	if len(pods) == 0 {
+		return fmt.Errorf("no pods in %s with selector %s", input.Namespace, input.LabelSelector)
+	}
+
+	timeout := time.Duration(input.Timeout * float64(time.Second))
+	for _, pod := range pods {
+		if input.PodName != "" && pod.Name != input.PodName {
+			break
+		}
+
+		if err := wait.PollUntilContextTimeout(ctx, time.Second, timeout, false, input.Waiter(ctx, input.Clientset, pod.Name, pod.Namespace)); err != nil {
+			print("\n")
+			if input.AllowCompletion && errors.Is(err, conditions.ErrPodCompleted) {
+				return nil
+			}
+			return fmt.Errorf("Error waiting for pod %s to be running: %w", pod.Name, err)
+		}
+		fmt.Printf(".")
+	}
+	print("\n")
+	return nil
+}
+
+func waitForNodeToExist(ctx context.Context, input WaitForNodeToExistInput) ([]v1.Node, error) {
+	var matchingNodes []v1.Node
+	var err error
+	for i := 0; i < input.RetryCount; i++ {
+		nodes, err := input.Clientset.ListNodes(ctx, ListNodesInput{})
+		if err != nil {
+			time.Sleep(1 * time.Second)
+		}
+
+		if input.NodeName == "" {
+			matchingNodes = nodes
+			break
+		}
+
+		for _, node := range nodes {
+			if node.Name == input.NodeName {
+				matchingNodes = append(matchingNodes, node)
+				break
+			}
+		}
+		if len(matchingNodes) > 0 {
+			break
+		}
+		time.Sleep(1 * time.Second)
+	}
+	if err != nil {
+		return matchingNodes, fmt.Errorf("Error listing nodes: %w", err)
+	}
+	return matchingNodes, nil
+}
+
+func waitForPodToExist(ctx context.Context, input WaitForPodToExistInput) ([]v1.Pod, error) {
+	var pods []v1.Pod
+	var err error
+	for i := 0; i < input.RetryCount; i++ {
+		pods, err = input.Clientset.ListPods(ctx, ListPodsInput{
+			Namespace:     input.Namespace,
+			LabelSelector: input.LabelSelector,
+		})
+		if err != nil {
+			time.Sleep(1 * time.Second)
+		}
+
+		if len(pods) == 0 {
+			time.Sleep(1 * time.Second)
+			continue
+		}
+
+		if input.PodName == "" {
+			break
+		}
+
+		for _, pod := range pods {
+			if pod.Name == input.PodName {
+				break
+			}
+		}
+		time.Sleep(1 * time.Second)
+	}
+	if err != nil {
+		return pods, fmt.Errorf("Error listing pods: %w", err)
+	}
+	return pods, nil
+}

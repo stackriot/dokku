@@ -8,12 +8,16 @@ setup() {
 }
 
 teardown() {
+  docker container rm -f "$TEST_APP.run.9999" >/dev/null 2>&1 || true
   destroy_app
   global_teardown
 }
 
-@test "(core) run" {
-  deploy_app
+@test "(run) run" {
+  run deploy_app
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
 
   run /bin/bash -c "dokku run $TEST_APP echo $TEST_APP"
   echo "output: $output"
@@ -26,9 +30,35 @@ teardown() {
   assert_failure
 }
 
-@test "(core) run:detached" {
-  deploy_app
+@test "(run) run over ssh preserves echo-like arguments" {
+  run deploy_app
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
 
+  run /bin/bash -c "ssh dokku@$DOKKU_DOMAIN run $TEST_APP /bin/echo --version --help 2>/dev/null"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "--version --help"
+
+  # bats strips trailing newlines from $output, so count bytes to verify -n was honored
+  run /bin/bash -c "ssh dokku@$DOKKU_DOMAIN run $TEST_APP /bin/echo -n hello 2>/dev/null | wc -c"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "5"
+}
+
+@test "(run) run:detached" {
+  run deploy_app
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  # the leading --label is replayed out of DOKKU_GLOBAL_FLAGS by
+  # plugins/scheduler-docker-local/scheduler-run, so this also covers that variable
+  # surviving the re-exec as the dokku user
   RANDOM_RUN_CID="$(dokku --label=com.dokku.test-label=value run:detached $TEST_APP sleep 300)"
   run /bin/bash -c "docker inspect -f '{{ .State.Status }}' $RANDOM_RUN_CID"
   echo "output: $output"
@@ -49,31 +79,213 @@ teardown() {
   echo "output: $output"
   echo "status: $status"
   assert_success
-  sleep 5  # wait for dokku cleanup to happen in the background
+  sleep 5 # wait for dokku cleanup to happen in the background
 }
 
-@test "(core) run (with tty)" {
-  deploy_app
+@test "(run) run (with tty)" {
+  run deploy_app
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
   run /bin/bash -c "dokku run $TEST_APP ls /app/null"
   echo "output: $output"
   echo "status: $status"
   assert_success
 }
 
-@test "(core) run (without tty)" {
-  deploy_app
+@test "(run) run (without tty)" {
+  run deploy_app
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
   run /bin/bash -c ": |dokku run $TEST_APP ls /app/null"
   echo "output: $output"
   echo "status: $status"
   assert_success
 }
 
-@test "(core) run command from Procfile" {
-  deploy_app
+@test "(run) run command from Procfile" {
+  run deploy_app
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
   run /bin/bash -c "dokku run $TEST_APP custom 'hi dokku' | tail -n 1"
   echo "output: $output"
   echo "status: $status"
 
   assert_success
   assert_output 'hi dokku'
+}
+
+@test "(run) list" {
+  run deploy_app
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku --quiet run:list $TEST_APP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku run:detached $TEST_APP sleep 300"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku --quiet run:list $TEST_APP | wc -l"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "1"
+
+  run /bin/bash -c "dokku run:list $TEST_APP --format json | jq '. | length'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "1"
+
+  run /bin/bash -c "dokku run:list --format json $TEST_APP | jq '. | length'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "1"
+
+  run /bin/bash -c "dokku run:detached $TEST_APP sleep 300"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku --quiet run:list $TEST_APP | wc -l"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "2"
+
+  run /bin/bash -c "dokku run:list $TEST_APP --format json | jq '. | length'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "2"
+
+  run /bin/bash -c "dokku run:list --format json $TEST_APP | jq '. | length'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "2"
+}
+
+@test "(run:stop) only stops run containers for the app" {
+  run deploy_app
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku run:detached $TEST_APP sleep 300"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku run:list $TEST_APP --format json | jq -r '.[0].name'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  local RUN_CONTAINER="$output"
+
+  run /bin/bash -c "docker container run -d --name $TEST_APP.run.9999 --entrypoint sleep dokku/$TEST_APP:latest 300"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku run:stop $TEST_APP --container other-app.run.1"
+  echo "output: $output"
+  echo "status: $status"
+  assert_failure
+  assert_output_contains "Specified app does not match app in container name"
+
+  run /bin/bash -c "dokku run:stop $TEST_APP --container $TEST_APP.run.9999"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output_contains "Specified container does not exist"
+
+  run /bin/bash -c "docker container inspect -f '{{.State.Running}}' $TEST_APP.run.9999"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "true"
+
+  run /bin/bash -c "dokku run:stop $TEST_APP --container $RUN_CONTAINER"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "docker container ls -q --filter name=^/$RUN_CONTAINER\$ | wc -l"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "0"
+}
+
+@test "(run) docker-options and -e flags are not eval-injected" {
+  run deploy_app
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku docker-options:add $TEST_APP run '--label=com.dokku.test=safe'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku run --ttl-seconds=60 -e FOO=bar $TEST_APP env | grep -E '^FOO=bar'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku run -e 'X=\$(id)' $TEST_APP env"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  [[ "$output" == *'X=$(id)'* ]] || flunk "expected literal X=\$(id) in container env"
+  [[ "$output" != *"uid="* ]] || flunk "id command output leaked - env value was expanded"
+}
+
+@test "(run) run propagates the command exit code" {
+  run deploy_app dockerfile
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku run $TEST_APP sh -c 'exit 3'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_exit_status 3
+
+  run /bin/bash -c "dokku run $TEST_APP sh -c 'exit 0'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+}
+
+@test "(run) --ttl-seconds rejects non-numeric input; docker-options stores it verbatim" {
+  run /bin/bash -c "dokku run --ttl-seconds '\$(id)' $TEST_APP echo hi"
+  echo "output: $output"
+  echo "status: $status"
+  assert_failure
+  [[ "$output" != *"uid="* ]] || flunk "id command output leaked - ttl value was expanded"
+
+  run /bin/bash -c "dokku docker-options:add $TEST_APP run '--label=x=\$(id)'"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku docker-options:report $TEST_APP --docker-options-run"
+  echo "output: $output"
+  echo "status: $status"
+  [[ "$output" == *'x=$(id)'* ]] || flunk "expected literal x=\$(id) stored in docker options"
+  [[ "$output" != *"uid="* ]] || flunk "id command output leaked - docker option was expanded"
 }

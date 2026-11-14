@@ -1,4 +1,4 @@
-FROM phusion/baseimage:bionic-1.0.0
+FROM phusion/baseimage:noble-1.0.3
 
 CMD ["/sbin/my_init"]
 
@@ -14,23 +14,47 @@ RUN addgroup --gid $DOKKU_GID dokku \
   && adduser --uid $DOKKU_UID --gid $DOKKU_GID --disabled-password --gecos "" "dokku"
 
 COPY ./tests/dhparam.pem /tmp/dhparam.pem
-COPY ./build/dokku.deb /tmp/dokku.deb
+COPY ./build/package/ /tmp
+COPY ./contrib/dependencies.json /tmp/dependencies.json
+
+ENV DOKKU_INIT_SYSTEM=sv
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 # hadolint ignore=DL3005,DL3008
-RUN echo "dokku dokku/hostname string $DOKKU_HOSTNAME" | debconf-set-selections \
+RUN mkdir -p /etc/apt/keyrings \
+  && mkdir -p /etc/apt/keyrings \
+  && apt-get remove -y systemd && apt-get autoremove -y && apt-get update && apt-get -y --no-install-recommends install gpg jq lsb-release openssl openssh-server rsync software-properties-common \
+  && curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg \
+  && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null \
+  && apt-get update \
+  && apt-get -y --no-install-recommends install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin \
+  && PACK_URL="$(jq -r --arg arch "$(dpkg --print-architecture)" '.dependencies[] | select(.name == "pack") | .urls[$arch]' /tmp/dependencies.json)" \
+  && curl -fsSL "$PACK_URL" | tar -C /usr/bin/ --no-same-owner -xzf - pack \
+  && chmod +x /usr/bin/pack \
+  && test -x /usr/bin/pack \
+  && curl -o /tmp/nixpacks.bash -sSL https://nixpacks.com/install.sh \
+  && chmod +x /tmp/nixpacks.bash \
+  && NIXPACKS_BIN_DIR=/usr/bin BIN_DIR=/usr/bin /tmp/nixpacks.bash \
+  && test -x /usr/bin/nixpacks \
+  && rm -rf /tmp/nixpacks.bash \
+  && curl -o /tmp/railpack.bash -sSL https://railpack.com/install.sh \
+  && chmod +x /tmp/railpack.bash \
+  && RAILPACK_BIN_DIR=/usr/bin BIN_DIR=/usr/bin /tmp/railpack.bash \
+  && test -x /usr/bin/railpack \
+  && rm -rf /tmp/railpack.bash \
+  && echo "dokku dokku/hostname string $DOKKU_HOSTNAME" | debconf-set-selections \
   && echo "dokku dokku/skip_key_file boolean $DOKKU_SKIP_KEY_FILE" | debconf-set-selections \
   && echo "dokku dokku/vhost_enable boolean $DOKKU_VHOST_ENABLE" | debconf-set-selections \
+  && echo "dokku dokku/install_default_site boolean true" | debconf-set-selections \
   && curl -sSL https://packagecloud.io/dokku/dokku/gpgkey | apt-key add - \
-  && echo "deb https://packagecloud.io/dokku/dokku/ubuntu/ bionic main" | tee /etc/apt/sources.list.d/dokku.list \
+  && echo "deb https://packagecloud.io/dokku/dokku/ubuntu/ noble main" | tee /etc/apt/sources.list.d/dokku.list \
   && mkdir -p /etc/nginx/ \
   && cp /tmp/dhparam.pem /etc/nginx/dhparam.pem \
-  && apt-get update -qq \
-  && apt-get upgrade -qq -y \
-  && apt-get -qq -y --no-install-recommends --only-upgrade install openssl openssh-server \
-  && apt-get -qq -y --no-install-recommends install rsync /tmp/dokku.deb \
-  && apt-get purge -qq -y syslog-ng-core \
-  && apt-get autoremove -qq -y \
+  && apt-get update \
+  && apt-get upgrade -y \
+  && apt-get -y --no-install-recommends install lambda-builder "/tmp/dokku-$(dpkg --print-architecture).deb" \
+  && apt-get purge -y syslog-ng-core \
+  && apt-get autoremove -y \
   && apt-get clean && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
 WORKDIR /tmp
@@ -39,6 +63,7 @@ COPY ./docker .
 
 RUN \
   rsync -a /tmp/ / \
+  && chmod +x /usr/local/bin/* \
   && rm -rf /tmp/* \
   && rm /etc/runit/runsvdir/default/sshd/down \
   && chown -R dokku:dokku /home/dokku/ \
@@ -51,8 +76,12 @@ RUN \
   && ln -sf /mnt/dokku/home/dokku /home/dokku \
   && ln -sf /mnt/dokku/var/lib/dokku/config /var/lib/dokku/config \
   && ln -sf /mnt/dokku/var/lib/dokku/data /var/lib/dokku/data \
+  && ln -sf /mnt/dokku/var/lib/dokku/services /var/lib/dokku/services \
   && mv /etc/my_init.d/00_regen_ssh_host_keys.sh /etc/my_init.d/15_regen_ssh_host_keys \
   && rm -f /etc/nginx/sites-enabled/default /usr/share/nginx/html/index.html /etc/my_init.d/10_syslog-ng.init \
   && rm -f /usr/local/openresty/nginx/conf/sites-enabled/default /usr/share/openresty/html/index.html \
   && sed -i '/imklog/d' /etc/rsyslog.conf \
   && rm -f /var/log/btmp /var/log/wtmp /var/log/*log /var/log/apt/* /var/log/dokku/*.log /var/log/nginx/* /var/log/openresty/*
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5m --retries=3 \
+  CMD curl -fsS http://127.0.0.1:18080/_dokku/health || exit 1

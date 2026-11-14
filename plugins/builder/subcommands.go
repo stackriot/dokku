@@ -1,6 +1,8 @@
 package builder
 
 import (
+	"errors"
+
 	"github.com/dokku/dokku/plugins/common"
 )
 
@@ -9,6 +11,10 @@ func CommandReport(appName string, format string, infoFlag string) error {
 	if len(appName) == 0 {
 		apps, err := common.DokkuApps()
 		if err != nil {
+			if errors.Is(err, common.NoAppsExist) {
+				common.LogWarn(err.Error())
+				return nil
+			}
 			return err
 		}
 		for _, appName := range apps {
@@ -24,6 +30,11 @@ func CommandReport(appName string, format string, infoFlag string) error {
 
 // CommandSet set or clear a builder property for an app
 func CommandSet(appName string, property string, value string) error {
+	if property == "detected" {
+		common.LogWarn("detected is a read-only property")
+		return nil
+	}
+
 	common.CommandPropertySet("builder", appName, property, value, DefaultProperties, GlobalProperties)
 	return nil
 }

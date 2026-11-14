@@ -10,9 +10,11 @@ BRANCH="${5:-master}"
 REMOTE="dokku@$TARGET"
 REPO="test-$(basename "$APP")-$RANDOM"
 
+ssh "$REMOTE" events:on
+
 destroy_app() {
-  # shellcheck disable=SC2029
-  echo "$REPO" | ssh "$REMOTE" apps:destroy "$REPO"
+  ssh "$REMOTE" apps:destroy "$REPO" --force
+  ssh "$REMOTE" events:off
 }
 
 failed() {
@@ -43,10 +45,11 @@ git add .
 
 [[ -x pre-commit ]] && ./pre-commit "$REMOTE" "$REPO"
 git commit -m 'initial commit'
+current_branch="$(git rev-parse --abbrev-ref HEAD)"
 if [[ "$SHOULD_FAIL" == true ]]; then
-  git push target "master:$BRANCH" && succeeded git-push
+  git push target "$current_branch:$BRANCH" && succeeded git-push
 else
-  git push target "master:$BRANCH" || failed git-push
+  git push target "$current_branch:$BRANCH" || failed git-push
 fi
 if [[ -x post-deploy ]]; then
   ./post-deploy "$REMOTE" "$REPO" || failed post-deploy
@@ -58,7 +61,9 @@ if [[ "$SHOULD_FAIL" == true ]]; then
   exit 0
 fi
 
-URL=$(dokku url "$REPO")$FORWARDED_PORT
+ssh "$REMOTE" events
+ssh "$REMOTE" apps:list
+URL=$(ssh "$REMOTE" url "$REPO")$FORWARDED_PORT
 sleep 2
 if (./check_deploy "$URL"); then
   echo "-----> Deploy success!"

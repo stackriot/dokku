@@ -20,23 +20,21 @@ func main() {
 	switch trigger {
 	case "docker-args-process-build":
 		appName := flag.Arg(0)
-		err = network.TriggerDockerArgsProcess(appName)
+		imageSourceType := flag.Arg(1)
+		err = network.TriggerDockerArgsProcess("build", appName, imageSourceType)
 	case "docker-args-process-deploy":
 		appName := flag.Arg(0)
-		err = network.TriggerDockerArgsProcess(appName)
+		imageSourceType := flag.Arg(1)
+		err = network.TriggerDockerArgsProcess("deploy", appName, imageSourceType)
 	case "docker-args-process-run":
 		appName := flag.Arg(0)
-		err = network.TriggerDockerArgsProcess(appName)
+		imageSourceType := flag.Arg(1)
+		err = network.TriggerDockerArgsProcess("run", appName, imageSourceType)
 	case "install":
 		err = network.TriggerInstall()
 	case "network-build-config":
 		appName := flag.Arg(0)
 		err = network.BuildConfig(appName)
-	case "network-compute-ports":
-		appName := flag.Arg(0)
-		processType := flag.Arg(1)
-		isHerokuishContainer := common.ToBool(flag.Arg(2))
-		err = network.TriggerNetworkComputePorts(appName, processType, isHerokuishContainer)
 	case "network-config-exists":
 		appName := flag.Arg(0)
 		err = network.TriggerNetworkConfigExists(appName)
@@ -49,12 +47,6 @@ func main() {
 		appName := flag.Arg(0)
 		processType := flag.Arg(1)
 		err = network.TriggerNetworkGetListeners(appName, processType)
-	case "network-get-port":
-		appName := flag.Arg(0)
-		processType := flag.Arg(1)
-		containerID := flag.Arg(2)
-		isHerokuishContainer := common.ToBool(flag.Arg(3))
-		err = network.TriggerNetworkGetPort(appName, processType, containerID, isHerokuishContainer)
 	case "network-get-property":
 		appName := flag.Arg(0)
 		property := flag.Arg(1)
@@ -90,9 +82,6 @@ func main() {
 		phase := flag.Arg(3)
 		processType := flag.Arg(4)
 		err = network.TriggerPostContainerCreate(containerType, containerID, appName, phase, processType)
-	case "post-create":
-		appName := flag.Arg(0)
-		err = network.TriggerPostCreate(appName)
 	case "post-delete":
 		appName := flag.Arg(0)
 		err = network.TriggerPostDelete(appName)

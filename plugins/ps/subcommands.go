@@ -3,10 +3,9 @@ package ps
 import (
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
-
-	dockeroptions "github.com/dokku/dokku/plugins/docker-options"
 
 	"github.com/dokku/dokku/plugins/common"
 	"github.com/gofrs/flock"
@@ -19,11 +18,20 @@ func CommandInspect(appName string) error {
 	}
 
 	scheduler := common.GetAppScheduler(appName)
-	return common.PlugnTrigger("scheduler-inspect", []string{scheduler, appName}...)
+	_, err := common.CallPlugnTrigger(common.PlugnTriggerInput{
+		Trigger:     "scheduler-inspect",
+		Args:        []string{scheduler, appName},
+		StreamStdio: true,
+	})
+	return err
 }
 
 // CommandRebuild rebuilds an app from source
-func CommandRebuild(appName string, allApps bool, parallelCount int) error {
+func CommandRebuild(appName string, allApps bool, parallelCount int, noCache bool) error {
+	if noCache {
+		os.Setenv("DOKKU_BUILD_NO_CACHE", "true")
+	}
+
 	if allApps {
 		return common.RunCommandAgainstAllApps(Rebuild, "rebuild", parallelCount)
 	}
@@ -40,6 +48,10 @@ func CommandReport(appName string, format string, infoFlag string) error {
 	if len(appName) == 0 {
 		apps, err := common.DokkuApps()
 		if err != nil {
+			if errors.Is(err, common.NoAppsExist) {
+				common.LogWarn(err.Error())
+				return nil
+			}
 			return err
 		}
 		for _, appName := range apps {
@@ -75,6 +87,14 @@ func CommandRestart(appName string, processName string, allApps bool, parallelCo
 
 // CommandRestore starts previously running apps e.g. after reboot
 func CommandRestore(appName string, allApps bool, parallelCount int) error {
+	_, err := common.CallPlugnTrigger(common.PlugnTriggerInput{
+		Trigger:     "pre-restore",
+		StreamStdio: true,
+	})
+	if err != nil {
+		return fmt.Errorf("Error running pre-restore: %s", err)
+	}
+
 	if allApps {
 		if err := restorePrep(); err != nil {
 			return err
@@ -101,56 +121,123 @@ func CommandRestore(appName string, allApps bool, parallelCount int) error {
 
 // CommandRetire ensures old containers are retired
 func CommandRetire(appName string) error {
-	lockFile := filepath.Join(common.MustGetEnv("DOKKU_LIB_ROOT"), "data", "ps", "retire")
+	lockFile := filepath.Join(common.GetDataDirectory("ps"), "retire")
 	scheduler := ""
 	if appName == "" {
 		scheduler = common.GetGlobalScheduler()
 	} else {
+		if err := common.VerifyAppName(appName); err != nil {
+			return err
+		}
 		scheduler = common.GetAppScheduler(appName)
 	}
 
 	fileLock := flock.New(lockFile)
 	locked, err := fileLock.TryLock()
 	if err != nil {
-		return fmt.Errorf("Failed to acquire ps:retire lock: %s", err)
+		return &RetireLockFailed{&err}
 	}
 	defer fileLock.Unlock()
 
 	if !locked {
-		return fmt.Errorf("Failed to acquire ps:retire lock")
+		return &RetireLockFailed{}
 	}
 
 	common.LogInfo1("Retiring old containers and images")
-	return common.PlugnTrigger("scheduler-retire", []string{scheduler, appName}...)
+	_, err = common.CallPlugnTrigger(common.PlugnTriggerInput{
+		Trigger:     "scheduler-retire",
+		Args:        []string{scheduler, appName},
+		StreamStdio: true,
+	})
+	if err != nil {
+		return fmt.Errorf("Error retiring containers: %w", err)
+	}
+
+	common.LogInfo1("Retiring expired run and cron containers")
+	_, err = common.CallPlugnTrigger(common.PlugnTriggerInput{
+		Trigger:     "scheduler-run-retire",
+		StreamStdio: true,
+	})
+	if err != nil {
+		return fmt.Errorf("Error retiring expired run containers: %w", err)
+	}
+
+	return err
+}
+
+// CommandScaleInput is the input for the CommandScale function
+type CommandScaleInput struct {
+	// AppName is the name of the app to scale
+	AppName string
+
+	// Clear is a flag to reset the formation to the default scale
+	Clear bool
+
+	// Format is the format to display the formation in
+	Format string
+
+	// ProcessTuples is a list of process tuples to scale
+	ProcessTuples []string
+
+	// Replace is a flag to replace the formation with the specified process tuples
+	Replace bool
+
+	// SkipDeploy is a flag to skip the deploy phase
+	SkipDeploy bool
 }
 
 // CommandScale gets or sets how many instances of a given process to run
-func CommandScale(appName string, skipDeploy bool, processTuples []string) error {
-	if err := common.VerifyAppName(appName); err != nil {
+func CommandScale(input CommandScaleInput) error {
+	if err := common.VerifyAppName(input.AppName); err != nil {
 		return err
 	}
 
-	if len(processTuples) == 0 {
-		return scaleReport(appName)
+	if input.Clear && input.Replace {
+		return errors.New("The --clear and --replace flags cannot be specified together")
 	}
 
-	if !canScaleApp(appName) {
-		return fmt.Errorf("App %s contains an app.json file with a formations key and cannot be manually scaled", appName)
+	if input.Clear && len(input.ProcessTuples) > 0 {
+		return errors.New("Process types cannot be specified when using the --clear flag, use --replace to set the entire formation")
 	}
 
-	common.LogInfo1(fmt.Sprintf("Scaling %s processes: %s", appName, strings.Join(processTuples, " ")))
-	return scaleSet(appName, skipDeploy, false, processTuples)
+	if input.Replace && len(input.ProcessTuples) == 0 {
+		return errors.New("Must specify at least one process type when using the --replace flag, use --clear to reset the formation")
+	}
+
+	if !input.Clear && len(input.ProcessTuples) == 0 {
+		return scaleReport(input.AppName, input.Format)
+	}
+
+	if !canScaleApp(input.AppName) {
+		return fmt.Errorf("App %s contains an app.json file with a formations key and cannot be manually scaled", input.AppName)
+	}
+
+	processTuples := input.ProcessTuples
+	if input.Clear {
+		var err error
+		processTuples, err = defaultProcessTuples(input.AppName)
+		if err != nil {
+			return err
+		}
+
+		common.LogInfo1(fmt.Sprintf("Resetting %s processes to the default scale", input.AppName))
+	} else {
+		common.LogInfo1(fmt.Sprintf("Scaling %s processes: %s", input.AppName, strings.Join(processTuples, " ")))
+	}
+
+	return scaleSet(scaleSetInput{
+		appName:           input.AppName,
+		skipDeploy:        input.SkipDeploy,
+		clearExisting:     input.Clear || input.Replace,
+		processTuples:     processTuples,
+		deployOnlyChanged: true,
+	})
 }
 
 // CommandSet sets or clears a ps property for an app
 func CommandSet(appName string, property string, value string) error {
-	if property == "restart-policy" {
-		if !isValidRestartPolicy(value) {
-			return errors.New("Invalid restart-policy specified")
-		}
-
-		common.LogInfo2Quiet(fmt.Sprintf("Setting %s to %s", property, value))
-		return dockeroptions.SetDockerOptionForPhases(appName, []string{"deploy"}, "restart", value)
+	if property == "restart-policy" && value != "" && !isValidRestartPolicy(value) {
+		return errors.New("Invalid restart-policy specified")
 	}
 
 	common.CommandPropertySet("ps", appName, property, value, DefaultProperties, GlobalProperties)

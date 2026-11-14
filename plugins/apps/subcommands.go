@@ -1,6 +1,7 @@
 package apps
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -26,7 +27,7 @@ func CommandClone(oldAppName string, newAppName string, skipDeploy bool, ignoreE
 		return err
 	}
 
-	if err := appExists(newAppName); err == nil {
+	if appNameTaken(newAppName) {
 		if ignoreExisting {
 			common.LogWarn("Name is already taken")
 			return nil
@@ -40,7 +41,12 @@ func CommandClone(oldAppName string, newAppName string, skipDeploy bool, ignoreE
 		return err
 	}
 
-	if err := common.PlugnTrigger("post-app-clone-setup", []string{oldAppName, newAppName}...); err != nil {
+	_, err := common.CallPlugnTrigger(common.PlugnTriggerInput{
+		Trigger:     "post-app-clone-setup",
+		Args:        []string{oldAppName, newAppName},
+		StreamStdio: true,
+	})
+	if err != nil {
 		return err
 	}
 
@@ -48,11 +54,21 @@ func CommandClone(oldAppName string, newAppName string, skipDeploy bool, ignoreE
 		os.Setenv("SKIP_REBUILD", "true")
 	}
 
-	if err := common.PlugnTrigger("post-app-clone", []string{oldAppName, newAppName}...); err != nil {
-		return err
+	_, err = common.CallPlugnTrigger(common.PlugnTriggerInput{
+		Trigger:     "git-has-code",
+		Args:        []string{newAppName},
+		StreamStdio: true,
+	})
+	if err != nil {
+		os.Setenv("SKIP_REBUILD", "true")
 	}
 
-	return nil
+	_, err = common.CallPlugnTrigger(common.PlugnTriggerInput{
+		Trigger:     "post-app-clone",
+		Args:        []string{oldAppName, newAppName},
+		StreamStdio: true,
+	})
+	return err
 }
 
 // CommandCreate creates app via command line
@@ -83,9 +99,26 @@ func CommandExists(appName string) error {
 }
 
 // CommandList lists all apps
-func CommandList() error {
-	common.LogInfo2Quiet("My Apps")
+func CommandList(format string) error {
 	apps, err := common.DokkuApps()
+
+	if format == "json" {
+		if err != nil && !errors.Is(err, common.NoAppsExist) {
+			return err
+		}
+
+		appList := []string{}
+		appList = append(appList, apps...)
+		out, err := json.Marshal(appList)
+		if err != nil {
+			return err
+		}
+
+		common.Log(string(out))
+		return nil
+	}
+
+	common.LogInfo2Quiet("My Apps")
 	if err != nil {
 		common.LogWarn(err.Error())
 		return nil
@@ -104,8 +137,11 @@ func CommandLock(appName string) error {
 		return err
 	}
 
-	lockfilePath := fmt.Sprintf("%v/.deploy.lock", common.AppRoot(appName))
-	if _, err := os.Create(lockfilePath); err != nil {
+	lockFile, err := os.OpenFile(getManualLockPath(appName), os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return errors.New("Unable to create deploy lock")
+	}
+	if err := lockFile.Close(); err != nil {
 		return errors.New("Unable to create deploy lock")
 	}
 
@@ -145,8 +181,12 @@ func CommandRename(oldAppName string, newAppName string, skipDeploy bool) error 
 		return err
 	}
 
-	if err := appExists(newAppName); err == nil {
+	if appNameTaken(newAppName) {
 		return errors.New("Name is already taken")
+	}
+
+	if appIsManuallyLocked(oldAppName) {
+		return errors.New("Unable to rename a locked app, run apps:unlock first")
 	}
 
 	common.LogInfo1Quiet(fmt.Sprintf("Renaming %s to %s", oldAppName, newAppName))
@@ -154,7 +194,12 @@ func CommandRename(oldAppName string, newAppName string, skipDeploy bool) error 
 		return err
 	}
 
-	if err := common.PlugnTrigger("post-app-rename-setup", []string{oldAppName, newAppName}...); err != nil {
+	_, err := common.CallPlugnTrigger(common.PlugnTriggerInput{
+		Trigger:     "post-app-rename-setup",
+		Args:        []string{oldAppName, newAppName},
+		StreamStdio: true,
+	})
+	if err != nil {
 		return err
 	}
 
@@ -167,11 +212,21 @@ func CommandRename(oldAppName string, newAppName string, skipDeploy bool) error 
 		os.Setenv("SKIP_REBUILD", "true")
 	}
 
-	if err := common.PlugnTrigger("post-app-rename", []string{oldAppName, newAppName}...); err != nil {
-		return err
+	_, err = common.CallPlugnTrigger(common.PlugnTriggerInput{
+		Trigger:     "git-has-code",
+		Args:        []string{newAppName},
+		StreamStdio: true,
+	})
+	if err != nil {
+		os.Setenv("SKIP_REBUILD", "true")
 	}
 
-	return nil
+	_, err = common.CallPlugnTrigger(common.PlugnTriggerInput{
+		Trigger:     "post-app-rename",
+		Args:        []string{oldAppName, newAppName},
+		StreamStdio: true,
+	})
+	return err
 }
 
 // CommandReport displays an app report for one or more apps
@@ -179,6 +234,10 @@ func CommandReport(appName string, format string, infoFlag string) error {
 	if len(appName) == 0 {
 		apps, err := common.DokkuApps()
 		if err != nil {
+			if errors.Is(err, common.NoAppsExist) {
+				common.LogWarn(err.Error())
+				return nil
+			}
 			return err
 		}
 		for _, appName := range apps {
@@ -192,19 +251,27 @@ func CommandReport(appName string, format string, infoFlag string) error {
 	return ReportSingleApp(appName, format, infoFlag)
 }
 
+// CommandSet set or clear an apps property for an app
+func CommandSet(appName string, property string, value string) error {
+	if appName != "--global" && property == "disable-autocreation" {
+		common.LogFail("Property can only be specified globally")
+	}
+	common.CommandPropertySet("apps", appName, property, value, DefaultProperties, GlobalProperties)
+	return nil
+}
+
 // CommandUnlock unlocks an app for deployment
 func CommandUnlock(appName string) error {
 	if err := common.VerifyAppName(appName); err != nil {
 		return err
 	}
 
-	lockfilePath := fmt.Sprintf("%v/.deploy.lock", common.AppRoot(appName))
-	if _, err := os.Stat(lockfilePath); !os.IsNotExist(err) {
+	if deployLockHeld(appName) {
 		common.LogWarn("A deploy may be in progress.")
 		common.LogWarn("Removing the app lock will not stop in progress deploys.")
 	}
 
-	if err := os.Remove(lockfilePath); err != nil {
+	if err := removeLockFiles(getManualLockPath(appName), getLockPath(appName)); err != nil {
 		return errors.New("Unable to remove deploy lock")
 	}
 

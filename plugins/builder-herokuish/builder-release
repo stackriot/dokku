@@ -13,24 +13,43 @@ trigger-builder-herokuish-builder-release() {
     return
   fi
 
-  local CID
   local IMAGE=$(get_app_image_name "$APP" "$IMAGE_TAG")
-  local DOCKER_BUILD_LABEL_ARGS="--label=org.label-schema.schema-version=1.0 --label=org.label-schema.vendor=dokku --label=com.dokku.app-name=$APP  --label=com.dokku.image-stage=release --label=dokku"
-
-  plugn trigger pre-release-buildpack "$APP" "$IMAGE_TAG"
-
   TMP_WORK_DIR="$(mktemp -d "/tmp/dokku-${DOKKU_PID}-${FUNCNAME[0]}.XXXXXX")"
   trap "rm -rf '$TMP_WORK_DIR' >/dev/null" RETURN INT TERM EXIT
 
   config_export global >"$TMP_WORK_DIR/00-global-env.sh"
   config_export app "$APP" >"$TMP_WORK_DIR/01-app-env.sh"
 
-  if ! suppress_output "$DOCKER_BIN" image build $DOCKER_BUILD_LABEL_ARGS $DOKKU_GLOBAL_BUILD_ARGS -f "$PLUGIN_AVAILABLE_PATH/builder-herokuish/dockerfiles/builder-release.Dockerfile" --build-arg APP_IMAGE="$IMAGE" -t $IMAGE "$TMP_WORK_DIR"; then
+  local DOCKER_BUILD_ARGS=("--label=org.label-schema.schema-version=1.0" "--label=org.label-schema.vendor=dokku" "--label=com.dokku.app-name=$APP" "--label=com.dokku.image-stage=release" "--label=dokku")
+
+  if fn-force-arm64-image "$IMAGE"; then
+    dokku_log_warn "Detected linux/amd64 image, forcing --platform=linux/amd64"
+    DOCKER_BUILD_ARGS+=("--platform=linux/amd64")
+  fi
+
+  DOKKU_APP_USER=$(config_get "$APP" DOKKU_APP_USER || true)
+  DOKKU_APP_USER=${DOKKU_APP_USER:="herokuishuser"}
+
+  local DOCKER_CONFIG
+  DOCKER_CONFIG="$(fn-registry-docker-config-dir "$APP")"
+  [[ -n "$DOCKER_CONFIG" ]] && export DOCKER_CONFIG
+
+  if ! suppress_output "$DOCKER_BIN" image build "${DOCKER_BUILD_ARGS[@]}" $DOKKU_GLOBAL_BUILD_ARGS -f "$PLUGIN_AVAILABLE_PATH/builder-herokuish/dockerfiles/builder-pre-release.Dockerfile" --build-arg APP_IMAGE="$IMAGE" --build-arg "DOKKU_APP_USER=$DOKKU_APP_USER" -t "$IMAGE" "$TMP_WORK_DIR"; then
     dokku_log_warn "Failure injecting environment variables"
     return 1
   fi
 
-  plugn trigger post-release-buildpack "$APP" "$IMAGE_TAG"
+  if fn-plugn-trigger-exists "pre-release-buildpack"; then
+    dokku_log_warn "Deprecated: please upgrade plugin to use 'pre-release-builder' plugin trigger instead of pre-release-buildpack"
+    plugn trigger pre-release-buildpack "$APP" "$IMAGE_TAG"
+  fi
+  plugn trigger pre-release-builder "$BUILDER_TYPE" "$APP" "$IMAGE"
+
+  if ! suppress_output "$DOCKER_BIN" image build "${DOCKER_BUILD_ARGS[@]}" $DOKKU_GLOBAL_BUILD_ARGS -f "$PLUGIN_AVAILABLE_PATH/builder-herokuish/dockerfiles/builder-release.Dockerfile" --build-arg APP_IMAGE="$IMAGE" --build-arg "DOKKU_APP_USER=$DOKKU_APP_USER" -t "$IMAGE" "$TMP_WORK_DIR"; then
+    dokku_log_warn "Failure injecting environment variables"
+    return 1
+  fi
+
   plugn trigger post-release-builder "$BUILDER_TYPE" "$APP" "$IMAGE"
 }
 

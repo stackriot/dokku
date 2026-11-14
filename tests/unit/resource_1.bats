@@ -32,20 +32,60 @@ teardown() {
   echo "status: $status"
   assert_output_contains "resource limits $TEST_APP information"
 
-  deploy_app
+  run deploy_app
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
   run /bin/bash -c "dokku resource:limit --memory 512MB $TEST_APP"
   echo "output: $output"
   echo "status: $status"
   assert_success
 
-  CID=$(< $DOKKU_ROOT/$TEST_APP/CONTAINER.web.1)
+  CID=$(<$DOKKU_ROOT/$TEST_APP/CONTAINER.web.1)
   run /bin/bash -c "docker inspect --format '{{.HostConfig.Memory}}' $CID"
   echo "output: $output"
   echo "status: $status"
   assert_output "0"
 
-  dokku ps:rebuild "$TEST_APP"
-  CID=$(< $DOKKU_ROOT/$TEST_APP/CONTAINER.web.1)
+  run /bin/bash -c "dokku ps:rebuild $TEST_APP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  CID=$(<$DOKKU_ROOT/$TEST_APP/CONTAINER.web.1)
+  run /bin/bash -c "docker inspect --format '{{.HostConfig.Memory}}' $CID"
+  echo "output: $output"
+  echo "status: $status"
+  assert_output "536870912"
+
+  run /bin/bash -c "dokku resource:limit --memory 1G $TEST_APP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku ps:rebuild $TEST_APP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  CID=$(<$DOKKU_ROOT/$TEST_APP/CONTAINER.web.1)
+  run /bin/bash -c "docker inspect --format '{{.HostConfig.Memory}}' $CID"
+  echo "output: $output"
+  echo "status: $status"
+  assert_output "1073741824"
+
+  run /bin/bash -c "dokku resource:limit --memory 512 $TEST_APP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku ps:rebuild $TEST_APP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  CID=$(<$DOKKU_ROOT/$TEST_APP/CONTAINER.web.1)
   run /bin/bash -c "docker inspect --format '{{.HostConfig.Memory}}' $CID"
   echo "output: $output"
   echo "status: $status"
@@ -56,8 +96,12 @@ teardown() {
   echo "status: $status"
   assert_success
 
-  dokku ps:rebuild "$TEST_APP"
-  CID=$(< $DOKKU_ROOT/$TEST_APP/CONTAINER.web.1)
+  run /bin/bash -c "dokku ps:rebuild $TEST_APP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  CID=$(<$DOKKU_ROOT/$TEST_APP/CONTAINER.web.1)
   run /bin/bash -c "docker inspect --format '{{.HostConfig.Memory}}' $CID"
   echo "output: $output"
   echo "status: $status"
@@ -68,8 +112,12 @@ teardown() {
   echo "status: $status"
   assert_success
 
-  dokku ps:rebuild "$TEST_APP"
-  CID=$(< $DOKKU_ROOT/$TEST_APP/CONTAINER.web.1)
+  run /bin/bash -c "dokku ps:rebuild $TEST_APP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  CID=$(<$DOKKU_ROOT/$TEST_APP/CONTAINER.web.1)
   run /bin/bash -c "docker inspect --format '{{.HostConfig.Memory}}' $CID"
   echo "output: $output"
   echo "status: $status"
@@ -80,8 +128,12 @@ teardown() {
   echo "status: $status"
   assert_success
 
-  dokku ps:rebuild "$TEST_APP"
-  CID=$(< $DOKKU_ROOT/$TEST_APP/CONTAINER.web.1)
+  run /bin/bash -c "dokku ps:rebuild $TEST_APP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  CID=$(<$DOKKU_ROOT/$TEST_APP/CONTAINER.web.1)
   run /bin/bash -c "docker inspect --format '{{.HostConfig.Memory}}' $CID"
   echo "output: $output"
   echo "status: $status"
@@ -92,8 +144,12 @@ teardown() {
   echo "status: $status"
   assert_success
 
-  dokku ps:rebuild "$TEST_APP"
-  CID=$(< $DOKKU_ROOT/$TEST_APP/CONTAINER.web.1)
+  run /bin/bash -c "dokku ps:rebuild $TEST_APP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  CID=$(<$DOKKU_ROOT/$TEST_APP/CONTAINER.web.1)
   run /bin/bash -c "docker inspect --format '{{.HostConfig.Memory}}' $CID"
   echo "output: $output"
   echo "status: $status"
@@ -133,4 +189,53 @@ teardown() {
   echo "output: $output"
   echo "status: $status"
   assert_failure
+}
+
+@test "(resource) resource:limit-clear preserves reservations" {
+  run /bin/bash -c "dokku resource:limit --memory 512m $TEST_APP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku resource:limit --memory 384m --process-type web $TEST_APP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku resource:reserve --memory 256m $TEST_APP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku resource:reserve --memory 128m --process-type web $TEST_APP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku resource:limit-clear $TEST_APP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+
+  run /bin/bash -c "dokku resource:report --resource-_default_.limit.memory $TEST_APP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_failure
+
+  run /bin/bash -c "dokku resource:report --resource-web.limit.memory $TEST_APP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_failure
+
+  run /bin/bash -c "dokku resource:report --resource-_default_.reserve.memory $TEST_APP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "256m"
+
+  run /bin/bash -c "dokku resource:report --resource-web.reserve.memory $TEST_APP"
+  echo "output: $output"
+  echo "status: $status"
+  assert_success
+  assert_output "128m"
 }

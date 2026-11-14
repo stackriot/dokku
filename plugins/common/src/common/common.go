@@ -5,6 +5,7 @@ import (
 	"os"
 
 	"github.com/dokku/dokku/plugins/common"
+	"github.com/dokku/dokku/plugins/common/shellwords"
 	flag "github.com/spf13/pflag"
 )
 
@@ -20,6 +21,32 @@ func main() {
 
 	var err error
 	switch cmd {
+	case "compose-up":
+		projectName := flag.Arg(1)
+		composeFile := flag.Arg(2)
+		err = common.ComposeUp(common.ComposeUpInput{
+			ProjectName: projectName,
+			ComposeFile: composeFile,
+		})
+	case "compose-down":
+		projectName := flag.Arg(1)
+		composeFile := flag.Arg(2)
+		err = common.ComposeDown(common.ComposeDownInput{
+			ProjectName: projectName,
+			ComposeFile: composeFile,
+		})
+	case "copy-dir-from-image":
+		appName := flag.Arg(1)
+		image := flag.Arg(2)
+		source := flag.Arg(3)
+		destination := flag.Arg(4)
+		err = common.CopyDirFromImage(appName, image, source, destination)
+	case "copy-from-image":
+		appName := flag.Arg(1)
+		image := flag.Arg(2)
+		source := flag.Arg(3)
+		destination := flag.Arg(4)
+		err = common.CopyFromImage(appName, image, source, destination)
 	case "docker-cleanup":
 		appName := flag.Arg(1)
 		force := common.ToBool(flag.Arg(2))
@@ -32,17 +59,58 @@ func main() {
 		if !common.IsDeployed(appName) {
 			err = fmt.Errorf("App %v not deployed", appName)
 		}
+	case "image-is-cnb-based":
+		image := flag.Arg(1)
+		if common.IsImageCnbBased(image) {
+			fmt.Print("true")
+		} else {
+			fmt.Print("false")
+		}
+	case "image-is-herokuish-based":
+		image := flag.Arg(1)
+		appName := flag.Arg(2)
+		if common.IsImageHerokuishBased(image, appName) {
+			fmt.Print("true")
+		} else {
+			fmt.Print("false")
+		}
 	case "scheduler-detect":
 		appName := flag.Arg(1)
 		if *global {
 			appName = "--global"
 		}
 		fmt.Print(common.GetAppScheduler(appName))
+	case "plugn-trigger-exists":
+		triggerName := flag.Arg(1)
+		if common.PlugnTriggerExists(triggerName) {
+			fmt.Print("true")
+		} else {
+			fmt.Print("false")
+		}
+	case "is-valid-app-name":
+		appName := flag.Arg(1)
+		err = common.IsValidAppName(appName)
+	case "is-valid-app-name-old":
+		appName := flag.Arg(1)
+		err = common.IsValidAppNameOld(appName)
+	case "split-command":
+		var fields []string
+		fields, err = shellwords.Split(flag.Arg(1))
+		if err != nil {
+			err = fmt.Errorf("Unable to parse command %q: %w", flag.Arg(1), err)
+			break
+		}
+		for _, field := range fields {
+			fmt.Printf("%s\x00", field)
+		}
+	case "verify-app-name":
+		appName := flag.Arg(1)
+		err = common.VerifyAppName(appName)
 	default:
 		err = fmt.Errorf("Invalid common command call: %v", cmd)
 	}
 
 	if err != nil {
-		common.LogFailQuiet(err.Error())
+		common.LogFailWithErrorQuiet(err)
 	}
 }

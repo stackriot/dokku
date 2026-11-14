@@ -19,8 +19,7 @@ Additional commands:`
 
 	helpContent = `
     builder:report [<app>] [<flag>], Displays a builder report for one or more apps
-    builder:set <app> <property> (<value>), Set or clear a builder property for an app
-`
+    builder:set <app> <property> (<value>), Set or clear a builder property for an app`
 )
 
 func main() {
@@ -32,11 +31,11 @@ func main() {
 	case "builder", "builder:help":
 		usage()
 	case "help":
-		command := common.NewShellCmd(fmt.Sprintf("ps -o command= %d", os.Getppid()))
-		command.ShowOutput = false
-		output, err := command.Output()
-
-		if err == nil && strings.Contains(string(output), "--all") {
+		result, err := common.CallExecCommand(common.ExecCommandInput{
+			Command: "ps",
+			Args:    []string{"-o", "command=", strconv.Itoa(os.Getppid())},
+		})
+		if err == nil && strings.Contains(result.StdoutContents(), "--all") {
 			fmt.Println(helpContent)
 		} else {
 			fmt.Print("\n    builder, Manage builder settings for an app\n")

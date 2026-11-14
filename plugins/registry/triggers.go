@@ -1,8 +1,8 @@
 package registry
 
 import (
-	"errors"
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/dokku/dokku/plugins/common"
@@ -10,7 +10,15 @@ import (
 
 // TriggerDeployedAppImageRepo outputs the associated image repo to stdout
 func TriggerDeployedAppImageRepo(appName string) error {
-	imageRepo := common.PropertyGet("registry", appName, "image-repo")
+	imageRepo := strings.TrimSpace(reportImageRepo(appName))
+	if imageRepo == "" {
+		var err error
+		imageRepo, err = getImageRepoFromTemplate(appName)
+		if err != nil {
+			return fmt.Errorf("Unable to determine image repo from template: %w", err)
+		}
+	}
+
 	if imageRepo == "" {
 		imageRepo = common.GetAppImageRepo(appName)
 	}
@@ -26,6 +34,7 @@ func TriggerDeployedAppImageTag(appName string) error {
 	}
 
 	tagVersion := common.PropertyGet("registry", appName, "tag-version")
+	tagVersion = strings.TrimSpace(tagVersion)
 	if tagVersion == "" {
 		tagVersion = "1"
 	}
@@ -49,11 +58,28 @@ func TriggerInstall() error {
 	return nil
 }
 
+// TriggerPostCreate creates the registry config directory for a new app
+func TriggerPostCreate(appName string) error {
+	return common.PropertySetupApp("registry", appName)
+}
+
 // TriggerPostAppCloneSetup creates new registry files
 func TriggerPostAppCloneSetup(oldAppName string, newAppName string) error {
 	err := common.PropertyClone("registry", oldAppName, newAppName)
 	if err != nil {
 		return err
+	}
+
+	// Clone docker config.json if it exists
+	oldConfigPath := GetAppRegistryConfigPath(oldAppName)
+	if common.FileExists(oldConfigPath) {
+		newConfigDir := GetAppRegistryConfigDir(newAppName)
+		if err := os.MkdirAll(newConfigDir, 0700); err != nil {
+			return fmt.Errorf("Unable to create registry config directory: %w", err)
+		}
+		if err := common.Copy(oldConfigPath, GetAppRegistryConfigPath(newAppName)); err != nil {
+			return fmt.Errorf("Unable to clone registry config: %w", err)
+		}
 	}
 
 	return nil
@@ -63,6 +89,18 @@ func TriggerPostAppCloneSetup(oldAppName string, newAppName string) error {
 func TriggerPostAppRenameSetup(oldAppName string, newAppName string) error {
 	if err := common.PropertyClone("registry", oldAppName, newAppName); err != nil {
 		return err
+	}
+
+	// Move docker config.json if it exists
+	oldConfigPath := GetAppRegistryConfigPath(oldAppName)
+	if common.FileExists(oldConfigPath) {
+		newConfigDir := GetAppRegistryConfigDir(newAppName)
+		if err := os.MkdirAll(newConfigDir, 0700); err != nil {
+			return fmt.Errorf("Unable to create registry config directory: %w", err)
+		}
+		if err := os.Rename(oldConfigPath, GetAppRegistryConfigPath(newAppName)); err != nil {
+			return fmt.Errorf("Unable to rename registry config: %w", err)
+		}
 	}
 
 	if err := common.PropertyDestroy("registry", oldAppName); err != nil {
@@ -81,8 +119,16 @@ func TriggerPostDelete(appName string) error {
 func TriggerPostReleaseBuilder(appName string, image string) error {
 	parts := strings.Split(image, ":")
 	imageTag := parts[len(parts)-1]
-	if err := common.PlugnTrigger("pre-deploy", []string{appName, imageTag}...); err != nil {
-		return err
+	if common.PlugnTriggerExists("pre-deploy") {
+		common.LogWarn("Deprecated: please upgrade plugin to use 'pre-release-builder' plugin trigger instead of pre-deploy")
+		_, err := common.CallPlugnTrigger(common.PlugnTriggerInput{
+			Trigger:     "pre-deploy",
+			Args:        []string{appName, imageTag},
+			StreamStdio: true,
+		})
+		if err != nil {
+			return err
+		}
 	}
 
 	imageID, _ := common.DockerInspect(image, "{{ .Id }}")
@@ -91,9 +137,8 @@ func TriggerPostReleaseBuilder(appName string, image string) error {
 	newImage := strings.Replace(image, imageRepo+":", computedImageRepo+":", 1)
 
 	if computedImageRepo != imageRepo {
-		if !dockerTag(imageID, newImage) {
-			// TODO: better error
-			return errors.New("Unable to tag image")
+		if err := dockerTag(imageID, newImage); err != nil {
+			return fmt.Errorf("unable to tag image %s as %s: %w", imageID, newImage, err)
 		}
 	}
 

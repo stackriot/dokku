@@ -2,13 +2,16 @@ FROM dokku/dokku:latest
 
 RUN apt-get update
 RUN apt-get install --no-install-recommends -y build-essential file nano && \
-  apt-get install --no-install-recommends -y help2man shellcheck uuid-runtime wget xmlstarlet && \
+  apt-get install --no-install-recommends -y software-properties-common help2man shellcheck uuid-runtime wget xmlstarlet && \
   apt-get clean autoclean && \
   apt-get autoremove --yes && \
   rm -rf /var/lib/apt/lists/*
 
-RUN wget https://dl.google.com/go/go1.16.10.linux-amd64.tar.gz && \
-  tar -xvf go1.16.10.linux-amd64.tar.gz && \
+ARG TARGETARCH
+COPY common.mk common.mk
+RUN GOLANG_VERSION=$(grep BUILD_IMAGE common.mk | cut -d' ' -f3 | cut -d':' -f2) && \
+  wget https://dl.google.com/go/go${GOLANG_VERSION}.linux-${TARGETARCH}.tar.gz && \
+  tar -xvf go${GOLANG_VERSION}.linux-${TARGETARCH}.tar.gz && \
   mv go /usr/local
 
 RUN GOROOT=/usr/local/go /usr/local/go/bin/go install golang.org/x/tools/gopls@latest 2>&1

@@ -1,0 +1,358 @@
+package main
+
+import (
+	"fmt"
+	"os"
+	"strings"
+
+	"github.com/dokku/dokku/plugins/common"
+	scheduler_k3s "github.com/dokku/dokku/plugins/scheduler-k3s"
+
+	flag "github.com/spf13/pflag"
+)
+
+// main entrypoint to all subcommands
+func main() {
+	parts := strings.Split(os.Args[0], "/")
+	subcommand := parts[len(parts)-1]
+
+	var err error
+	switch subcommand {
+	case "annotations:clear":
+		args := flag.NewFlagSet("scheduler-k3s:annotations:clear", flag.ExitOnError)
+		global := args.Bool("global", false, "--global: clear global annotations")
+		processType := args.String("process-type", "", "--process-type: filter by process-type")
+		resourceType := args.String("resource-type", "", "--resource-type: filter by resource-type")
+		args.Parse(os.Args[2:])
+		appName := args.Arg(0)
+		if *global {
+			appName = "--global"
+		}
+
+		err = scheduler_k3s.CommandAnnotationsClear(scheduler_k3s.MetadataClearInput{
+			AppName:      appName,
+			ProcessType:  *processType,
+			ResourceType: *resourceType,
+		})
+	case "annotations:set":
+		args := flag.NewFlagSet("scheduler-k3s:annotations:set", flag.ExitOnError)
+		global := args.Bool("global", false, "--global: set a global property")
+		processType := args.String("process-type", "", "--process-type: scope to process-type")
+		resourceType := args.String("resource-type", "", "--resource-type: scope to resource-type")
+		replace := args.Bool("replace", false, "--replace: replace the entire annotation map for the scope")
+		args.Parse(os.Args[2:])
+		input := scheduler_k3s.MetadataSetInput{
+			AppName:      args.Arg(0),
+			ProcessType:  *processType,
+			ResourceType: *resourceType,
+			Replace:      *replace,
+		}
+
+		skip := 1
+		if *global {
+			input.AppName = "--global"
+			skip = 0
+		}
+
+		if *replace {
+			input.Pairs = common.VarArgs(args.Args(), skip)
+		} else {
+			input.Key = args.Arg(skip)
+			input.Value = args.Arg(skip + 1)
+		}
+
+		err = scheduler_k3s.CommandAnnotationsSet(input)
+	case "annotations:report":
+		args := flag.NewFlagSet("scheduler-k3s:annotations:report", flag.ExitOnError)
+		global := args.Bool("global", false, "--global: show the global report")
+		format := args.String("format", "stdout", "format: [ stdout | json ]")
+		processType := args.String("process-type", "", "--process-type: filter by process-type")
+		resourceType := args.String("resource-type", "", "--resource-type: filter by resource-type")
+		passthroughArgs, infoFlag, flagErr := scheduler_k3s.ExtractReportInfoFlag("--scheduler-k3s-annotations.", os.Args[2:])
+		if flagErr != nil {
+			err = flagErr
+			break
+		}
+		args.Parse(passthroughArgs)
+		appName := args.Arg(0)
+		if *global {
+			appName = "--global"
+		}
+		err = scheduler_k3s.CommandAnnotationsReport(appName, *format, *processType, *resourceType, infoFlag)
+	case "autoscaling-auth:set":
+		args := flag.NewFlagSet("scheduler-k3s:autoscaling-auth:set", flag.ExitOnError)
+		global := args.Bool("global", false, "--global: set a global property")
+		metadata := args.StringToString("metadata", map[string]string{}, "--metadata: a key=value map of parameter metadata")
+		replace := args.Bool("replace", false, "--replace: replace the entire metadata map for the trigger")
+		args.Parse(os.Args[2:])
+		appName := args.Arg(0)
+		trigger := args.Arg(1)
+		if *global {
+			appName = "--global"
+			trigger = args.Arg(0)
+		}
+		err = scheduler_k3s.CommandAutoscalingAuthSet(appName, trigger, *metadata, *global, *replace)
+	case "autoscaling-auth:report":
+		args := flag.NewFlagSet("scheduler-k3s:autoscaling-auth:report", flag.ExitOnError)
+		global := args.Bool("global", false, "--global: show the global report")
+		includeMetadata := args.Bool("include-metadata", false, "--include-metadata: include metadata keys and values in the report")
+		format := args.String("format", "stdout", "format: [ stdout | json ]")
+		passthroughArgs, infoFlag, flagErr := scheduler_k3s.ExtractReportInfoFlag("--scheduler-k3s-autoscaling-auth.", os.Args[2:])
+		if flagErr != nil {
+			err = flagErr
+			break
+		}
+		args.Parse(passthroughArgs)
+		appName := args.Arg(0)
+		if *global {
+			appName = "--global"
+		}
+		err = scheduler_k3s.CommandAutoscalingAuthReport(appName, *format, *includeMetadata, infoFlag)
+	case "charts:clear":
+		args := flag.NewFlagSet("scheduler-k3s:charts:clear", flag.ExitOnError)
+		args.Parse(os.Args[2:])
+		chartName := args.Arg(0)
+		err = scheduler_k3s.CommandChartsClear(chartName)
+	case "charts:set":
+		args := flag.NewFlagSet("scheduler-k3s:charts:set", flag.ExitOnError)
+		replace := args.Bool("replace", false, "--replace: replace the entire override map for the chart")
+		args.Parse(os.Args[2:])
+		input := scheduler_k3s.ChartsSetInput{
+			Replace: *replace,
+		}
+
+		if *replace {
+			input.ChartName = args.Arg(0)
+			input.Pairs = common.VarArgs(args.Args(), 1)
+		} else {
+			input.Property = args.Arg(0)
+			input.Value = args.Arg(1)
+		}
+
+		err = scheduler_k3s.CommandChartsSet(input)
+	case "charts:report":
+		args := flag.NewFlagSet("scheduler-k3s:charts:report", flag.ExitOnError)
+		format := args.String("format", "stdout", "format: [ stdout | json ]")
+		reportArgs, flagErr := common.ParseReportArgs("scheduler-k3s-charts", os.Args[2:])
+		if flagErr == nil {
+			args.Parse(reportArgs.OSArgs)
+			chartName := args.Arg(0)
+			err = scheduler_k3s.CommandChartsReport(chartName, *format, reportArgs.InfoFlag)
+		} else {
+			err = flagErr
+		}
+	case "cluster:add":
+		args := flag.NewFlagSet("scheduler-k3s:cluster:add", flag.ExitOnError)
+		allowUknownHosts := args.Bool("insecure-allow-unknown-hosts", false, "insecure-allow-unknown-hosts: allow unknown hosts")
+		taintScheduling := args.Bool("taint-scheduling", false, "taint-scheduling: add a taint against scheduling app workloads")
+		serverIP := args.String("server-ip", "", "server-ip: IP address of the dokku server node")
+		kubeletArgs := args.StringSlice("kubelet-args", []string{}, "kubelet-args: repeatable key=value kubelet arguments (e.g., --kubelet-args key=value)")
+		role := args.String("role", "worker", "role: [ server | worker ]")
+		profileName := args.String("profile", "", "profile: name of the node profile to use")
+		args.Parse(os.Args[2:])
+		remoteHost := args.Arg(0)
+		err = scheduler_k3s.CommandClusterAdd(*profileName, *role, remoteHost, *serverIP, *allowUknownHosts, *taintScheduling, *kubeletArgs)
+	case "cluster:list":
+		args := flag.NewFlagSet("scheduler-k3s:cluster:list", flag.ExitOnError)
+		format := args.String("format", "stdout", "format: [ stdout | json ]")
+		args.Parse(os.Args[2:])
+		err = scheduler_k3s.CommandClusterList(*format)
+	case "cluster:remove":
+		args := flag.NewFlagSet("scheduler-k3s:cluster:remove", flag.ExitOnError)
+		args.Parse(os.Args[2:])
+		nodeName := args.Arg(0)
+		err = scheduler_k3s.CommandClusterRemove(nodeName)
+	case "ensure-charts":
+		args := flag.NewFlagSet("scheduler-k3s:ensure-charts", flag.ExitOnError)
+		forceInstall := args.Bool("force", false, "--force: force install all charts")
+		chartNames := args.StringSlice("charts", []string{}, "--charts: comma separated list of chart names to force install")
+		args.Parse(os.Args[2:])
+		err = scheduler_k3s.CommandEnsureCharts(*forceInstall, *chartNames)
+	case "initialize":
+		args := flag.NewFlagSet("scheduler-k3s:initialize", flag.ExitOnError)
+		taintScheduling := args.Bool("taint-scheduling", false, "taint-scheduling: add a taint against scheduling app workloads")
+		serverIP := args.String("server-ip", "", "server-ip: IP address of the dokku server node")
+		ingressClass := args.String("ingress-class", "nginx", "ingress-class: ingress-class to use for all outbound traffic")
+		kubeletArgs := args.StringSlice("kubelet-args", []string{}, "kubelet-args: repeatable key=value kubelet arguments (e.g., --kubelet-args key=value)")
+		args.Parse(os.Args[2:])
+		err = scheduler_k3s.CommandInitialize(*ingressClass, *serverIP, *taintScheduling, *kubeletArgs)
+	case "labels:clear":
+		args := flag.NewFlagSet("scheduler-k3s:labels:clear", flag.ExitOnError)
+		global := args.Bool("global", false, "--global: clear global labels")
+		processType := args.String("process-type", "", "--process-type: filter by process-type")
+		resourceType := args.String("resource-type", "", "--resource-type: filter by resource-type")
+		args.Parse(os.Args[2:])
+		appName := args.Arg(0)
+		if *global {
+			appName = "--global"
+		}
+
+		err = scheduler_k3s.CommandLabelsClear(scheduler_k3s.MetadataClearInput{
+			AppName:      appName,
+			ProcessType:  *processType,
+			ResourceType: *resourceType,
+		})
+	case "labels:set":
+		args := flag.NewFlagSet("scheduler-k3s:labels:set", flag.ExitOnError)
+		global := args.Bool("global", false, "--global: set a global property")
+		processType := args.String("process-type", "", "--process-type: scope to process-type")
+		resourceType := args.String("resource-type", "", "--resource-type: scope to resource-type")
+		replace := args.Bool("replace", false, "--replace: replace the entire label map for the scope")
+		args.Parse(os.Args[2:])
+		input := scheduler_k3s.MetadataSetInput{
+			AppName:      args.Arg(0),
+			ProcessType:  *processType,
+			ResourceType: *resourceType,
+			Replace:      *replace,
+		}
+
+		skip := 1
+		if *global {
+			input.AppName = "--global"
+			skip = 0
+		}
+
+		if *replace {
+			input.Pairs = common.VarArgs(args.Args(), skip)
+		} else {
+			input.Key = args.Arg(skip)
+			input.Value = args.Arg(skip + 1)
+		}
+
+		err = scheduler_k3s.CommandLabelsSet(input)
+	case "labels:report":
+		args := flag.NewFlagSet("scheduler-k3s:labels:report", flag.ExitOnError)
+		global := args.Bool("global", false, "--global: show the global report")
+		format := args.String("format", "stdout", "format: [ stdout | json ]")
+		processType := args.String("process-type", "", "--process-type: filter by process-type")
+		resourceType := args.String("resource-type", "", "--resource-type: filter by resource-type")
+		passthroughArgs, infoFlag, flagErr := scheduler_k3s.ExtractReportInfoFlag("--scheduler-k3s-labels.", os.Args[2:])
+		if flagErr != nil {
+			err = flagErr
+			break
+		}
+		args.Parse(passthroughArgs)
+		appName := args.Arg(0)
+		if *global {
+			appName = "--global"
+		}
+		err = scheduler_k3s.CommandLabelsReport(appName, *format, *processType, *resourceType, infoFlag)
+	case "node-sysctls:clear":
+		args := flag.NewFlagSet("scheduler-k3s:node-sysctls:clear", flag.ExitOnError)
+		global := args.Bool("global", false, "--global: scope to all nodes without a node profile")
+		profileName := args.String("profile", "", "--profile: scope to a node profile instead of all unprofiled nodes")
+		args.Parse(os.Args[2:])
+		if *global && *profileName != "" {
+			err = fmt.Errorf("Only one of --global and --profile may be specified")
+			break
+		}
+		err = scheduler_k3s.CommandNodeSysctlsClear(*profileName)
+	case "node-sysctls:set":
+		args := flag.NewFlagSet("scheduler-k3s:node-sysctls:set", flag.ExitOnError)
+		global := args.Bool("global", false, "--global: scope to all nodes without a node profile")
+		profileName := args.String("profile", "", "--profile: scope to a node profile instead of all unprofiled nodes")
+		replace := args.Bool("replace", false, "--replace: replace the entire sysctl map for the scope")
+		args.Parse(os.Args[2:])
+		if *global && *profileName != "" {
+			err = fmt.Errorf("Only one of --global and --profile may be specified")
+			break
+		}
+
+		input := scheduler_k3s.NodeSysctlsSetInput{
+			ProfileName: *profileName,
+			Replace:     *replace,
+		}
+		if *replace {
+			input.Pairs = args.Args()
+		} else {
+			input.Key = args.Arg(0)
+			input.Value = args.Arg(1)
+		}
+
+		err = scheduler_k3s.CommandNodeSysctlsSet(input)
+	case "node-sysctls:report":
+		args := flag.NewFlagSet("scheduler-k3s:node-sysctls:report", flag.ExitOnError)
+		format := args.String("format", "stdout", "format: [ stdout | json ]")
+		global := args.Bool("global", false, "--global: report only on all nodes without a node profile")
+		profileName := args.String("profile", "", "--profile: report only on a node profile instead of every scope")
+		stored := args.Bool("stored", false, "--stored: report the sysctls each scope stores itself rather than the resolved set it applies")
+		args.Parse(os.Args[2:])
+		if *global && *profileName != "" {
+			err = fmt.Errorf("Only one of --global and --profile may be specified")
+			break
+		}
+
+		err = scheduler_k3s.CommandNodeSysctlsReport(scheduler_k3s.NodeSysctlsReportInput{
+			Format:      *format,
+			Global:      *global,
+			ProfileName: *profileName,
+			Stored:      *stored,
+		})
+	case "preview":
+		args := flag.NewFlagSet("scheduler-k3s:preview", flag.ExitOnError)
+		context := args.Int("context", 3, "--context: number of unchanged lines of context around each change (-1 for full output)")
+		showSecrets := args.Bool("show-secrets", false, "--show-secrets: do not redact secret values in the output")
+		showSecretsDecoded := args.Bool("show-secrets-decoded", false, "--show-secrets-decoded: render secret values base64-decoded")
+		args.Parse(os.Args[2:])
+		appName := args.Arg(0)
+		err = scheduler_k3s.CommandPreview(appName, *context, *showSecrets, *showSecretsDecoded)
+	case "profiles:add":
+		args := flag.NewFlagSet("scheduler-k3s:profiles:add", flag.ExitOnError)
+		role := args.String("role", "worker", "role: [ server | worker ]")
+		allowUknownHosts := args.Bool("insecure-allow-unknown-hosts", false, "insecure-allow-unknown-hosts: allow unknown hosts")
+		taintScheduling := args.Bool("taint-scheduling", false, "taint-scheduling: add a taint against scheduling app workloads")
+		kubeletArgs := args.StringSlice("kubelet-args", []string{}, "kubelet-args: repeatable key=value kubelet arguments (e.g., --kubelet-args key=value)")
+		args.Parse(os.Args[2:])
+		profileName := args.Arg(0)
+		err = scheduler_k3s.CommandProfilesAdd(profileName, *role, *allowUknownHosts, *taintScheduling, *kubeletArgs)
+	case "profiles:list":
+		args := flag.NewFlagSet("scheduler-k3s:profiles:list", flag.ExitOnError)
+		format := args.String("format", "stdout", "format: [ stdout | json ]")
+		args.Parse(os.Args[2:])
+		err = scheduler_k3s.CommandProfilesList(*format)
+	case "profiles:remove":
+		args := flag.NewFlagSet("scheduler-k3s:profiles:remove", flag.ExitOnError)
+		args.Parse(os.Args[2:])
+		profileName := args.Arg(0)
+		err = scheduler_k3s.CommandProfilesRemove(profileName)
+	case "report":
+		args := flag.NewFlagSet("scheduler-k3s:report", flag.ExitOnError)
+		format := args.String("format", "stdout", "format: [ stdout | json ]")
+		reportArgs, flagErr := common.ParseReportArgs("scheduler-k3s", os.Args[2:])
+		if flagErr == nil {
+			args.Parse(reportArgs.OSArgs)
+			appName := args.Arg(0)
+			if reportArgs.IsGlobal {
+				appName = "--global"
+			}
+			err = scheduler_k3s.CommandReport(appName, *format, reportArgs.InfoFlag)
+		}
+	case "set":
+		args := flag.NewFlagSet("scheduler-k3s:set", flag.ExitOnError)
+		global := args.Bool("global", false, "--global: set a global property")
+		args.Parse(os.Args[2:])
+		appName := args.Arg(0)
+		property := args.Arg(1)
+		value := args.Arg(2)
+		if *global {
+			appName = "--global"
+			property = args.Arg(0)
+			value = args.Arg(1)
+		}
+		err = scheduler_k3s.CommandSet(appName, property, value)
+	case "show-kubeconfig":
+		args := flag.NewFlagSet("scheduler-k3s:show-kubeconfig", flag.ExitOnError)
+		args.Parse(os.Args[2:])
+		err = scheduler_k3s.CommandShowKubeconfig()
+	case "uninstall":
+		args := flag.NewFlagSet("scheduler-k3s:uninstall", flag.ExitOnError)
+		args.Parse(os.Args[2:])
+		err = scheduler_k3s.CommandUninstall()
+	default:
+		err = fmt.Errorf("Invalid plugin subcommand call: %s", subcommand)
+	}
+
+	if err != nil {
+		common.LogFailWithError(err)
+	}
+}

@@ -1,21 +1,111 @@
 package registry
 
 import (
-	"errors"
+	"bytes"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"text/template"
 
-	"github.com/codeskyblue/go-sh"
 	"github.com/dokku/dokku/plugins/common"
 )
+
+const registryConfigDir = "/var/lib/dokku/config/registry"
+
+// dockerIndexServer is the auths key docker stores Docker Hub credentials under
+const dockerIndexServer = "https://index.docker.io/v1/"
+
+// GetAppRegistryConfigDir returns the per-app registry config directory
+func GetAppRegistryConfigDir(appName string) string {
+	return filepath.Join(registryConfigDir, appName)
+}
+
+// GetAppRegistryConfigPath returns the path to per-app docker config.json
+func GetAppRegistryConfigPath(appName string) string {
+	return filepath.Join(GetAppRegistryConfigDir(appName), "config.json")
+}
+
+func GetComputedAppRegistryConfigDir(appName string) string {
+	if HasAppRegistryAuth(appName) {
+		return GetAppRegistryConfigDir(appName)
+	}
+
+	return GetGlobalRegistryConfigDir()
+}
+
+// GetGlobalRegistryConfigDir returns the docker config directory global logins write to
+func GetGlobalRegistryConfigDir() string {
+	return filepath.Join(os.Getenv("DOKKU_ROOT"), ".docker")
+}
+
+// GetGlobalRegistryConfigPath returns the path to the global docker config.json
+func GetGlobalRegistryConfigPath() string {
+	return filepath.Join(GetGlobalRegistryConfigDir(), "config.json")
+}
+
+// HasAppRegistryAuth checks if an app has registry credentials configured
+func HasAppRegistryAuth(appName string) bool {
+	configPath := GetAppRegistryConfigPath(appName)
+	if !common.FileExists(configPath) {
+		return false
+	}
+
+	content, err := os.ReadFile(configPath)
+	if err != nil {
+		return false
+	}
+
+	config, err := parseDockerConfig(content)
+	if err != nil {
+		return false
+	}
+
+	return len(config.Auths) > 0
+}
+
+// GetDockerConfigArgs returns docker --config arguments if per-app config exists
+func GetDockerConfigArgs(appName string) []string {
+	if appName == "" || !HasAppRegistryAuth(appName) {
+		return []string{}
+	}
+	return []string{"--config", GetAppRegistryConfigDir(appName)}
+}
+
+func getImageRepoFromTemplate(appName string) (string, error) {
+	imageRepoTemplate := strings.TrimSpace(reportImageRepoTemplate(appName))
+	if imageRepoTemplate == "" {
+		imageRepoTemplate = reportGlobalImageRepoTemplate(appName)
+	}
+	if imageRepoTemplate == "" {
+		return "", nil
+	}
+
+	tmpl, err := template.New("template").Parse(imageRepoTemplate)
+	if err != nil {
+		return "", fmt.Errorf("Unable to parse image-repo-template: %w", err)
+	}
+
+	type templateData struct {
+		AppName string
+	}
+	data := templateData{AppName: appName}
+
+	var doc bytes.Buffer
+	if err := tmpl.Execute(&doc, data); err != nil {
+		return "", fmt.Errorf("Unable to execute image-repo-template: %w", err)
+	}
+
+	return strings.TrimSpace(doc.String()), nil
+}
 
 func getRegistryServerForApp(appName string) string {
 	value := common.PropertyGet("registry", appName, "server")
 	if value == "" {
 		value = common.PropertyGet("registry", "--global", "server")
 	}
+	value = strings.TrimSpace(value)
 
 	value = strings.TrimSuffix(value, "/")
 	if value == "hub.docker.com" || value == "docker.io" {
@@ -33,24 +123,36 @@ func isPushEnabled(appName string) bool {
 	return reportComputedPushOnRelease(appName) == "true"
 }
 
+// incrementTagVersion bumps the app's tag version and returns the new value,
+// holding the app's registry property lock across the read and the write so
+// concurrent releases never hand out the same version.
 func incrementTagVersion(appName string) (int, error) {
-	tag := common.PropertyGet("registry", appName, "tag-version")
-	if tag == "" {
-		tag = "0"
-	}
+	version := 0
+	err := common.PropertyLock("registry", appName, func(p *common.LockedProperties) error {
+		tag := common.PropertyGet("registry", appName, "tag-version")
+		if tag == "" {
+			tag = "0"
+		}
 
-	version, err := strconv.Atoi(tag)
+		tag = strings.TrimSpace(tag)
+		current, err := strconv.Atoi(tag)
+		if err != nil {
+			return fmt.Errorf("Unable to convert existing tag version (%s) to integer: %v", tag, err)
+		}
+
+		version = current + 1
+		common.LogVerboseQuiet(fmt.Sprintf("Bumping tag to %d", version))
+		return p.Write("tag-version", strconv.Itoa(version))
+	})
 	if err != nil {
-		return 0, fmt.Errorf("Unable to convert existing tag version (%s) to integer: %v", tag, err)
-	}
-
-	version++
-	common.LogVerboseQuiet(fmt.Sprintf("Bumping tag to %d", version))
-	if err = common.PropertyWrite("registry", appName, "tag-version", strconv.Itoa(version)); err != nil {
 		return 0, err
 	}
 
 	return version, nil
+}
+
+func getRegistryPushExtraTagsForApp(appName string) string {
+	return reportComputedPushExtraTags(appName)
 }
 
 func pushToRegistry(appName string, tag int, imageID string, imageRepo string) error {
@@ -62,24 +164,39 @@ func pushToRegistry(appName string, tag int, imageID string, imageRepo string) e
 	fullImage := fmt.Sprintf("%s%s:%d", registryServer, imageRepo, tag)
 
 	common.LogVerboseQuiet(fmt.Sprintf("Tagging %s:%d in registry format", imageRepo, tag))
-	if !dockerTag(imageID, fullImage) {
-		// TODO: better error
-		return errors.New("Unable to tag image")
+	if err := dockerTag(imageID, fullImage); err != nil {
+		return fmt.Errorf("unable to tag image %s as %s: %w", imageID, fullImage, err)
 	}
 
-	if !dockerTag(imageID, fmt.Sprintf("%s:%d", imageRepo, tag)) {
-		// TODO: better error
-		return errors.New("Unable to tag image")
+	if err := dockerTag(imageID, fmt.Sprintf("%s:%d", imageRepo, tag)); err != nil {
+		return fmt.Errorf("unable to tag image %s as %s:%d: %w", imageID, imageRepo, tag, err)
 	}
 
-	// For the future, we should also add the ability to create the remote repository
-	// This is only really important for registries that do not support creation on push
-	// Examples include AWS and Quay.io
+	extraTags := getRegistryPushExtraTagsForApp(appName)
+	if extraTags != "" {
+		extraTagsArray := strings.Split(extraTags, ",")
+		for _, extraTag := range extraTagsArray {
+			extraTagImage := fmt.Sprintf("%s%s:%s", registryServer, imageRepo, extraTag)
+			common.LogVerboseQuiet(fmt.Sprintf("Tagging %s as %s in registry format", imageRepo, extraTag))
+			if err := dockerTag(imageID, extraTagImage); err != nil {
+				return fmt.Errorf("unable to tag image %s as %s: %w", imageID, extraTagImage, err)
+			}
+			defer func() {
+				common.LogVerboseQuiet(fmt.Sprintf("Untagging extra tag %s", extraTag))
+				if err := common.RemoveImages([]string{extraTagImage}); err != nil {
+					common.LogWarn(fmt.Sprintf("Unable to untag extra tag %s: %s", extraTag, err.Error()))
+				}
+			}()
+			common.LogVerboseQuiet(fmt.Sprintf("Pushing %s", extraTagImage))
+			if err := dockerPush(appName, extraTagImage); err != nil {
+				return fmt.Errorf("unable to push image with %s tag: %w", extraTag, err)
+			}
+		}
+	}
 
 	common.LogVerboseQuiet(fmt.Sprintf("Pushing %s", fullImage))
-	if !dockerPush(fullImage) {
-		// TODO: better error
-		return errors.New("Unable to push image")
+	if err := dockerPush(appName, fullImage); err != nil {
+		return fmt.Errorf("unable to push image %s: %w", fullImage, err)
 	}
 
 	// Only clean up when the scheduler is not docker-local
@@ -96,26 +213,36 @@ func pushToRegistry(appName string, tag int, imageID string, imageRepo string) e
 	return nil
 }
 
-func dockerTag(imageID string, imageTag string) bool {
-	cmd := sh.Command(common.DockerBin(), "image", "tag", imageID, imageTag)
-	cmd.Stdout = nil
-	cmd.Stderr = nil
-	if err := cmd.Run(); err != nil {
-		return false
+func dockerTag(imageID string, imageTag string) error {
+	result, err := common.CallExecCommand(common.ExecCommandInput{
+		Command:     common.DockerBin(),
+		Args:        []string{"image", "tag", imageID, imageTag},
+		StreamStdio: true,
+	})
+	if err != nil {
+		return fmt.Errorf("docker tag command failed: %w", err)
 	}
-
-	return true
+	if result.ExitCode != 0 {
+		return fmt.Errorf("docker tag command exited with code %d: %s", result.ExitCode, result.Stderr)
+	}
+	return nil
 }
 
-func dockerPush(imageTag string) bool {
-	cmd := sh.Command(common.DockerBin(), "image", "push", imageTag)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		return false
+func dockerPush(appName string, imageTag string) error {
+	args := GetDockerConfigArgs(appName)
+	args = append(args, "image", "push", imageTag)
+	result, err := common.CallExecCommand(common.ExecCommandInput{
+		Command:     common.DockerBin(),
+		Args:        args,
+		StreamStdio: true,
+	})
+	if err != nil {
+		return fmt.Errorf("docker image push command failed: %w", err)
 	}
-
-	return true
+	if result.ExitCode != 0 {
+		return fmt.Errorf("docker image push command exited with code %d: %s", result.ExitCode, result.Stderr)
+	}
+	return nil
 }
 
 func imageCleanup(appName string, imageRepo string, imageTag string, tag int) {
@@ -135,4 +262,39 @@ func imageCleanup(appName string, imageRepo string, imageTag string, tag int) {
 	imageIDs, _ := common.ListDanglingImages(appName)
 	imagesToRemove = append(imagesToRemove, imageIDs...)
 	common.RemoveImages(imagesToRemove)
+}
+
+// normalizeRegistryServer applies the dokku-level aliases for a registry server
+func normalizeRegistryServer(server string) string {
+	if server == "hub.docker.com" || server == "docker.com" {
+		return "docker.io"
+	}
+
+	return server
+}
+
+// convertToHostname strips any scheme and path from a registry server, matching
+// the rule docker applies before storing or looking up a credential
+func convertToHostname(server string) string {
+	stripped := server
+	if strings.HasPrefix(stripped, "http://") {
+		stripped = strings.TrimPrefix(stripped, "http://")
+	} else if strings.HasPrefix(stripped, "https://") {
+		stripped = strings.TrimPrefix(stripped, "https://")
+	}
+
+	return strings.SplitN(stripped, "/", 2)[0]
+}
+
+// dockerAuthKey returns the key docker uses for a registry server in the auths
+// map of a config.json. Docker Hub is stored under the index server address
+// rather than the hostname the user logged in with, and is also the only server
+// docker treats that way: registry-1.docker.io gets a key of its own.
+func dockerAuthKey(server string) string {
+	hostname := convertToHostname(normalizeRegistryServer(server))
+	if hostname == "" || hostname == "docker.io" || hostname == "index.docker.io" {
+		return dockerIndexServer
+	}
+
+	return hostname
 }

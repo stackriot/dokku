@@ -10,7 +10,7 @@ When creating custom plugins:
 2. Check out the [list of triggers](/docs/development/plugin-triggers.md) the plugin can implement
 3. Upload the plugin to GitHub with a repository name following the `dokku-<name>` convention (e.g. `dokku-mariadb`)
 4. Edit [this page](/docs/community/plugins.md) and add a link to the plugin
-5. Subscribe to the [dokku development blog](http://progrium.com) to be notified about API changes and releases
+5. Subscribe to the [dokku development blog](https://dokku.com/blog/) to be notified about API changes and releases
 
 ### Compilable plugins (Golang, Java(?), C, etc.)
 
@@ -103,7 +103,7 @@ if ! command -v "nginx" &>/dev/null; then
 fi
 
 # `which` example
-if ! which nginx >/dev/null 2>&1; then
+if ! which nginx &>/dev/null; then
   dokku_log_fail "Missing nginx, install it"
 fi
 ```
@@ -120,7 +120,7 @@ See the sample plugin below for an example.
 
 ### Namespace commands
 
-All commands _should_ be namespaced. In cases where a core plugin is overriden, the plugin _may_ utilize the a namespace in use by the core, but generally this should be avoided to reduce confusion as to where the command is implemented.
+All commands _should_ be namespaced. In cases where a core plugin is overridden, the plugin _may_ utilize the a namespace in use by the core, but generally this should be avoided to reduce confusion as to where the command is implemented.
 
 ### Implement a proper catch-all command
 
@@ -145,6 +145,7 @@ Any functions that must be kept private should reside in the plugin's `trigger/`
 
 ### Use helper functions to fetch app images
 
+> [!IMPORTANT]
 > New as of 0.4.0
 
 Dokku allows image tagging and deployment of tagged images. This means hard-coding the `$IMAGE` as `dokku/$APP` is no longer sufficient.
@@ -155,6 +156,7 @@ Plugins should use `get_running_image_tag()` and `get_app_image_name()` as sourc
 
 ### Use `$DOCKER_BIN` instead of `docker` directly
 
+> [!IMPORTANT]
 > New as of 0.17.5
 
 Certain systems may require a wrapper function around the `docker` binary for proper execution. Utilizing the `$DOCKER_BIN` environment variable when calling docker for those functions is preferred.
@@ -169,6 +171,7 @@ docker run -d $IMAGE /bin/bash -e -c "$COMMAND"
 
 ### Include labels for all temporary containers and images
 
+> [!IMPORTANT]
 > New as of 0.5.0
 
 As of 0.5.0, labels are used to help cleanup intermediate containers with `dokku cleanup`. Plugins that create containers and images should add the correct labels to the `build`, `commit`, and `run` docker commands.
@@ -197,7 +200,7 @@ Avoid copying files from running containers as these files may change over time.
 source "$PLUGIN_CORE_AVAILABLE_PATH/common/functions"
 
 local TMP_FILE=$(mktemp "/tmp/dokku-${DOKKU_PID}-${FUNCNAME[0]}.XXXXXX")
-trap "rm -rf '$TMP_FILE' >/dev/null" RETURN INT TERM
+trap "rm -rf '$TMP_FILE' >/dev/null" RETURN INT TERM EXIT
 
 local IMAGE_TAG="$(get_running_image_tag "$APP")"
 local IMAGE=$(get_deploying_app_image_name "$APP" "$IMAGE_TAG")
@@ -208,6 +211,7 @@ Files are copied from the `/app` directory - for images built via buildpacks - o
 
 ### Avoid calling the `dokku` binary directly
 
+> [!IMPORTANT]
 > New as of 0.6.0
 
 Plugins should **not** call the `dokku` binary directly from within plugins because clients using the `--app` argument are potentially broken when doing so.

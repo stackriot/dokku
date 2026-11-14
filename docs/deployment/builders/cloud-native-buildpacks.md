@@ -1,6 +1,12 @@
-# Cloud Native Buildpacks (Experimental)
+# Cloud Native Buildpacks
 
+> [!IMPORTANT]
 > New as of 0.22.0
+
+```
+builder-pack:report [<app>] [<flag>]   # Displays a builder-pack report for one or more apps
+builder-pack:set <app> <key> (<value>) # Set or clear a builder-pack property for an app
+```
 
 ```
 buildpacks:set-property [--global|<app>] <key> <value>  # Set or clear a buildpacks property for an app
@@ -8,7 +14,8 @@ buildpacks:set-property [--global|<app>] <key> <value>  # Set or clear a buildpa
 
 Cloud Native Buildpacks are an evolution over the Buildpacks technology provided by the Herokuish builder. See the [herokuish buildpacks documentation](/docs/deployment/builders/herokuish-buildpacks.md) for more information on how to clear buildpack build cache for an application.
 
-> Warning: This functionality uses the `pack` cli from the [Cloud Native Buildpacks](https://buildpacks.io) project to build apps. As the integration is experimental in Dokku, it is likely to change over time.
+> [!NOTE]
+> This functionality uses the `pack` cli from the [Cloud Native Buildpacks](https://buildpacks.io) project to build apps.
 
 ## Usage
 
@@ -20,28 +27,21 @@ Builds will proceed with the `pack` cli for the app from then on.
 
 ### Caveats
 
-As this functionality is highly experimental, there are a number of caveats. Please note that not all issuesare listed below.
+While pack is well-supported in Dokku, there are a number of caveats. Please note that not all issues are listed below.
 
 - Specifying specific buildpacks is not currently possible.
-  - A future release will add support for specifying buildpacks via the `buildpacks` plugin.
+    - A future release will add support for specifying buildpacks via the `buildpacks` plugin.
 - There is currently no way to specify extra arguments for `pack` cli invocations.
-  - A future release will add support for injecting extra arguments during the build process.
+    - A future release will add support for injecting extra arguments during the build process.
 - The default process type is `web`.
 - Build cache is stored in Docker volumes instead of on disk. As such, `repo:purge-cache` currently has no effect.
-  - A future version will add integration with the `repo` plugin.
+    - The build cache may be cleared for a single rebuild via `ps:rebuild --no-cache`. See the [rebuilding without the build cache](/docs/processes/process-management.md#rebuilding-without-the-build-cache) documentation for more information.
 - `pack` is not currently included with Dokku, nor is it added as a package dependency.
-  - A future version will include it as a package dependency.
+    - A future version will include it as a package dependency.
 
 ### Detection
 
-This builder will be auto-detected in either the following cases:
-
-- The `DOKKU_CNB_EXPERIMENTAL` app environment variable is set to `1`.
-  ```shell
-  dokku config:set --no-restart node-js-app DOKKU_CNB_EXPERIMENTAL=1
-  ```
-- A `project.toml` file exists in the root of the app repository.
-  - This file is consumed by `pack-cli` and used to describe how the app is built.
+This builder will be auto-detected if a `project.toml` file exists in the root of the app repository.  This file is consumed by `pack-cli` and used to describe how the app is built.
 
 The builder can also be specified via the `builder:set` command:
 
@@ -53,11 +53,18 @@ dokku builder:set node-js-app selected pack
 
 ### Changing the `project.toml` location
 
-When deploying a monorepo, it may be desirable to specify the specific path of the `project.toml` file to use for a given app. This can be done via the `builder-pack:set` command. If a value other than `project.toml` is specified and that file does not exist in the app's build directory, Dokku will continue the build process as if the repository has no `project.toml`.
+The `project.toml` is expected to be found in a specific directory, depending on the deploy approach:
+
+- The `WORKDIR` of the Docker image for deploys resulting from `git:from-image` and `git:load-image` commands.
+- The root of the source code tree for all other deploys (git push, `git:from-archive`, `git:sync`).
+
+Sometimes it may be desirable to set a different path for a given app, e.g. when deploying from a monorepo. This can be done via the `projecttoml-path` property:
 
 ```shell
-dokku builder-pack:set node-js-app projecttoml-path project2.toml
+dokku builder-pack:set node-js-app projecttoml-path .dokku/project.toml
 ```
+
+The value is the path to the desired file *relative* to the base search directory, and will never be treated as absolute paths in any context. If that file does not exist within the repository, Dokku will continue the build process as if the repository has no `project.toml`.
 
 The default value may be set by passing an empty value for the option:
 
@@ -79,28 +86,40 @@ dokku builder-pack:set --global projecttoml-path
 
 ### Displaying builder-pack reports for an app
 
+> [!IMPORTANT]
 > New as of 0.25.0
 
 You can get a report about the app's storage status using the `builder-pack:report` command:
 
 ```shell
-dokku app-json:report
+dokku builder-pack:report
 ```
 
 ```
 =====> node-js-app builder-pack information
-       Builder-pack computed projecttoml path: project2.toml
-       Builder-pack global projecttoml path:   project.toml
-       Builder-pack projecttoml path:          project2.toml
+       Builder pack computed projecttoml path: project2.toml
+       Builder pack global projecttoml path:
+       Builder pack projecttoml path:          project2.toml
+       Builder pack computed stack:            heroku/builder:24
+       Builder pack global stack:
+       Builder pack stack:
 =====> python-sample builder-pack information
-       Builder-pack computed projecttoml path: project.toml
-       Builder-pack global projecttoml path:   project.toml
-       Builder-pack projecttoml path:
+       Builder pack computed projecttoml path: project.toml
+       Builder pack global projecttoml path:
+       Builder pack projecttoml path:
+       Builder pack computed stack:            heroku/builder:24
+       Builder pack global stack:
+       Builder pack stack:
 =====> ruby-sample builder-pack information
-       Builder-pack computed projecttoml path: project.toml
-       Builder-pack global projecttoml path:   project.json
-       Builder-pack projecttoml path:
+       Builder pack computed projecttoml path: project.toml
+       Builder pack global projecttoml path:
+       Builder pack projecttoml path:
+       Builder pack computed stack:            heroku/builder:24
+       Builder pack global stack:
+       Builder pack stack:
 ```
+
+The `projecttoml-path` and `global-projecttoml-path` keys hold the raw per-app and global value respectively, and are empty when nothing has been set. The `computed-projecttoml-path` key holds the effective value used at build time, falling back to the global value (where one has been set) and then to the built-in default of `project.toml`.
 
 You can run the command for a specific app also.
 
@@ -110,9 +129,9 @@ dokku builder-pack:report node-js-app
 
 ```
 =====> node-js-app builder-pack information
-       Builder-pack computed projecttoml path: project2.toml
-       Builder-pack global projecttoml path:   project.toml
-       Builder-pack projecttoml path:          project2.toml
+       Builder pack computed projecttoml path: project2.toml
+       Builder pack global projecttoml path:
+       Builder pack projecttoml path:          project2.toml
 ```
 
 You can pass flags which will output only the value of the specific information you want. For example:
@@ -127,28 +146,53 @@ project2.toml
 
 ### Customizing the Buildpack stack builder
 
-> New as of 0.23.0
+> [!IMPORTANT]
+> New as of 0.23.0. The `stack` property moved from the `buildpacks` plugin to the `builder-pack` plugin in 0.39.0.
 
-The default stack builder in use by CNB buildpacks in Dokku is based on `heroku/buildpacks`. Users may desire to switch the stack builder to a custom version, either to update the operating system or to customize packages included with the stack builder. This can be performed via the `buildpacks:set-property` command.
-
-```shell
-dokku buildpacks:set-property node-js-app stack paketobuildpacks/build:base-cnb
-```
-
-The specified stack builder can also be unset by omitting the name of the stack builder when calling `buildpacks:set-property`.
+The default stack builder in use by CNB buildpacks in Dokku is based on `heroku/builder:24`. Users may desire to switch the stack builder to a custom version, either to update the operating system or to customize packages included with the stack builder. This can be performed via the `builder-pack:set` command.
 
 ```shell
-dokku buildpacks:set-property node-js-app stack
+dokku builder-pack:set node-js-app stack paketobuildpacks/build:base-cnb
 ```
 
-A change in the stack builder value will execute the `post-stack-set` trigger.
+The specified stack builder can also be unset by omitting the name of the stack builder when calling `builder-pack:set`.
 
-Finally, stack builders can be set or unset globally as a fallback. This will take precedence over a globally set `DOKKU_CNB_BUILDER` environment variable (`heroku/buildpacks` by default).
+```shell
+dokku builder-pack:set node-js-app stack
+```
+
+A change in the stack builder value flags the next build to run with `--clear-cache` so a stale pack cache is not reused.
+
+Finally, stack builders can be set or unset globally as a fallback. This will take precedence over a globally set `DOKKU_CNB_BUILDER` environment variable (`heroku/builder:24` by default).
 
 ```shell
 # set globally
-dokku buildpacks:set-property --global stack paketobuildpacks/build:base-cnb
+dokku builder-pack:set --global stack paketobuildpacks/build:base-cnb
 
 # unset globally
-dokku buildpacks:set-property --global stack
+dokku builder-pack:set --global stack
 ```
+
+> [!WARNING]
+> The `buildpacks:set-property stack` command is deprecated. It still works but emits a deprecation warning and forwards the value to `builder-pack` (when the value is a CNB builder) or `builder-herokuish` (when the value references a herokuish image).
+
+### Specifying commands via Procfile
+
+See the [Procfile documentation](/docs/processes/process-management.md#procfile) for more information on how to specify different processes for your app.
+
+## Properties
+
+### Settable properties
+
+| Property | Scope | Default | Report flags | Description |
+|---|---|---|---|---|
+| `projecttoml-path` | app + global | `project.toml` | `--builder-pack-projecttoml-path`, `--builder-pack-global-projecttoml-path`, `--builder-pack-computed-projecttoml-path` | Path within the app to the CNB `project.toml` manifest, relative to the build root |
+| `stack` | app + global | `heroku/builder:24` | `--builder-pack-stack`, `--builder-pack-global-stack`, `--builder-pack-computed-stack` | CNB builder image used to build the app (e.g. `paketobuildpacks/build:base-cnb`) |
+
+### Internal properties
+
+The following properties are recorded internally by the builder-pack plugin and are not exposed via `builder-pack:report`:
+
+| Property | Scope | Description | Source |
+|---|---|---|---|
+| `clear-cache` | per-app | Transient flag set when the pack `stack` changes. The next `pack build` runs with `--clear-cache` and then the flag is deleted, ensuring a stack change does not reuse a stale pack cache | `plugins/builder-pack/subcommands/set` sets it on stack change; `plugins/builder-pack/builder-build` consumes and deletes it |

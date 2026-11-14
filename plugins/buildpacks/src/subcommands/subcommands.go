@@ -30,6 +30,15 @@ func main() {
 		args.Parse(os.Args[2:])
 		appName := args.Arg(0)
 		err = buildpacks.CommandClear(appName)
+	case "detect":
+		args := flag.NewFlagSet("buildpacks:detect", flag.ExitOnError)
+		branch := args.String("branch", "", "--branch: the branch to detect against (defaults to the deploy branch)")
+		args.Parse(os.Args[2:])
+		appName := args.Arg(0)
+		if *branch == "" {
+			*branch = common.PropertyGet("git", appName, "deploy-branch")
+		}
+		err = buildpacks.CommandDetect(appName, *branch)
 	case "list":
 		args := flag.NewFlagSet("buildpacks:list", flag.ExitOnError)
 		args.Parse(os.Args[2:])
@@ -45,19 +54,23 @@ func main() {
 	case "report":
 		args := flag.NewFlagSet("buildpacks:report", flag.ExitOnError)
 		format := args.String("format", "stdout", "format: [ stdout | json ]")
-		osArgs, infoFlag, flagErr := common.ParseReportArgs("buildpacks", os.Args[2:])
+		reportArgs, flagErr := common.ParseReportArgs("buildpacks", os.Args[2:])
 		if flagErr == nil {
-			args.Parse(osArgs)
+			args.Parse(reportArgs.OSArgs)
 			appName := args.Arg(0)
-			err = buildpacks.CommandReport(appName, *format, infoFlag)
+			if reportArgs.IsGlobal {
+				appName = "--global"
+			}
+			err = buildpacks.CommandReport(appName, *format, reportArgs.InfoFlag)
 		}
 	case "set":
 		args := flag.NewFlagSet("buildpacks:set", flag.ExitOnError)
 		index := args.Int("index", 0, "--index: the 1-based index of the URL in the list of URLs")
+		replace := args.Bool("replace", false, "--replace: replace the entire ordered buildpack list")
 		args.Parse(os.Args[2:])
 		appName := args.Arg(0)
-		buildpack := args.Arg(1)
-		err = buildpacks.CommandSet(appName, buildpack, *index)
+		_, buildpackList := common.ShiftString(args.Args())
+		err = buildpacks.CommandSet(appName, buildpackList, *index, *replace)
 	case "set-property":
 		args := flag.NewFlagSet("buildpacks:set-property", flag.ExitOnError)
 		global := args.Bool("global", false, "--global: set a global property")

@@ -18,6 +18,9 @@ enable_plugin() {
   local PLUGIN="$1"
   [[ -e $PLUGIN_ENABLED_PATH/$PLUGIN ]] && dokku_log_fail "Plugin already enabled"
   [[ ! -e $PLUGIN_AVAILABLE_PATH/$PLUGIN ]] && dokku_log_fail "Plugin does not exist"
+  if [[ -e $PLUGIN_CORE_AVAILABLE_PATH/$PLUGIN ]] && [[ ! -e $PLUGIN_CORE_ENABLED_PATH/$PLUGIN ]]; then
+    PLUGIN_PATH="$PLUGIN_CORE_PATH" plugn enable "$PLUGIN"
+  fi
   plugn enable "$PLUGIN"
   dokku_log_info1_quiet "Plugin $PLUGIN enabled"
 }
@@ -33,6 +36,7 @@ download_and_enable_plugin() {
   declare desc="wrapper to download and enable specified version of plugin"
   local PLUGIN_GIT_URL="$1"
   shift
+  local SKIP_INSTALL_TRIGGER=false
   while getopts ":-:" opt "$@"; do
     case "$opt" in
       -)
@@ -47,6 +51,9 @@ download_and_enable_plugin() {
             OPTIND=$((OPTIND + 1))
             local CUSTOM_NAME="$val"
             ;;
+          skip-install-trigger)
+            SKIP_INSTALL_TRIGGER=true
+            ;;
         esac
         ;;
     esac
@@ -57,6 +64,9 @@ download_and_enable_plugin() {
   enable_plugin "$PLUGIN_NAME"
   if [[ -n "$PLUGIN_COMMITTISH" ]]; then
     update_plugin "$PLUGIN_NAME" "$PLUGIN_COMMITTISH"
+  fi
+  if [[ "$SKIP_INSTALL_TRIGGER" == "false" ]]; then
+    plugn trigger install
   fi
 }
 
